@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
-from typing import Dict, Tuple
+from typing import Dict, Literal, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,13 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
 from src.models.hdim_model import HDIMModel
+
+
+@dataclass(frozen=True)
+class TrainingRegime:
+    mode: Literal["reconstruction", "paired"]
+    update_memory: bool
+    memory_mode: Literal["retrieve", "update"]
 
 
 class HDIMTrainer:
@@ -31,26 +39,45 @@ class HDIMTrainer:
         self.lambda_routing = lambda_routing
         self._step: int = 0
 
+    def _resolve_training_regime(
+        self,
+        batch: Dict[str, torch.Tensor],
+    ) -> TrainingRegime:
+        is_pair_batch = self._has_pairs(batch)
+        return TrainingRegime(
+            mode="paired" if is_pair_batch else "reconstruction",
+            update_memory=self.model.training,
+            memory_mode="update" if self.model.training else "retrieve",
+        )
+
     def _extract_iso_targets(
         self,
         batch: Dict[str, torch.Tensor],
-        invariant: torch.Tensor,
+        aux_state: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         if "pair_encoding" not in batch or "pair_domain_id" not in batch:
-            return invariant.detach()
+            return aux_state["training_invariant"].detach()
 
         pair_encoding = batch["pair_encoding"].to(self.device)
         pair_domain_id = batch["pair_domain_id"].to(self.device)
-        _, _, pair_invariant = self.model(
-            pair_encoding,
-            pair_domain_id,
-            update_memory=False,
-            memory_mode="retrieve",
-        )
-        return pair_invariant.detach()
+        return self._compute_pair_iso_targets(pair_encoding, pair_domain_id)
 
     def _has_pairs(self, batch: Dict[str, torch.Tensor]) -> bool:
         return "pair_encoding" in batch and "pair_domain_id" in batch
+
+    def _compute_pair_iso_targets(
+        self,
+        pair_encoding: torch.Tensor,
+        pair_domain_id: torch.Tensor,
+    ) -> torch.Tensor:
+        _, _, _, aux_state = self.model(
+            pair_encoding,
+            pair_domain_id,
+            return_state=True,
+            update_memory=False,
+            memory_mode="retrieve",
+        )
+        return aux_state["processed_invariant"].detach()
 
     def _compute_reconstruction_loss(
         self,
@@ -65,26 +92,30 @@ class HDIMTrainer:
     ) -> Dict[str, torch.Tensor]:
         encoding = batch["encoding"].to(self.device)
         domain_id = batch["domain_id"].to(self.device)
-        is_pair_batch = self._has_pairs(batch)
+        regime = self._resolve_training_regime(batch)
 
-        if is_pair_batch:
+        if regime.mode == "paired":
             pair_encoding = batch["pair_encoding"].to(self.device)
             pair_domain_id = batch["pair_domain_id"].to(self.device)
             output, routing_weights, invariant, aux_state = self.model.transfer_pairs(
                 encoding,
                 domain_id,
                 pair_domain_id,
-                update_memory=self.model.training,
-                memory_mode="update" if self.model.training else "retrieve",
+                update_memory=regime.update_memory,
+                memory_mode=regime.memory_mode,
             )
             recon_target = pair_encoding
         else:
-            output, routing_weights, invariant, aux_state = self._forward_batch(encoding, domain_id)
+            output, routing_weights, invariant, aux_state = self._forward_batch(
+                encoding,
+                domain_id,
+                regime=regime,
+            )
             recon_target = encoding
 
-        iso_target = self._extract_iso_targets(batch, invariant)
+        iso_target = self._extract_iso_targets(batch, aux_state)
         loss_recon = self._compute_reconstruction_loss(output, recon_target)
-        loss_iso = self.compute_iso_loss(invariant, iso_target)
+        loss_iso = self.compute_iso_loss(aux_state["processed_invariant"], iso_target)
         loss_routing = aux_state["router_loss"]
         loss_memory = aux_state["memory_loss"]
         loss_total = (
@@ -102,6 +133,9 @@ class HDIMTrainer:
             "loss_memory": loss_memory,
             "routing_weights": routing_weights,
             "invariant": invariant,
+            "raw_invariant": aux_state["raw_invariant"],
+            "processed_invariant": aux_state["processed_invariant"],
+            "training_mode": regime.mode,
         }
 
     def evaluate_batch(
@@ -116,13 +150,14 @@ class HDIMTrainer:
         self,
         encoding: torch.Tensor,
         domain_id: torch.Tensor,
+        regime: TrainingRegime,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         output, routing_weights, invariant, aux_state = self.model(
             encoding,
             domain_id,
             return_state=True,
-            update_memory=True,
-            memory_mode="update" if self.model.training else "retrieve",
+            update_memory=regime.update_memory,
+            memory_mode=regime.memory_mode,
         )
         return output, routing_weights, invariant, aux_state
 

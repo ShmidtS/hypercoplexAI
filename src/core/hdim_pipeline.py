@@ -10,14 +10,81 @@ HDIM — Hypercomplex Domain Isomorphism Machine
   5. Decoder: U_inv → выход целевого домена
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from typing import Any, Dict, List, Optional, Tuple
 
 from .hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from .domain_operators import DomainRotationOperator, InvariantExtractor, sandwich_transfer
-from .titans_memory import TitansMemoryModule
+from .titans_memory import MemoryState, TitansMemoryModule
 from .moe_router import R3MoERouter
+
+
+@dataclass
+class TransferState:
+    g_source: Optional[torch.Tensor]
+    u_inv: torch.Tensor
+    u_mem: torch.Tensor
+    u_route: torch.Tensor
+    g_target: torch.Tensor
+    output: torch.Tensor
+    memory_loss: torch.Tensor
+    memory_retrieved: torch.Tensor
+    memory_updated: bool
+    memory_alpha: Optional[torch.Tensor]
+    memory_eta: Optional[torch.Tensor]
+    memory_theta: Optional[torch.Tensor]
+    router_state: Dict[str, Any]
+    memory_mode: str
+    update_memory: bool
+    input_is_invariant: bool
+
+    @property
+    def routing_weights(self) -> torch.Tensor:
+        return self.router_state["gate_weights"]
+
+    @property
+    def raw_invariant(self) -> torch.Tensor:
+        return self.u_inv
+
+    @property
+    def processed_invariant(self) -> torch.Tensor:
+        return self.u_route
+
+    @property
+    def training_invariant(self) -> torch.Tensor:
+        return self.u_route
+
+    @property
+    def invariant(self) -> torch.Tensor:
+        return self.training_invariant
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "g_source": self.g_source,
+            "u_inv": self.u_inv,
+            "u_mem": self.u_mem,
+            "u_route": self.u_route,
+            "g_target": self.g_target,
+            "output": self.output,
+            "memory_loss": self.memory_loss,
+            "memory_retrieved": self.memory_retrieved,
+            "memory_updated": self.memory_updated,
+            "memory_alpha": self.memory_alpha,
+            "memory_eta": self.memory_eta,
+            "memory_theta": self.memory_theta,
+            "router_state": self.router_state,
+            "routing_weights": self.routing_weights,
+            "memory_mode": self.memory_mode,
+            "update_memory": self.update_memory,
+            "input_is_invariant": self.input_is_invariant,
+            "raw_invariant": self.raw_invariant,
+            "processed_invariant": self.processed_invariant,
+            "training_invariant": self.training_invariant,
+            "invariant": self.invariant,
+        }
 
 
 class HDIMEncoder(nn.Module):
@@ -122,17 +189,24 @@ class HDIMPipeline(nn.Module):
         u_inv: torch.Tensor,
         update_memory: bool,
         memory_mode: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, MemoryState]:
         if memory_mode not in {"none", "retrieve", "update"}:
             raise ValueError(f"Unsupported memory_mode: {memory_mode}")
-        should_update = update_memory and memory_mode == "update"
         if memory_mode == "none":
-            mem_retrieved = torch.zeros_like(u_inv)
-            memory_loss = torch.zeros((), device=u_inv.device, dtype=u_inv.dtype)
-            return u_inv, mem_retrieved, memory_loss
+            empty_state = MemoryState(
+                retrieved=torch.zeros_like(u_inv),
+                loss=torch.zeros((), device=u_inv.device, dtype=u_inv.dtype),
+                updated=False,
+            )
+            return u_inv, empty_state
+
         mem_key = self.memory_key_proj(u_inv)
-        mem_retrieved, memory_loss = self.memory(mem_key, u_inv, update_memory=should_update)
-        return u_inv + mem_retrieved, mem_retrieved, memory_loss
+        memory_state = self.memory.retrieve_and_update(
+            mem_key,
+            u_inv,
+            update_memory=update_memory and memory_mode == "update",
+        )
+        return u_inv + memory_state.retrieved, memory_state
 
     def transfer(
         self,
@@ -153,7 +227,7 @@ class HDIMPipeline(nn.Module):
         else:
             g_source, u_inv = self.encode_domain(x, source_domain)
 
-        u_mem, mem_retrieved, memory_loss = self._apply_memory(
+        u_mem, memory_state = self._apply_memory(
             u_inv,
             update_memory=update_memory,
             memory_mode=memory_mode,
@@ -164,26 +238,35 @@ class HDIMPipeline(nn.Module):
         if input_is_invariant:
             g_target = r_target(u_route)
         else:
-            _, g_target = sandwich_transfer(self.algebra, g_source, r_source, r_target, invariant_override=u_route)
+            _, g_target = sandwich_transfer(
+                self.algebra,
+                g_source,
+                r_source,
+                r_target,
+                invariant_override=u_route,
+            )
         output = self.decoder(g_target)
 
-        transfer_state: Dict[str, Any] = {
-            "g_source": g_source,
-            "u_inv": u_inv,
-            "u_mem": u_mem,
-            "u_route": u_route,
-            "g_target": g_target,
-            "memory_loss": memory_loss,
-            "memory_retrieved": mem_retrieved,
-            "router_state": router_state,
-            "routing_weights": router_state["gate_weights"],
-            "invariant": u_inv,
-            "processed_invariant": u_route,
-            "memory_mode": memory_mode,
-            "update_memory": update_memory,
-            "input_is_invariant": input_is_invariant,
-        }
-        return output, transfer_state
+        transfer_state = TransferState(
+            g_source=g_source,
+            u_inv=u_inv,
+            u_mem=u_mem,
+            u_route=u_route,
+            g_target=g_target,
+            output=output,
+            memory_loss=memory_state.loss,
+            memory_retrieved=memory_state.retrieved,
+            memory_updated=memory_state.updated,
+            memory_alpha=memory_state.alpha,
+            memory_eta=memory_state.eta,
+            memory_theta=memory_state.theta,
+            router_state=router_state,
+            memory_mode=memory_mode,
+            update_memory=update_memory,
+            input_is_invariant=input_is_invariant,
+        )
+        return output, transfer_state.to_dict()
+
 
     def forward(
         self,
@@ -194,6 +277,10 @@ class HDIMPipeline(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Алиас для transfer()."""
         return self.transfer(x, source_domain, target_domain, **kwargs)
+
+    def reset_memory(self) -> None:
+        """Сбрасывает stateful память перед новым экспериментом."""
+        self.memory.reset_memory()
 
     def compute_isomorphism_loss(
         self,

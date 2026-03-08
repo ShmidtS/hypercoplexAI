@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import random
 from typing import Dict, List, Optional, Tuple
 
@@ -29,7 +30,8 @@ def _text_to_embedding(text: str, dim: int, seed: Optional[int] = None) -> torch
         char_vec = char_vec / char_vec.sum()
 
     rng = torch.Generator()
-    rng.manual_seed(abs(hash(text)) % (2**32) if seed is None else seed)
+    stable_seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:8], 16)
+    rng.manual_seed(stable_seed if seed is None else seed)
     proj = torch.randn(dim, 256, generator=rng)
     embedding = proj @ char_vec
 
@@ -90,6 +92,8 @@ class DomainProblemDataset(Dataset):
             pair_idx = self.pair_indices[idx]
             item["pair_encoding"] = self._encodings[pair_idx].float()
             item["pair_domain_id"] = torch.tensor(self._labels[pair_idx], dtype=torch.long)
+            item["pair_index"] = torch.tensor(pair_idx, dtype=torch.long)
+            item["pair_same_template"] = torch.tensor(True)
 
         return item
 

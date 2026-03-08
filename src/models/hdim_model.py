@@ -57,8 +57,8 @@ class HDIMModel(nn.Module):
     interface suitable for batch training. Domain indices map to the named
     domain rotors registered inside the pipeline.
 
-    Forward returns (output, routing_weights, invariant) matching the
-    expected training contract.
+    Forward returns (output, routing_weights, invariant) where invariant is
+    the hidden-dim projection of the canonical training invariant.
     """
 
     def __init__(self, config: HDIMConfig) -> None:
@@ -80,7 +80,8 @@ class HDIMModel(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
         clifford_dim = self.pipeline.clifford_dim
-        self.inv_head = nn.Linear(clifford_dim, config.hidden_dim)
+        self.raw_inv_head = nn.Linear(clifford_dim, config.hidden_dim)
+        self.training_inv_head = nn.Linear(clifford_dim, config.hidden_dim)
 
     def _domain_idx_to_name(self, domain_idx: int) -> str:
         """Convert an integer domain index to its registered name."""
@@ -128,6 +129,18 @@ class HDIMModel(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
+        raw_invariant = torch.empty(
+            batch_size,
+            self.pipeline.clifford_dim,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        training_invariant = torch.empty(
+            batch_size,
+            self.pipeline.clifford_dim,
+            device=x.device,
+            dtype=x.dtype,
+        )
         memory_loss = torch.zeros((), device=x.device, dtype=x.dtype)
         router_loss = torch.zeros((), device=x.device, dtype=x.dtype)
 
@@ -146,8 +159,10 @@ class HDIMModel(nn.Module):
 
             output[mask] = group_output
             routing_weights[mask] = transfer_state["routing_weights"].to(dtype=x.dtype)
-            invariant[mask] = self.inv_head(transfer_state["invariant"]).to(dtype=x.dtype)
+            invariant[mask] = self.training_inv_head(transfer_state["training_invariant"]).to(dtype=x.dtype)
             processed_invariant[mask] = transfer_state["processed_invariant"].to(dtype=x.dtype)
+            raw_invariant[mask] = transfer_state["raw_invariant"].to(dtype=x.dtype)
+            training_invariant[mask] = transfer_state["training_invariant"].to(dtype=x.dtype)
             memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=x.dtype)
             router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=x.dtype)
 
@@ -156,6 +171,8 @@ class HDIMModel(nn.Module):
                 "memory_loss": memory_loss,
                 "router_loss": router_loss,
                 "processed_invariant": processed_invariant,
+                "raw_invariant": raw_invariant,
+                "training_invariant": training_invariant,
             }
             return output, routing_weights, invariant, aux_state
         return output, routing_weights, invariant
@@ -217,6 +234,18 @@ class HDIMModel(nn.Module):
             device=source_encoding.device,
             dtype=source_encoding.dtype,
         )
+        raw_invariant = torch.empty(
+            batch_size,
+            self.pipeline.clifford_dim,
+            device=source_encoding.device,
+            dtype=source_encoding.dtype,
+        )
+        training_invariant = torch.empty(
+            batch_size,
+            self.pipeline.clifford_dim,
+            device=source_encoding.device,
+            dtype=source_encoding.dtype,
+        )
         memory_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
         router_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
 
@@ -237,8 +266,9 @@ class HDIMModel(nn.Module):
             )
             output[mask] = group_output
             routing_weights[mask] = transfer_state["routing_weights"].to(dtype=source_encoding.dtype)
-            invariant[mask] = self.inv_head(transfer_state["invariant"]).to(dtype=source_encoding.dtype)
+            invariant[mask] = self.processed_inv_head(transfer_state["processed_invariant"]).to(dtype=source_encoding.dtype)
             processed_invariant[mask] = transfer_state["processed_invariant"].to(dtype=source_encoding.dtype)
+            raw_invariant[mask] = transfer_state["raw_invariant"].to(dtype=source_encoding.dtype)
             memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=source_encoding.dtype)
             router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=source_encoding.dtype)
 
@@ -246,5 +276,6 @@ class HDIMModel(nn.Module):
             "memory_loss": memory_loss,
             "router_loss": router_loss,
             "processed_invariant": processed_invariant,
+            "raw_invariant": raw_invariant,
         }
         return output, routing_weights, invariant, aux_state

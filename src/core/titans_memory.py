@@ -9,10 +9,22 @@ HDIM — Titans Memory Module
   α_t, η_t, θ_t — обучаемые скаляры (sigmoid-гейты из входа)
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Tuple
+
+
+@dataclass
+class MemoryState:
+    retrieved: torch.Tensor
+    loss: torch.Tensor
+    updated: bool
+    alpha: torch.Tensor | None = None
+    eta: torch.Tensor | None = None
+    theta: torch.Tensor | None = None
 
 
 class TitansMemoryModule(nn.Module):
@@ -45,10 +57,54 @@ class TitansMemoryModule(nn.Module):
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, 0.5)  # начальные значения ~0.5
 
+    def retrieve(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> MemoryState:
+        retrieved = self.memory(k)
+        loss_memory = F.mse_loss(retrieved, v.detach())
+        return MemoryState(retrieved=retrieved, loss=loss_memory, updated=False)
+
+    def update(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        loss_ttt = F.mse_loss(self.memory(k.detach()), v.detach())
+        gates = torch.sigmoid(self.gate_proj(k.detach().mean(0) if k.dim() > 1 else k.detach()))
+        alpha, eta, theta = gates[..., 0], gates[..., 1], gates[..., 2]
+        grad = torch.autograd.grad(
+            loss_ttt,
+            self.memory.weight,
+            retain_graph=False,
+            create_graph=False,
+        )[0]
+        self.momentum_S = eta * self.momentum_S.detach() - theta * grad.detach()
+        self.memory.weight.data.copy_(
+            (1 - alpha) * self.memory.weight.data + self.momentum_S.data
+        )
+        return alpha.detach(), eta.detach(), theta.detach()
+
+    def retrieve_and_update(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        update_memory: bool = True,
+    ) -> MemoryState:
+        state = self.retrieve(k, v)
+        if update_memory and self.training:
+            alpha, eta, theta = self.update(k, v)
+            state.updated = True
+            state.alpha = alpha
+            state.eta = eta
+            state.theta = theta
+        return state
+
     def forward(
         self,
-        k: torch.Tensor,           # (..., key_dim) — ключ
-        v: torch.Tensor,           # (..., val_dim) — значение (цель)
+        k: torch.Tensor,
+        v: torch.Tensor,
         update_memory: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -62,39 +118,8 @@ class TitansMemoryModule(nn.Module):
         Returns:
             (retrieved, loss): извлечённое значение и потеря памяти
         """
-        # Поиск: retrieved = M(k)
-        retrieved = self.memory(k)  # (..., val_dim)
-
-        # Потеря памяти: || M(k) - v ||²
-        loss_memory = F.mse_loss(retrieved, v.detach())
-
-        if update_memory and self.training:
-            # TTT update на detached входах — изолируем от внешнего графа
-            loss_ttt = F.mse_loss(self.memory(k.detach()), v.detach())
-
-            # Вычисляем гейты из ключа (усредняем по batch)
-            gates = torch.sigmoid(self.gate_proj(k.detach().mean(0) if k.dim() > 1 else k.detach()))
-            alpha, eta, theta = gates[..., 0], gates[..., 1], gates[..., 2]
-
-            # Градиент по весам памяти (изолирован от внешнего графа)
-            grad = torch.autograd.grad(
-                loss_ttt,
-                self.memory.weight,
-                retain_graph=False,
-                create_graph=False,
-            )[0]  # (val_dim, key_dim)
-
-            # Обновление momentum: S_t = η * S_{t-1} - θ * ∇L
-            self.momentum_S = eta * self.momentum_S.detach() - theta * grad.detach()
-
-            # Обновление памяти через copy_ (не inplace на граф)
-            # .data.copy_ не инкрементирует версию тензора в autograd,
-            # поэтому не нарушает граф внешнего backward-прохода
-            self.memory.weight.data.copy_(
-                (1 - alpha) * self.memory.weight.data + self.momentum_S.data
-            )
-
-        return retrieved, loss_memory
+        state = self.retrieve_and_update(k, v, update_memory=update_memory)
+        return state.retrieved, state.loss
 
     def reset_memory(self):
         """Сбрасывает память и momentum state к нулям."""

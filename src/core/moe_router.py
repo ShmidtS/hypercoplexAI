@@ -85,13 +85,18 @@ class R3MoERouter(nn.Module):
             expert_out = expert(x_flat)
             output += gate_weights[:, i:i + 1] * expert_out
         router_loss = self._load_balance_loss(scores, mask)
+        gate_weights_view = gate_weights.reshape(*orig_shape[:-1], self.num_experts)
+        topk_idx_view = topk_idx.reshape(*orig_shape[:-1], self.top_k)
         router_state = {
             "loss": router_loss,
             "router_loss": router_loss,
             "scores": scores.reshape(*orig_shape[:-1], self.num_experts),
-            "topk_idx": topk_idx.reshape(*orig_shape[:-1], self.top_k),
-            "gate_weights": gate_weights.reshape(*orig_shape[:-1], self.num_experts),
+            "topk_idx": topk_idx_view,
+            "gate_weights": gate_weights_view,
             "train_scores_snapshot": train_scores_snapshot,
+            "topk_gate_weights": torch.gather(gate_weights_view, -1, topk_idx_view),
+            "expert_usage": mask.float().mean(0),
+            "routing_entropy": -(gate_weights * gate_weights.clamp(min=1e-8).log()).sum(dim=-1).mean(),
         }
         return output.reshape(orig_shape), router_state
 
