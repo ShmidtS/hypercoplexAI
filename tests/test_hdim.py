@@ -49,9 +49,10 @@ def test_model_forward_return_state(model, cfg):
     assert out.shape == (bsz, cfg.hidden_dim)
     assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
-    assert state["processed_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    assert state["training_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    expected_inv = model.training_inv_head(state["training_invariant"])
+    assert state["raw_invariant"].shape == (bsz, model.pipeline.clifford_dim)
+    assert state["memory_augmented_invariant"].shape == (bsz, model.pipeline.clifford_dim)
+    assert state["exported_invariant"].shape == (bsz, model.pipeline.clifford_dim)
+    expected_inv = model.training_inv_head(state["exported_invariant"])
     assert torch.allclose(inv, expected_inv, atol=1e-5)
     assert state["router_loss"].ndim == 0
     assert state["memory_loss"].ndim == 0
@@ -84,9 +85,10 @@ def test_transfer_pairs(model, cfg):
     assert out.shape == (bsz, cfg.hidden_dim)
     assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
-    assert state["processed_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    assert state["training_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    expected_inv = model.training_inv_head(state["training_invariant"])
+    assert state["raw_invariant"].shape == (bsz, model.pipeline.clifford_dim)
+    assert state["memory_augmented_invariant"].shape == (bsz, model.pipeline.clifford_dim)
+    assert state["exported_invariant"].shape == (bsz, model.pipeline.clifford_dim)
+    expected_inv = model.training_inv_head(state["exported_invariant"])
     assert torch.allclose(inv, expected_inv, atol=1e-5)
 
 
@@ -105,15 +107,25 @@ def test_paired_dataset():
     sample = ds[0]
     assert "pair_encoding" in sample
     assert "pair_domain_id" in sample
+    assert "pair_group_id" in sample
     assert sample["pair_encoding"].shape == (64,)
     assert sample["pair_domain_id"].dtype == torch.long
+    assert sample["pair_group_id"].dtype == torch.long
+    assert sample["pair_same_template"].dtype == torch.bool
     assert sample["pair_domain_id"].item() != sample["domain_id"].item()
+    assert sample["pair_same_template"].item() is True
 
 
 def test_dataset_rejects_same_domain_pairs():
     samples = [("a", 0), ("b", 0)]
     with pytest.raises(ValueError):
-        DomainProblemDataset(samples, pair_indices=[1, 0])
+        DomainProblemDataset(samples, pair_indices=[1, 0], pair_group_ids=[0, 0])
+
+
+def test_dataset_rejects_misaligned_pair_groups():
+    samples = [("a", 0), ("b", 1), ("c", 2)]
+    with pytest.raises(ValueError):
+        DomainProblemDataset(samples, pair_indices=[1, 0, 1], pair_group_ids=[0, 1, 2])
 
 
 def test_iso_loss(trainer, cfg):
@@ -170,7 +182,31 @@ def test_evaluate_batch_with_pairs(trainer):
     losses = trainer.evaluate_batch(batch)
     assert losses["loss_total"].item() >= 0
     assert losses["loss_iso"].item() >= 0
-    assert losses["training_invariant"].shape == losses["processed_invariant"].shape
+    assert losses["training_invariant"].shape == (8, trainer.model.config.hidden_dim)
+    assert losses["exported_invariant"].shape == (8, trainer.model.pipeline.clifford_dim)
+
+
+def test_model_return_state_exposes_memory_lifecycle(model, cfg):
+    x = torch.randn(4, cfg.hidden_dim)
+    domain_id = torch.zeros(4, dtype=torch.long)
+    _, _, _, state = model(
+        x,
+        domain_id,
+        return_state=True,
+        update_memory=False,
+        memory_mode="retrieve",
+    )
+    assert state["memory_mode"] == "retrieve"
+    assert state["update_memory"] is False
+    assert state["memory_updated"] is False
+    assert state["training_invariant"].shape == (4, cfg.hidden_dim)
+
+
+def test_model_rejects_invalid_memory_mode(model, cfg):
+    x = torch.randn(2, cfg.hidden_dim)
+    domain_id = torch.zeros(2, dtype=torch.long)
+    with pytest.raises(ValueError):
+        model(x, domain_id, update_memory=False, memory_mode="bad-mode")
 
 
 def test_model_forward_rejects_invalid_domain_id(model, cfg):
@@ -258,8 +294,8 @@ def test_round_trip_transfer_same_domain(model, cfg):
     assert out.shape == x.shape
 
 
-def test_raw_invariant_differs_from_processed(model, cfg):
-    """raw_invariant и processed_invariant должны различаться (memory+router меняют инвариант)."""
+def test_raw_invariant_differs_from_exported(model, cfg):
+    """raw_invariant и exported_invariant должны проходить через канонический lifecycle."""
     x = torch.randn(4, cfg.hidden_dim)
     domain_id = torch.zeros(4, dtype=torch.long)
     with torch.no_grad():
@@ -270,12 +306,8 @@ def test_raw_invariant_differs_from_processed(model, cfg):
             memory_mode="retrieve",
         )
     raw = state["raw_invariant"]
-    processed = state["processed_invariant"]
-    # raw_invariant это u_inv, processed_invariant это u_route — они должны отличаться
-    # (если memory+router что-то делают)
-    assert raw.shape == processed.shape
-    # Проверяем что это не одинаковые тензоры (они могут быть близки но не идентичны)
-    # Это не жёсткое требование — просто проверяем что pipeline работает
+    exported = state["exported_invariant"]
+    assert raw.shape == exported.shape
     assert raw.shape == (4, model.pipeline.clifford_dim)
 
 

@@ -56,7 +56,7 @@ class HDIMTrainer:
         aux_state: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         if "pair_encoding" not in batch or "pair_domain_id" not in batch:
-            return aux_state["exported_invariant"].detach()
+            return self._training_invariant(aux_state).detach()
 
         pair_encoding = batch["pair_encoding"].to(self.device)
         pair_domain_id = batch["pair_domain_id"].to(self.device)
@@ -64,6 +64,12 @@ class HDIMTrainer:
 
     def _exported_invariant(self, aux_state: Dict[str, torch.Tensor]) -> torch.Tensor:
         return aux_state["exported_invariant"]
+
+    def _training_invariant(self, aux_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return aux_state["training_invariant"]
+
+    def _iso_reference_invariant(self, aux_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self._training_invariant(aux_state)
 
     def _has_pairs(self, batch: Dict[str, torch.Tensor]) -> bool:
         return "pair_encoding" in batch and "pair_domain_id" in batch
@@ -138,7 +144,8 @@ class HDIMTrainer:
             "routing_weights": routing_weights,
             "invariant": invariant,
             "raw_invariant": aux_state["raw_invariant"],
-            "processed_invariant": aux_state["processed_invariant"],
+            "memory_augmented_invariant": aux_state["memory_augmented_invariant"],
+            "exported_invariant": aux_state["exported_invariant"],
             "training_invariant": training_invariant,
             "training_mode": regime.mode,
         }

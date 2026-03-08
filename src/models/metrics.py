@@ -53,30 +53,40 @@ def _paired_batch_metrics(model, batch) -> Tuple[List[float], torch.Tensor]:
     pair_domain_ids = batch.get("pair_domain_id")
 
     if pair_enc is None or pair_domain_ids is None:
-        _, routing, _ = model(
+        _, routing, _, state = model(
             enc,
             domain_id=domain_ids,
+            return_state=True,
             update_memory=False,
             memory_mode="retrieve",
         )
-        return [1.0] * len(enc), routing.cpu()
+        sts_values = structural_transfer_score(
+            state["exported_invariant"],
+            state["memory_augmented_invariant"],
+        ).repeat(len(enc))
+        return sts_values.tolist(), routing.cpu()
 
     pair_enc = pair_enc.to(device)
     pair_domain_ids = pair_domain_ids.to(device)
-    _, routing, inv_src, _ = model.transfer_pairs(
+    _, routing, _, src_state = model.transfer_pairs(
         enc,
         domain_ids,
         pair_domain_ids,
         update_memory=False,
         memory_mode="retrieve",
     )
-    _, _, inv_tgt = model(
+    _, _, _, tgt_state = model(
         pair_enc,
         domain_id=pair_domain_ids,
+        return_state=True,
         update_memory=False,
         memory_mode="retrieve",
     )
-    sts_values = F.cosine_similarity(inv_src, inv_tgt, dim=-1)
+    sts_values = F.cosine_similarity(
+        src_state["exported_invariant"],
+        tgt_state["exported_invariant"],
+        dim=-1,
+    )
     return sts_values.tolist(), routing.cpu()
 
 

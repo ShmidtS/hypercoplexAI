@@ -58,11 +58,13 @@ class DomainProblemDataset(Dataset):
         samples: List[Tuple[str, int]],
         embed_dim: int = 64,
         pair_indices: Optional[List[int]] = None,
+        pair_group_ids: Optional[List[int]] = None,
     ) -> None:
         assert embed_dim % 4 == 0, f"embed_dim must be divisible by 4, got {embed_dim}"
         self.samples = samples
         self.embed_dim = embed_dim
         self.pair_indices = pair_indices
+        self.pair_group_ids = pair_group_ids
         self._encodings: List[torch.Tensor] = [
             _text_to_embedding(text, embed_dim) for text, _ in samples
         ]
@@ -71,6 +73,10 @@ class DomainProblemDataset(Dataset):
         if self.pair_indices is not None:
             if len(self.pair_indices) != len(self.samples):
                 raise ValueError("pair_indices must have the same length as samples")
+            if self.pair_group_ids is None:
+                raise ValueError("pair_group_ids must be provided with pair_indices")
+            if len(self.pair_group_ids) != len(self.samples):
+                raise ValueError("pair_group_ids must have the same length as samples")
             for idx, pair_idx in enumerate(self.pair_indices):
                 if pair_idx < 0 or pair_idx >= len(self.samples):
                     raise IndexError("pair_indices contains an out-of-range sample index")
@@ -78,6 +84,8 @@ class DomainProblemDataset(Dataset):
                     raise ValueError("pair_indices must reference a different sample")
                 if self._labels[pair_idx] == self._labels[idx]:
                     raise ValueError("pair_indices must point to a sample from a different domain")
+                if self.pair_group_ids[pair_idx] != self.pair_group_ids[idx]:
+                    raise ValueError("pair_indices must stay within the same cross-domain pair group")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -93,7 +101,11 @@ class DomainProblemDataset(Dataset):
             item["pair_encoding"] = self._encodings[pair_idx].float()
             item["pair_domain_id"] = torch.tensor(self._labels[pair_idx], dtype=torch.long)
             item["pair_index"] = torch.tensor(pair_idx, dtype=torch.long)
-            item["pair_same_template"] = torch.tensor(True)
+            item["pair_group_id"] = torch.tensor(self.pair_group_ids[idx], dtype=torch.long)
+            item["pair_same_template"] = torch.tensor(
+                self.pair_group_ids[pair_idx] == self.pair_group_ids[idx],
+                dtype=torch.bool,
+            )
 
         return item
 
@@ -199,14 +211,18 @@ def create_paired_demo_dataset(
             raise ValueError("Could not construct cross-domain pair for sample")
         pair_indices.append(random.choice(candidates))
 
+    pair_group_ids = list(variant_ids)
+
     order = list(range(len(samples)))
     random.shuffle(order)
     shuffled_samples = [samples[i] for i in order]
     inverse_order = {old_idx: new_idx for new_idx, old_idx in enumerate(order)}
     shuffled_pairs = [inverse_order[pair_indices[old_idx]] for old_idx in order]
+    shuffled_pair_groups = [pair_group_ids[old_idx] for old_idx in order]
 
     return DomainProblemDataset(
         shuffled_samples,
         embed_dim=embed_dim,
         pair_indices=shuffled_pairs,
+        pair_group_ids=shuffled_pair_groups,
     )
