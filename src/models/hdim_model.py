@@ -266,9 +266,10 @@ class HDIMModel(nn.Module):
             )
             output[mask] = group_output
             routing_weights[mask] = transfer_state["routing_weights"].to(dtype=source_encoding.dtype)
-            invariant[mask] = self.processed_inv_head(transfer_state["processed_invariant"]).to(dtype=source_encoding.dtype)
+            invariant[mask] = self.training_inv_head(transfer_state["training_invariant"]).to(dtype=source_encoding.dtype)
             processed_invariant[mask] = transfer_state["processed_invariant"].to(dtype=source_encoding.dtype)
             raw_invariant[mask] = transfer_state["raw_invariant"].to(dtype=source_encoding.dtype)
+            training_invariant[mask] = transfer_state["training_invariant"].to(dtype=source_encoding.dtype)
             memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=source_encoding.dtype)
             router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=source_encoding.dtype)
 
@@ -277,5 +278,6 @@ class HDIMModel(nn.Module):
             "router_loss": router_loss,
             "processed_invariant": processed_invariant,
             "raw_invariant": raw_invariant,
+            "training_invariant": training_invariant,
         }
         return output, routing_weights, invariant, aux_state

@@ -14,7 +14,22 @@ R3 использует ИНФЕРЕНС-скоры для выбора эксп
 
 import torch
 import torch.nn as nn
+from dataclasses import dataclass
 from typing import Any, Dict, Tuple
+
+
+@dataclass
+class RouterState:
+    """Typed contract for R3MoERouter output state."""
+    loss: torch.Tensor
+    router_loss: torch.Tensor
+    scores: torch.Tensor
+    topk_idx: torch.Tensor
+    gate_weights: torch.Tensor
+    train_scores_snapshot: torch.Tensor
+    topk_gate_weights: torch.Tensor
+    expert_usage: torch.Tensor
+    routing_entropy: torch.Tensor
 
 
 class R3MoERouter(nn.Module):
