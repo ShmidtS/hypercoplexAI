@@ -1,0 +1,1 @@
+"""HypercoplexAI — top-level package."""

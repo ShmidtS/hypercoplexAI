@@ -1,0 +1,113 @@
+"""
+HDIM — Domain Operators.
+Операторы доменных вращений, инвариантного извлечения и кроссдоменного переноса.
+
+Математическая основа:
+  R — ротор домена (верзор алгебры Клиффорда)
+  U_inv = R^{-1} ⊗_Cl G ⊗_Cl R — структурный инвариант
+  G_target = R_target ⊗ U_inv ⊗ R_target^{-1} — перенос в целевой домен
+"""
+
+from typing import Dict, Optional
+
+import torch
+import torch.nn as nn
+
+from .hypercomplex import CliffordAlgebra
+
+
+class DomainRotationOperator(nn.Module):
+    """Обучаемый ротор домена."""
+
+    def __init__(
+        self,
+        algebra: CliffordAlgebra,
+        domain_name: str = "default",
+        init_identity: bool = True,
+    ):
+        super().__init__()
+        self.algebra = algebra
+        self.domain_name = domain_name
+        self.R = nn.Parameter(torch.zeros(algebra.dim))
+        if init_identity:
+            self.R.data[0] = 1.0
+
+    def get_inverse(self) -> torch.Tensor:
+        R_rev = self.algebra.reverse(self.R)
+        norm_sq = self.algebra.norm(self.R) ** 2 + 1e-8
+        return R_rev / norm_sq
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.algebra.sandwich(self.R, x)
+
+    def apply_inverse(self, x: torch.Tensor) -> torch.Tensor:
+        return self.algebra.sandwich(self.get_inverse(), x)
+
+
+class InvariantExtractor(nn.Module):
+    """Извлекает структурный инвариант U_inv = R^{-1} ⊗_Cl G ⊗_Cl R."""
+
+    def __init__(self, algebra: CliffordAlgebra):
+        super().__init__()
+        self.algebra = algebra
+
+    def forward(
+        self,
+        G_source: torch.Tensor,
+        R: DomainRotationOperator,
+    ) -> torch.Tensor:
+        R_inv = R.get_inverse()
+        step1 = self.algebra.geometric_product(R_inv.expand(*G_source.shape), G_source)
+        return self.algebra.geometric_product(step1, R.R.expand(*G_source.shape))
+
+    def extract(
+        self,
+        G_source: torch.Tensor,
+        R: DomainRotationOperator,
+    ) -> torch.Tensor:
+        return self.forward(G_source, R)
+
+
+class DomainRegistry:
+    """Реестр обучаемых роторов доменов."""
+
+    def __init__(self):
+        self._operators: Dict[str, DomainRotationOperator] = {}
+
+    def register(self, name: str, operator: DomainRotationOperator) -> None:
+        self._operators[name] = operator
+
+    def get(self, name: str) -> DomainRotationOperator:
+        if name not in self._operators:
+            raise KeyError(f"Domain {name} not registered")
+        return self._operators[name]
+
+    def all_operators(self) -> Dict[str, DomainRotationOperator]:
+        return dict(self._operators)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._operators
+
+    def parameters(self):
+        for operator in self._operators.values():
+            yield from operator.parameters()
+
+
+def sandwich_transfer(
+    algebra: CliffordAlgebra,
+    G_source: torch.Tensor,
+    R_source: DomainRotationOperator,
+    R_target: DomainRotationOperator,
+    invariant_override: Optional[torch.Tensor] = None,
+):
+    """Переносит мультивектор через общий инвариант в целевой домен."""
+    if invariant_override is None:
+        R_src_inv = R_source.get_inverse()
+        step1 = algebra.geometric_product(R_src_inv.expand(*G_source.shape), G_source)
+        U_inv = algebra.geometric_product(step1, R_source.R.expand(*G_source.shape))
+    else:
+        U_inv = invariant_override
+
+    step2 = algebra.geometric_product(R_target.R.expand(*U_inv.shape), U_inv)
+    G_target = algebra.geometric_product(step2, R_target.get_inverse().expand(*U_inv.shape))
+    return U_inv, G_target
