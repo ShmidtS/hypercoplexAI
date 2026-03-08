@@ -50,16 +50,16 @@ class TransferState:
         return self.u_inv
 
     @property
-    def processed_invariant(self) -> torch.Tensor:
-        return self.u_route
+    def memory_augmented_invariant(self) -> torch.Tensor:
+        return self.u_mem
 
     @property
-    def training_invariant(self) -> torch.Tensor:
+    def exported_invariant(self) -> torch.Tensor:
         return self.u_route
 
     @property
     def invariant(self) -> torch.Tensor:
-        return self.training_invariant
+        return self.exported_invariant
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,8 +81,8 @@ class TransferState:
             "update_memory": self.update_memory,
             "input_is_invariant": self.input_is_invariant,
             "raw_invariant": self.raw_invariant,
-            "processed_invariant": self.processed_invariant,
-            "training_invariant": self.training_invariant,
+            "memory_augmented_invariant": self.memory_augmented_invariant,
+            "exported_invariant": self.exported_invariant,
             "invariant": self.invariant,
         }
 

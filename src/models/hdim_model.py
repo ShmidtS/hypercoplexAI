@@ -123,7 +123,7 @@ class HDIMModel(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
-        processed_invariant = torch.empty(
+        exported_invariant = torch.empty(
             batch_size,
             self.pipeline.clifford_dim,
             device=x.device,
@@ -135,7 +135,7 @@ class HDIMModel(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
-        training_invariant = torch.empty(
+        memory_augmented_invariant = torch.empty(
             batch_size,
             self.pipeline.clifford_dim,
             device=x.device,

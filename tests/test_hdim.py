@@ -50,6 +50,9 @@ def test_model_forward_return_state(model, cfg):
     assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
     assert state["processed_invariant"].shape == (bsz, model.pipeline.clifford_dim)
+    assert state["training_invariant"].shape == (bsz, model.pipeline.clifford_dim)
+    expected_inv = model.training_inv_head(state["training_invariant"])
+    assert torch.allclose(inv, expected_inv, atol=1e-5)
     assert state["router_loss"].ndim == 0
     assert state["memory_loss"].ndim == 0
 
@@ -167,6 +170,28 @@ def test_evaluate_batch_with_pairs(trainer):
     losses = trainer.evaluate_batch(batch)
     assert losses["loss_total"].item() >= 0
     assert losses["loss_iso"].item() >= 0
+    assert losses["training_invariant"].shape == losses["processed_invariant"].shape
+
+
+def test_model_forward_rejects_invalid_domain_id(model, cfg):
+    x = torch.randn(2, cfg.hidden_dim)
+    domain_id = torch.tensor([0, cfg.num_domains], dtype=torch.long)
+    with pytest.raises(IndexError):
+        model(x, domain_id, update_memory=False, memory_mode="retrieve")
+
+
+def test_transfer_pairs_rejects_invalid_target_domain(model, cfg):
+    x = torch.randn(2, cfg.hidden_dim)
+    source_domain_id = torch.tensor([0, 1], dtype=torch.long)
+    target_domain_id = torch.tensor([1, cfg.num_domains], dtype=torch.long)
+    with pytest.raises(IndexError):
+        model.transfer_pairs(
+            x,
+            source_domain_id,
+            target_domain_id,
+            update_memory=False,
+            memory_mode="retrieve",
+        )
 
 def test_compute_all_metrics_runs_on_model_device(trainer):
     ds = create_demo_dataset(n_samples=16)
