@@ -188,6 +188,7 @@ def compute_all_metrics(
     all_group_ids: List[torch.Tensor] = []
     all_domain_ids: List[torch.Tensor] = []
     all_pair_domain_ids: List[torch.Tensor] = []
+    all_pair_labels: List[torch.Tensor] = []
     sts_exported_scores: List[torch.Tensor] = []
     sts_training_scores: List[torch.Tensor] = []
     routing_runs: List[List[torch.Tensor]] = [[] for _ in range(num_routing_runs)]
@@ -220,6 +221,8 @@ def compute_all_metrics(
                 all_tgt_inv.append(tgt_state.exported_invariant.cpu())
                 if "pair_group_id" in batch:
                     all_group_ids.append(batch["pair_group_id"].cpu())
+                if "pair_relation_label" in batch:
+                    all_pair_labels.append(batch["pair_relation_label"].cpu())
                 all_domain_ids.append(d_ids.cpu())
                 all_pair_domain_ids.append(pd_ids.cpu())
 
@@ -227,32 +230,38 @@ def compute_all_metrics(
     all_sts_exported = torch.cat(sts_exported_scores) if sts_exported_scores else torch.empty(0)
     all_sts_training = torch.cat(sts_training_scores) if sts_training_scores else torch.empty(0)
 
-    # Глобальный pair_margin
+    # Глобальный pair_margin — используем labeled positive/negative пары
     mean_pair_margin = 0.0
-    if all_src_inv and all_tgt_inv and all_group_ids:
+    if all_src_inv and all_tgt_inv:
         src = F.normalize(torch.cat(all_src_inv), dim=-1)
         tgt = F.normalize(torch.cat(all_tgt_inv), dim=-1)
-        groups = torch.cat(all_group_ids)
-        domain_ids_all = torch.cat(all_domain_ids)
-        pair_domain_ids_all = torch.cat(all_pair_domain_ids)
-        N = src.shape[0]
-        # Positive scores: диагональные элементы
-        pos_scores = (src * tgt).sum(dim=-1)  # (N,)
-        # Negative scores: для каждого образца найти негатив из другой группы
-        neg_scores = torch.zeros(N)
-        for i in range(N):
-            neg_mask = (groups != groups[i]) & (pair_domain_ids_all != domain_ids_all[i])
-            if not neg_mask.any():
-                neg_mask = groups != groups[i]
-            if neg_mask.any():
-                neg_sim = (src[i:i+1] * tgt[neg_mask]).sum(dim=-1)
-                neg_scores[i] = neg_sim.max().item()
-            else:
-                neg_scores[i] = 0.0
-        pair_margins = pos_scores - neg_scores
-        mean_pair_margin = pair_margins.mean().item()
-    elif all_sts_exported.numel() > 0:
-        mean_pair_margin = 0.0
+        pair_labels_cat = torch.cat(all_pair_labels) if all_pair_labels else None
+        if pair_labels_cat is not None and pair_labels_cat.shape[0] == src.shape[0]:
+            pos_mask = pair_labels_cat > 0.5
+            neg_mask = ~pos_mask
+            diag_sim = (src * tgt).sum(dim=-1)  # per-sample similarity
+            if pos_mask.any() and neg_mask.any():
+                pos_mean = diag_sim[pos_mask].mean().item()
+                neg_mean = diag_sim[neg_mask].mean().item()
+                mean_pair_margin = pos_mean - neg_mean
+            elif pos_mask.any():
+                # Only positives: compare against global negatives (other groups)
+                groups = torch.cat(all_group_ids) if all_group_ids else None
+                if groups is not None:
+                    pos_scores = diag_sim[pos_mask]
+                    # Find cross-group negatives for each positive
+                    neg_scores_list = []
+                    pos_indices = pos_mask.nonzero(as_tuple=True)[0]
+                    for pi in pos_indices:
+                        neg_mask2 = torch.cat(all_group_ids) != torch.cat(all_group_ids)[pi]
+                        if neg_mask2.any():
+                            neg_sims = (src[pi:pi+1] * tgt[neg_mask2]).sum(dim=-1)
+                            neg_scores_list.append(neg_sims.mean())
+                    if neg_scores_list:
+                        neg_mean = torch.stack(neg_scores_list).mean().item()
+                        mean_pair_margin = pos_scores.mean().item() - neg_mean
+        elif src.shape[0] > 0:
+            mean_pair_margin = 0.0
 
     mean_sts_exported = all_sts_exported.mean().item() if all_sts_exported.numel() else 0.0
     mean_sts_training = all_sts_training.mean().item() if all_sts_training.numel() else 0.0

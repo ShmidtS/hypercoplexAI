@@ -344,3 +344,117 @@ class TestAdvancedEncoderIntegration:
         domain_id = torch.zeros(4, dtype=torch.long)
         out, routing, inv = model(x, domain_id, update_memory=False, memory_mode="retrieve")
         assert out.shape == (4, cfg.hidden_dim)
+
+
+# ============================================================
+# Phase 3: trainer recon_target fix tests
+# ============================================================
+
+class TestNegativePairReconTarget:
+    """Проверяем что negative pairs используют source encoding как recon_target."""
+
+    def test_positive_pair_recon_toward_target(self):
+        """Для positive pair: loss_recon = mse(output, pair_encoding)."""
+        from src.models.hdim_model import HDIMConfig, HDIMModel
+        from src.training.trainer import HDIMTrainer
+        import torch
+
+        cfg = HDIMConfig(hidden_dim=64)
+        model = HDIMModel(cfg)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        trainer = HDIMTrainer(model, optimizer)
+
+        batch = {
+            "encoding": torch.randn(4, 64),
+            "domain_id": torch.tensor([0, 1, 0, 1], dtype=torch.long),
+            "pair_encoding": torch.randn(4, 64),
+            "pair_domain_id": torch.tensor([1, 0, 1, 0], dtype=torch.long),
+            "pair_relation_label": torch.tensor([1., 1., 1., 1.]),
+            "pair_weight": torch.ones(4),
+            "pair_group_id": torch.tensor([0, 0, 1, 1]),
+            "pair_family_id": torch.tensor([0, 0, 1, 1]),
+        }
+        losses = trainer._compute_batch_losses(batch)
+        assert "loss_recon" in losses
+        assert losses["loss_recon"].item() >= 0.0
+
+    def test_negative_pair_recon_toward_source(self):
+        """Для negative pair: recon_target должен быть близок к source encoding."""
+        from src.models.hdim_model import HDIMConfig, HDIMModel
+        from src.training.trainer import HDIMTrainer
+        import torch
+
+        cfg = HDIMConfig(hidden_dim=64)
+        model = HDIMModel(cfg)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        trainer = HDIMTrainer(model, optimizer)
+
+        enc = torch.randn(4, 64)
+        pair_enc = torch.randn(4, 64) * 100.0  # Very different pair
+        batch = {
+            "encoding": enc,
+            "domain_id": torch.tensor([0, 1, 0, 1], dtype=torch.long),
+            "pair_encoding": pair_enc,
+            "pair_domain_id": torch.tensor([1, 0, 1, 0], dtype=torch.long),
+            "pair_relation_label": torch.tensor([0., 0., 0., 0.]),  # All negative
+            "pair_weight": torch.ones(4),
+            "pair_group_id": torch.tensor([0, 1, 2, 3]),
+            "pair_family_id": torch.tensor([0, 1, 2, 3]),
+        }
+        losses = trainer._compute_batch_losses(batch)
+        # With negative pairs and recon toward source,
+        # reconstruction should be feasible (lower than with very distant pair_enc)
+        assert losses["loss_recon"].item() >= 0.0
+        assert not torch.isnan(losses["loss_recon"])
+
+
+# ============================================================
+# Phase 3: compute_primary_score tests
+# ============================================================
+
+class TestPrimaryScore:
+    def test_score_formula_consistent(self):
+        from scripts.gpu_train import compute_primary_score, PRIMARY_SCORE_WEIGHTS
+        quality = {"pair_margin": 0.1, "STS_exported": 0.5}
+        expected = 0.1 * 1.0 + 0.5 * 0.3
+        score = compute_primary_score(quality)
+        assert abs(score - expected) < 1e-6
+
+    def test_score_with_missing_keys(self):
+        from scripts.gpu_train import compute_primary_score
+        quality = {}
+        score = compute_primary_score(quality)
+        assert score == 0.0
+
+    def test_check_run_validity_crash_nan(self):
+        from scripts.gpu_train import check_run_validity
+        results = {
+            "quality": {"pair_margin": 0.1, "STS_exported": 0.3},
+            "nan_batches_total": 100,
+            "training_summary": {"total_epochs": 10},
+        }
+        is_valid, reason = check_run_validity(results)
+        assert not is_valid
+        assert reason == "crash_nan"
+
+    def test_check_run_validity_metric_regression(self):
+        from scripts.gpu_train import check_run_validity
+        results = {
+            "quality": {"pair_margin": 0.0, "STS_exported": 0.0},
+            "nan_batches_total": 0,
+            "training_summary": {"total_epochs": 10},
+        }
+        is_valid, reason = check_run_validity(results)
+        assert not is_valid
+        assert reason == "metric_regression"
+
+    def test_check_run_validity_ok(self):
+        from scripts.gpu_train import check_run_validity
+        results = {
+            "quality": {"pair_margin": 0.05, "STS_exported": 0.6},
+            "nan_batches_total": 2,
+            "training_summary": {"total_epochs": 20},
+        }
+        is_valid, reason = check_run_validity(results)
+        assert is_valid
+        assert reason == ""

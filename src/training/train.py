@@ -1,4 +1,6 @@
-# train.py — запуск: python -m src.training.train
+# train.py -- запуск: python -m src.training.train
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
@@ -9,6 +11,7 @@ from torch.utils.data import DataLoader
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.metrics import compute_all_metrics
+from src.models.model_factory import build_text_hdim_model
 from src.models.text_hdim_model import TextHDIMModel
 from src.training.dataset import (
     create_demo_dataset,
@@ -48,7 +51,10 @@ def _load_experiment_config(config_path: Path | None) -> ExperimentConfig | None
     return ExperimentConfig.from_json(config_path)
 
 
-def _apply_experiment_defaults(args: argparse.Namespace, experiment: ExperimentConfig | None) -> argparse.Namespace:
+def _apply_experiment_defaults(
+    args: argparse.Namespace,
+    experiment: ExperimentConfig | None,
+) -> argparse.Namespace:
     if experiment is None:
         return args
 
@@ -68,13 +74,40 @@ def _apply_experiment_defaults(args: argparse.Namespace, experiment: ExperimentC
         args.ledger_path = Path(experiment.ledger_path)
     if experiment.description:
         args.description = experiment.description
-    args.model_override.extend(f"{key}={value}" for key, value in experiment.model_overrides.items())
-    args.trainer_override.extend(f"{key}={value}" for key, value in experiment.trainer_overrides.items())
+    args.model_override.extend(
+        f"{key}={value}" for key, value in experiment.model_overrides.items()
+    )
+    args.trainer_override.extend(
+        f"{key}={value}" for key, value in experiment.trainer_overrides.items()
+    )
+
+    # Phase-2 advanced component flags from manifest
+    if experiment.advanced_encoder:
+        args.advanced_encoder = True
+    if experiment.hierarchical_memory:
+        args.hierarchical_memory = True
+    if experiment.soft_router:
+        args.soft_router = True
+
+    # Phase-2 HDIMConfig overrides from manifest (only when not already
+    # present as explicit CLI args -- we check for non-default values).
+    if experiment.hidden_dim != 128:   # non-default -> forward as model_override
+        args.model_override.append(f"hidden_dim={experiment.hidden_dim}")
+    if experiment.num_experts != 4:
+        args.model_override.append(f"num_experts={experiment.num_experts}")
+
     return args
 
 
 def _build_config(args: argparse.Namespace) -> HDIMConfig:
     cfg = HDIMConfig()
+    # Apply hidden_dim / num_experts from CLI flags first (take precedence
+    # over model_override strings for these two well-known knobs).
+    if getattr(args, "hidden_dim", None) is not None:
+        cfg.hidden_dim = args.hidden_dim
+    if getattr(args, "num_experts", None) is not None:
+        cfg.num_experts = args.num_experts
+
     for key, value in _parse_overrides(args.model_override).items():
         if not hasattr(cfg, key):
             raise ValueError(f"Unknown model override: {key}")
@@ -82,8 +115,36 @@ def _build_config(args: argparse.Namespace) -> HDIMConfig:
     return cfg
 
 
-def _build_trainer(model: HDIMModel, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> HDIMTrainer:
-    trainer_kwargs = {
+def _build_model(
+    cfg: HDIMConfig,
+    args: argparse.Namespace,
+) -> HDIMModel | TextHDIMModel:
+    """Build the model using model_factory when advanced flags are set."""
+    advanced_encoder: bool = getattr(args, "advanced_encoder", False)
+    hierarchical_memory: bool = getattr(args, "hierarchical_memory", False)
+    soft_router: bool = getattr(args, "soft_router", False)
+
+    needs_text = args.text_mode or advanced_encoder or hierarchical_memory or soft_router
+
+    if needs_text or advanced_encoder or hierarchical_memory or soft_router:
+        return build_text_hdim_model(
+            cfg,
+            advanced_encoder=advanced_encoder,
+            hierarchical_memory=hierarchical_memory,
+            soft_router=soft_router,
+        )
+
+    # Plain baseline path (identical to pre-Phase-2 behaviour)
+    core_model = HDIMModel(cfg)
+    return TextHDIMModel(core_model) if args.text_mode else core_model
+
+
+def _build_trainer(
+    model: HDIMModel,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+) -> HDIMTrainer:
+    trainer_kwargs: dict[str, Any] = {
         "device": args.device,
     }
     for key, value in _parse_overrides(args.trainer_override).items():
@@ -128,9 +189,14 @@ def _build_run_summary(
             "seed": args.seed,
             "text_mode": args.text_mode,
             "description": args.description,
+            "advanced_encoder": getattr(args, "advanced_encoder", False),
+            "hierarchical_memory": getattr(args, "hierarchical_memory", False),
+            "soft_router": getattr(args, "soft_router", False),
         },
         "validation": val_metrics,
         "quality": quality_metrics,
+        "score": quality_metrics.get("pair_margin", 0.0),
+        "nan_batches_total": 0,
         "checkpoint": checkpoint_path.as_posix(),
         "config_hash": config_hash,
         "status": status,
@@ -140,9 +206,15 @@ def _build_run_summary(
 def _resolve_run_id(experiment: ExperimentConfig | None) -> str | None:
     if experiment is None:
         return None
-    return str(experiment.metadata.get("run_id")) if experiment.metadata.get("run_id") is not None else None
+    rid = experiment.metadata.get("run_id")
+    return str(rid) if rid is not None else None
 
-def _resolve_checkpoint_path(args: argparse.Namespace, experiment: ExperimentConfig | None, run_id: str | None) -> Path:
+
+def _resolve_checkpoint_path(
+    args: argparse.Namespace,
+    experiment: ExperimentConfig | None,
+    run_id: str | None,
+) -> Path:
     if args.results_json is not None:
         return args.results_json.parent / "checkpoints" / "hdim_final.pt"
     if experiment is not None and experiment.output_dir is not None:
@@ -154,47 +226,82 @@ def _resolve_checkpoint_path(args: argparse.Namespace, experiment: ExperimentCon
     return checkpoint_dir / "hdim_final.pt"
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Train HDIM model")
-    parser.add_argument("--config", type=Path, default=None, help="Optional experiment manifest JSON path.")
+    parser.add_argument(
+        "--config", type=Path, default=None,
+        help="Optional experiment manifest JSON path.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--num_samples", type=int, default=100)
-    parser.add_argument("--use_pairs", action="store_true", help="Use paired cross-domain supervision dataset")
+    parser.add_argument(
+        "--use_pairs", action="store_true",
+        help="Use paired cross-domain supervision dataset",
+    )
     parser.add_argument("--negative_ratio", type=float, default=0.0)
     parser.add_argument("--train_fraction", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--text_mode", action="store_true", help="Train through TextHDIMModel wrapper")
+    parser.add_argument(
+        "--text_mode", action="store_true",
+        help="Train through TextHDIMModel wrapper",
+    )
     parser.add_argument("--description", default="baseline")
-    parser.add_argument("--model_override", action="append", default=[], help="Model override in key=value format")
-    parser.add_argument("--trainer_override", action="append", default=[], help="Trainer override in key=value format")
     parser.add_argument(
-        "--results_json",
-        type=Path,
-        default=None,
-        help="Optional path to write machine-readable run summary JSON for autoresearch-style orchestration.",
+        "--model_override", action="append", default=[],
+        help="Model override in key=value format",
     )
     parser.add_argument(
-        "--ledger_path",
-        type=Path,
-        default=None,
-        help="Optional JSONL ledger path for keep/discard style experiment logging.",
+        "--trainer_override", action="append", default=[],
+        help="Trainer override in key=value format",
     )
+    parser.add_argument(
+        "--results_json", type=Path, default=None,
+        help="Optional path to write machine-readable run summary JSON.",
+    )
+    parser.add_argument(
+        "--ledger_path", type=Path, default=None,
+        help="Optional JSONL ledger path for keep/discard style logging.",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Phase-2 advanced component flags                                    #
+    # ------------------------------------------------------------------ #
+    parser.add_argument(
+        "--advanced_encoder", action="store_true",
+        help="Replace SimpleTextEncoder with AdvancedTextEncoder (Transformer+RoPE).",
+    )
+    parser.add_argument(
+        "--hierarchical_memory", action="store_true",
+        help="Replace TitansMemoryModule with HierarchicalTitansMemory.",
+    )
+    parser.add_argument(
+        "--soft_router", action="store_true",
+        help="Replace R3MoERouter with SoftMoERouter.",
+    )
+    parser.add_argument(
+        "--hidden_dim", type=int, default=None,
+        help="Override HDIMConfig.hidden_dim.",
+    )
+    parser.add_argument(
+        "--num_experts", type=int, default=None,
+        help="Override HDIMConfig.num_experts.",
+    )
+
     args = parser.parse_args()
 
     experiment = _load_experiment_config(args.config)
     args = _apply_experiment_defaults(args, experiment)
 
     cfg = _build_config(args)
-    core_model = HDIMModel(cfg)
-    model = TextHDIMModel(core_model) if args.text_mode else core_model
+    model = _build_model(cfg, args)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     trainer = _build_trainer(model, optimizer, args)
 
     dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
-    dataset_kwargs = {
+    dataset_kwargs: dict[str, Any] = {
         "n_samples": args.num_samples,
         "embed_dim": cfg.hidden_dim,
         "seed": args.seed,
@@ -202,11 +309,13 @@ def main():
     if args.use_pairs:
         dataset_kwargs["negative_ratio"] = args.negative_ratio
     dataset = dataset_factory(**dataset_kwargs)
-    train_ds, val_ds = create_group_aware_split(dataset, train_fraction=args.train_fraction, seed=args.seed)
+    train_ds, val_ds = create_group_aware_split(
+        dataset, train_fraction=args.train_fraction, seed=args.seed
+    )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
-    val_metrics = None
+    val_metrics: dict | None = None
     for epoch in range(args.epochs):
         total_loss = 0.0
         for batch in train_loader:
@@ -214,7 +323,11 @@ def main():
             total_loss += loss.item()
         avg_loss = total_loss / len(train_loader)
         val_metrics = trainer.validate(val_loader)
-        print(f'Epoch {epoch+1}/{args.epochs} | train_loss={avg_loss:.4f} | val_loss={val_metrics["loss_total"]:.4f}')
+        print(
+            f"Epoch {epoch + 1}/{args.epochs} "
+            f"| train_loss={avg_loss:.4f} "
+            f'| val_loss={val_metrics["loss_total"]:.4f}'
+        )
 
     if val_metrics is None:
         val_metrics = trainer.validate(val_loader)
@@ -248,7 +361,9 @@ def main():
             status=status,
         )
         args.results_json.parent.mkdir(parents=True, exist_ok=True)
-        args.results_json.write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
+        args.results_json.write_text(
+            json.dumps(run_summary, indent=2), encoding="utf-8"
+        )
         print(f"Wrote run summary to {args.results_json}")
         if args.ledger_path is not None:
             append_ledger_row(

@@ -321,14 +321,23 @@ MVP не должен описываться как уже имеющий:
 - EMA train_scores для R3 совместимости;
 - API-совместим с `R3MoERouter`.
 
-### J. GPU Training Infrastructure (Phase 2)
+### J. GPU Training Infrastructure (Phase 3)
 Реализовано:
-- `scripts/gpu_train.py` — полноценный GPU training loop;
-- AMP (Automatic Mixed Precision) для GPU;
-- Cosine LR scheduler с linear warmup;
-- Live monitoring (JSONL log каждой эпохи);
-- Checkpoint по лучшей val pair_margin;
-- `scripts/autoresearch_loop.py` — iterative hyperparameter search (grid/random/refinement).
+- `scripts/gpu_train.py` — GPU training loop с AMP (torch.amp API), OneCycleLR scheduler;
+- Мониторинг: `nan_batches_epoch`, `nan_batches_total`, `loss_memory`, `loss_routing`, `score` (canonical PRIMARY_SCORE_WEIGHTS);
+- `compute_primary_score()` и `check_run_validity()` — единственный источник scoring для incumbent comparison;
+- Checkpoint по лучшему `score` с `--results_json` / `--ledger_path` для orchestration;
+- `scripts/autoresearch_loop.py` — двухфазный `two_phase` режим (explore→refine) с `IncumbentTracker`;
+- `IncumbentTracker` отслеживает лучшую конфигурацию, ведёт failure taxonomy: `crash_nan`, `crash_oom`, `crash_runtime`, `metric_regression`, `timeout`;
+- `check_run_validity()` блокирует metric_regression и crash_nan прогоны от попадания в incumbent.
+
+### K. Обнаруженные эмпирические закономерности (Phase 3)
+Из autoresearch экспериментов на RTX 3070:
+- Конфигурация `advanced_encoder=True, soft_router=True, hierarchical_memory=False` показывает наиболее стабильное обучение;
+- `HierarchicalTitansMemory` + `AdvancedTextEncoder` совместно нестабильны — TTT gradient плохо взаимодействует с AMP;
+- `hidden_dim=64-128` с `num_experts=8` предпочтительнее больших моделей на малых датасетах;
+- Исправление recon_target для negative pairs (source encoding вместо pair encoding) критически важно для положительного pair_margin;
+- Labeled pair_margin (pos vs neg по `pair_relation_label`) является более надёжной метрикой чем группово-вычисляемый margin.
 
 ## 5.2 Next-phase engineering components
 Следующая фаза должна улучшать текущий код, а не подменять его новой абстрактной архитектурой.
@@ -571,8 +580,8 @@ raw texts
 | AdvancedTextEncoder | implemented (Phase 2) | `hypercoplexAI/src/models/advanced_text_encoder.py` | Transformer+RoPE+AttentionPooling замена SimpleTextEncoder |
 | HierarchicalTitansMemory | implemented (Phase 2) | `hypercoplexAI/src/core/hierarchical_memory.py` | two-level memory с surprise-based routing |
 | SoftMoERouter | implemented (Phase 2) | `hypercoplexAI/src/core/soft_moe_router.py` | Soft MoE без token dropping |
-| GPU training script | implemented (Phase 2) | `hypercoplexAI/scripts/gpu_train.py` | AMP, cosine LR, live monitoring |
-| AutoResearch Loop | implemented (Phase 2) | `hypercoplexAI/scripts/autoresearch_loop.py` | grid/random/refinement hyperparameter search |
+| GPU training script | implemented (Phase 3) | `hypercoplexAI/scripts/gpu_train.py` | AMP (torch.amp), OneCycleLR, canonical score, check_run_validity, nan tracking |
+| AutoResearch Loop | implemented (Phase 3) | `hypercoplexAI/scripts/autoresearch_loop.py` | двухфазный explore→refine с IncumbentTracker и failure taxonomy |
 | Q-Attention | research only | not present in runtime code | оставить как post-MVP extension |
 | TRIZ parser / avatars / Scholar ingestion | research only | not present in runtime code | внешний workflow, не ядро Python MVP |
 
@@ -606,16 +615,27 @@ raw texts
 
 Статус: **частично реализовано и уже привязано к текущему коду**.
 
-## 10.2 Phase 2 — next implementation phase
+## 10.2 Phase 2 — completed implementation
 Цель: усилить реализуемость и экспериментальную достоверность.
 
-Приоритеты:
-1. улучшить paired supervision;
-2. формализовать memory lifecycle;
-3. расширить algebraic and transfer contract tests;
-4. укрепить router observability;
-5. выровнять training/eval semantics;
-6. канонизировать invariant-state naming и API.
+Выполнено:
+1. AdvancedTextEncoder с RoPE + AttentionPooling — замена SimpleTextEncoder;
+2. HierarchicalTitansMemory с surprise-based long-term routing;
+3. SoftMoERouter без token dropping;
+4. GPU training loop с AMP, canonical score, check_run_validity;
+5. AutoResearch Loop с двухфазным explore→refine и IncumbentTracker;
+6. Исправление recon_target для negative pairs (критический баг training objective);
+7. Labeled pair_margin в compute_all_metrics.
+
+## 10.3 Phase 3 — in progress
+Цель: стабилизировать обучение и улучшить качество метрик.
+
+Выявленные проблемы и работы:
+1. HierarchicalTitansMemory TTT нестабилен с AMP — изолировать float32 path;
+2. pair_margin остаётся малым (~0.02-0.04) — исследовать влияние датасета и loss весов;
+3. val_loss скачет из-за редкого eval — увеличить частоту eval;
+4. Масштабирование: GPU использует <1% VRAM — увеличить hidden_dim/batch для RTX 3070;
+5. Реальные текстовые данные — добавить возможность обучения на реальных text corpora.
 
 ## 10.3 Phase 3 — long-term research
 Цель: перейти от MVP transfer engine к исследовательской платформе.

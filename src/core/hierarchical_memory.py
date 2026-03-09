@@ -129,34 +129,50 @@ class HierarchicalTitansMemory(nn.Module):
         Один TTT шаг для одного уровня памяти.
         Возвращает (alpha, eta, theta) для диагностики.
         """
-        k_agg = self._aggregate_key(k.detach())
-        gates = torch.sigmoid(gate_proj(k_agg))
+        # Use float32 for stability in mixed-precision contexts
+        k32 = k.detach().float()
+        v32 = v.detach().float()
+        k_agg = self._aggregate_key(k32)
+        gates = torch.sigmoid(gate_proj(k_agg.to(gate_proj.weight.dtype)))
         alpha, eta, theta = gates[0], gates[1], gates[2]
 
         if scale is not None:
             theta = theta * scale.clamp(0.0, 1.0)
 
-        loss_ttt = F.mse_loss(memory(k.detach()), v.detach())
+        # TTT gradient in float32
+        mem_weight_fp32 = memory.weight.float()
+        pred = k32 @ mem_weight_fp32.T
+        loss_ttt = F.mse_loss(pred, v32)
+        if torch.isnan(loss_ttt) or torch.isinf(loss_ttt):
+            return alpha.detach(), eta.detach(), theta.detach()
         grad = torch.autograd.grad(
             loss_ttt,
-            memory.weight,
+            mem_weight_fp32,
             retain_graph=False,
             create_graph=False,
         )[0]
 
         # Clamp gradient to prevent explosive TTT update
-        grad_clamped = torch.clamp(grad.detach(), min=-1.0, max=1.0)
+        grad_clamped = torch.clamp(grad.detach(), min=-0.5, max=0.5)
 
-        # Momentum update
-        new_momentum = eta * momentum_buf.detach() - 0.01 * theta * grad_clamped
-        momentum_buf.copy_(new_momentum)
+        # Momentum update in float32
+        mom_fp32 = momentum_buf.float()
+        alpha_f = alpha.float()
+        eta_f = eta.float()
+        theta_f = theta.float()
+        new_momentum = eta_f * mom_fp32 - 0.01 * theta_f * grad_clamped
+        # Clamp momentum norm
+        mom_norm = new_momentum.norm()
+        if mom_norm > 5.0:
+            new_momentum = new_momentum * (5.0 / (mom_norm + 1e-8))
+        momentum_buf.copy_(new_momentum.to(momentum_buf.dtype))
 
         # Memory update with max-norm constraint
-        new_weight = (1 - alpha) * memory.weight.data + momentum_buf.data
+        new_weight = (1 - alpha_f) * mem_weight_fp32 + new_momentum
         weight_norm = new_weight.norm()
         if weight_norm > 10.0:
             new_weight = new_weight * (10.0 / (weight_norm + 1e-8))
-        memory.weight.data.copy_(new_weight)
+        memory.weight.data.copy_(new_weight.to(memory.weight.dtype))
         return alpha.detach(), eta.detach(), theta.detach()
 
 

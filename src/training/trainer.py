@@ -382,7 +382,15 @@ class HDIMTrainer:
                         memory_mode=regime.memory_mode,
                     )
                 )
-                recon_target = self._encode_texts(pair_texts)
+                # For negative pairs: recon_target = source encoding
+                _prl = batch.get("pair_relation_label")
+                _src_enc = self._encode_texts(texts)
+                _tgt_enc = self._encode_texts(pair_texts)
+                if _prl is not None:
+                    _pos_mask = (_prl.to(self.device) > 0.5).unsqueeze(-1).expand_as(_src_enc)
+                    recon_target = torch.where(_pos_mask, _tgt_enc, _src_enc)
+                else:
+                    recon_target = _tgt_enc
             else:
                 output, routing_weights, invariant, aux_state = self._forward_text_batch(
                     texts, domain_id, regime
@@ -400,7 +408,14 @@ class HDIMTrainer:
                     update_memory=regime.update_memory,
                     memory_mode=regime.memory_mode,
                 )
-                recon_target = pair_encoding
+                # For negative pairs: recon_target = source encoding (no transfer)
+                # For positive pairs: recon_target = pair_encoding (cross-domain transfer)
+                pair_relation_label = batch.get("pair_relation_label")
+                if pair_relation_label is not None:
+                    pos_mask = (pair_relation_label > 0.5).unsqueeze(-1).expand_as(encoding)
+                    recon_target = torch.where(pos_mask, pair_encoding, encoding)
+                else:
+                    recon_target = pair_encoding
             else:
                 output, routing_weights, invariant, aux_state = self._forward_batch(
                     encoding, domain_id, regime

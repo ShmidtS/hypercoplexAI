@@ -1,14 +1,29 @@
+"""Canonical experiment configuration contract for HDIM research.
+
+All fields carry sane defaults so legacy manifests (that omit new keys)
+continue to deserialise without errors.
+
+Backward-compat notes
+---------------------
+* ``lr`` is the canonical learning-rate field (matches train.py and older
+  manifests).  ``learning_rate`` is kept as an alias via ``__post_init__``.
+* All new Phase-2 fields default to False/None/0 so existing JSON manifests
+  that omit them deserialise without errors.
+"""
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
 class ExperimentConfig:
+    # ------------------------------------------------------------------ #
+    # Legacy / core training fields (unchanged from Phase 1)              #
+    # ------------------------------------------------------------------ #
     description: str = "baseline"
     epochs: int = 3
     batch_size: int = 16
@@ -20,18 +35,61 @@ class ExperimentConfig:
     train_fraction: float = 0.8
     seed: int = 42
     text_mode: bool = False
-    output_dir: str | None = None
-    results_json: str | None = None
-    ledger_path: str | None = None
+    output_dir: Optional[str] = None
+    results_json: Optional[str] = None
+    ledger_path: Optional[str] = None
     status: str = "pending"
-    model_overrides: dict[str, Any] = field(default_factory=dict)
-    trainer_overrides: dict[str, Any] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    model_overrides: dict = field(default_factory=dict)
+    trainer_overrides: dict = field(default_factory=dict)
+    metadata: dict = field(default_factory=dict)
 
+    # ------------------------------------------------------------------ #
+    # Phase-2 model hyper-parameters                                      #
+    # ------------------------------------------------------------------ #
+    hidden_dim: int = 128
+    num_experts: int = 4
+    num_domains: int = 4
+
+    # ------------------------------------------------------------------ #
+    # Phase-2 loss coefficients                                           #
+    # ------------------------------------------------------------------ #
+    lambda_iso: float = 0.1
+    lambda_pair: float = 0.1
+    lambda_routing: float = 0.05
+    lambda_memory: float = 0.01
+
+    # ------------------------------------------------------------------ #
+    # Phase-2 training schedule extras                                    #
+    # ------------------------------------------------------------------ #
+    warmup_epochs: int = 3
+    # Optional wall-clock budget in seconds; None means no limit.
+    time_budget_s: Optional[float] = None
+
+    # ------------------------------------------------------------------ #
+    # Phase-2 optional advanced components                                #
+    # ------------------------------------------------------------------ #
+    advanced_encoder: bool = False
+    hierarchical_memory: bool = False
+    soft_router: bool = False
+
+    # ------------------------------------------------------------------ #
+    # Misc extras                                                         #
+    # ------------------------------------------------------------------ #
+    experiment_name: str = "hdim_experiment"
+    log_interval: int = 10
+    checkpoint_dir: str = "checkpoints"
+    data_path: str = "data"
+
+    # ------------------------------------------------------------------ #
+    # Serialisation helpers (unchanged from Phase 1)                      #
+    # ------------------------------------------------------------------ #
     @classmethod
     def from_json(cls, path: str | Path) -> "ExperimentConfig":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(**payload)
+        """Load from a JSON manifest; unknown keys are silently ignored."""
+        payload: dict[str, Any] = json.loads(Path(path).read_text(encoding="utf-8"))
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        filtered = {k: v for k, v in payload.items() if k in known}
+        return cls(**filtered)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -39,3 +97,14 @@ class ExperimentConfig:
     def config_hash(self) -> str:
         encoded = json.dumps(self.to_dict(), sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()[:12]
+
+    # ------------------------------------------------------------------ #
+    # HDIMConfig bridge                                                   #
+    # ------------------------------------------------------------------ #
+    def to_hdim_config_kwargs(self) -> dict[str, Any]:
+        """Return the subset of fields relevant to HDIMConfig construction."""
+        return dict(
+            hidden_dim=self.hidden_dim,
+            num_experts=self.num_experts,
+            num_domains=self.num_domains,
+        )

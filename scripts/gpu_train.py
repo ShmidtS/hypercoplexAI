@@ -8,8 +8,9 @@ HDIM GPU Training Script с AMP, gradient checkpointing и live monitoring.
   - Gradient checkpointing для экономии памяти
   - Живой мониторинг через progress bar (tqdm) и tensorboard/json
   - Checkpoint сохранение каждые N эпох и по лучшей валидации
-  - Поддержка AdvancedTextEncoder и HierarchicalTitansMemory
+  - Поддержка AdvancedTextEncoder, HierarchicalTitansMemory, SoftMoERouter
   - Совместим с ExperimentConfig/AutoResearchRunner
+  - Использует model_factory как единственный источник сборки моделей
 
 Запуск:
   python scripts/gpu_train.py --epochs 50 --device cuda --use_pairs --text_mode --advanced_encoder
@@ -27,15 +28,15 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 # Add repo root to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.hdim_model import HDIMConfig, HDIMModel
+from src.models.hdim_model import HDIMConfig
 from src.models.metrics import compute_all_metrics
-from src.models.text_hdim_model import TextHDIMModel
+from src.models.model_factory import build_hdim_model, build_text_hdim_model
 from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
@@ -44,6 +45,52 @@ from src.training.dataset import (
 from src.training.experiment_config import ExperimentConfig
 from src.training.results_logger import append_ledger_row
 from src.training.trainer import HDIMTrainer
+
+
+# ---------------------------------------------------------------------------
+# Primary score formula — единственное место определения «качества прогона».
+# autoresearch_loop.py импортирует эту же формулу для согласованности.
+# ---------------------------------------------------------------------------
+PRIMARY_SCORE_WEIGHTS = {"pair_margin": 1.0, "STS_exported": 0.3}
+
+
+def compute_primary_score(quality: dict) -> float:
+    """Главная скалярная метрика — incumbent-совместимая."""
+    return sum(
+        w * quality.get(k, 0.0) for k, w in PRIMARY_SCORE_WEIGHTS.items()
+    )
+
+
+def check_run_validity(results: dict) -> tuple[bool, str]:
+    """Проверяет валидность завершённого прогона.
+
+    Returns
+    -------
+    (is_valid, reason)
+        is_valid — True если прогон считается успешным.
+        reason   — пустая строка при успехе, иначе код провала из таксономии.
+    """
+    quality = results.get("quality", {})
+    training_summary = results.get("training_summary", {})
+    nan_batches_total = results.get("nan_batches_total", 0)
+    total_epochs = training_summary.get("total_epochs", 0)
+
+    # crash_nan: слишком много NaN-батчей
+    if total_epochs > 0 and nan_batches_total / max(total_epochs, 1) > 5:
+        return False, "crash_nan"
+
+    # crash_oom: признак OOM — total_epochs < ожидаемого (уже поймано через returncode)
+    # здесь детектируем только на основе метрик
+
+    # metric_regression: все метрики нулевые / NaN
+    pair_margin = quality.get("pair_margin", 0.0)
+    sts = quality.get("STS_exported", 0.0)
+    if (pair_margin == 0.0 and sts == 0.0) or (
+        pair_margin != pair_margin or sts != sts  # NaN check
+    ):
+        return False, "metric_regression"
+
+    return True, ""
 
 
 def detect_device(requested: str) -> torch.device:
@@ -64,79 +111,37 @@ def detect_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
-def build_model_with_advanced_components(
-    cfg: HDIMConfig,
-    use_advanced_encoder: bool = False,
-    use_hierarchical_memory: bool = False,
-    use_soft_router: bool = False,
-    text_mode: bool = False,
-) -> nn.Module:
-    """
-    Собирает модель с опциональными продвинутыми компонентами.
-    """
-    model = HDIMModel(cfg)
-
-    if use_hierarchical_memory:
-        from src.core.hierarchical_memory import HierarchicalTitansMemory
-        old_memory = model.pipeline.memory
-        new_memory = HierarchicalTitansMemory(
-            key_dim=old_memory.key_dim,
-            val_dim=old_memory.val_dim,
-            hidden_dim=64,
+def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
+    """Собирает модель через model_factory — единственный источник истины."""
+    needs_text = args.text_mode or args.advanced_encoder or args.hierarchical_memory or args.soft_router
+    if needs_text:
+        model = build_text_hdim_model(
+            cfg,
+            advanced_encoder=args.advanced_encoder,
+            hierarchical_memory=args.hierarchical_memory,
+            soft_router=args.soft_router,
         )
-        model.pipeline.memory = new_memory
-        print("Using HierarchicalTitansMemory")
-
-    if use_soft_router:
-        from src.core.soft_moe_router import SoftMoERouter
-        old_router = model.pipeline.moe
-        new_router = SoftMoERouter(
-            input_dim=model.pipeline.clifford_dim,
-            num_experts=cfg.num_experts,
-            expert_dim=256,
-            top_k=cfg.top_k,
-        )
-        model.pipeline.moe = new_router
-        print("Using SoftMoERouter")
-
-    if text_mode:
-        text_model = TextHDIMModel(model)
-
-        if use_advanced_encoder:
-            from src.models.advanced_text_encoder import AdvancedTextEncoder
-            old_encoder = text_model.text_encoder
-            new_encoder = AdvancedTextEncoder(
-                output_dim=cfg.hidden_dim,
-                vocab_size=old_encoder.vocab_size,
-                max_length=old_encoder.max_length,
-                num_layers=2,
-                num_heads=max(1, cfg.hidden_dim // 32),
-                dropout=cfg.dropout,
-            )
-            text_model.text_encoder = new_encoder
-            print(f"Using AdvancedTextEncoder (layers=2, heads={max(1, cfg.hidden_dim // 32)})")
-
-        return text_model
-
-    return model
+        components = []
+        if args.advanced_encoder:
+            components.append("AdvancedTextEncoder")
+        if args.hierarchical_memory:
+            components.append("HierarchicalTitansMemory")
+        if args.soft_router:
+            components.append("SoftMoERouter")
+        if components:
+            print(f"Components: {', '.join(components)}")
+        return model
+    return build_hdim_model(cfg)
 
 
 class GPUTrainingMonitor:
-    """Мониторинг GPU памяти и throughput."""
+    """Мониторинг GPU памяти, throughput и NaN-статистики."""
 
     def __init__(self, device: torch.device, log_path: Optional[Path] = None):
         self.device = device
         self.log_path = log_path
         self.history: list[dict] = []
         self.start_time = time.time()
-        self._use_tqdm = self._check_tqdm()
-
-    def _check_tqdm(self) -> bool:
-        try:
-            import tqdm  # noqa
-            return True
-        except ImportError:
-            return False
 
     def gpu_stats(self) -> dict:
         if self.device.type != "cuda":
@@ -153,29 +158,39 @@ class GPUTrainingMonitor:
         val_metrics: dict,
         quality_metrics: dict,
         lr: float,
+        nan_batches_epoch: int = 0,
+        nan_batches_total: int = 0,
     ) -> None:
         elapsed = time.time() - self.start_time
         gpu_stats = self.gpu_stats()
+        score = compute_primary_score(quality_metrics)
         row = {
             "epoch": epoch,
             "train_loss": round(train_loss, 6),
             "val_loss": round(val_metrics.get("loss_total", 0.0), 6),
+            "loss_memory": round(val_metrics.get("loss_memory", 0.0), 6),
+            "loss_routing": round(val_metrics.get("loss_routing", 0.0), 6),
             "pair_margin": round(quality_metrics.get("pair_margin", 0.0), 6),
             "STS_exported": round(quality_metrics.get("STS_exported", 0.0), 6),
+            "score": round(score, 6),
             "lr": lr,
             "elapsed_s": round(elapsed, 1),
+            "nan_batches_epoch": nan_batches_epoch,
+            "nan_batches_total": nan_batches_total,
             **gpu_stats,
         }
         self.history.append(row)
 
-        # Print
         msg = (
             f"Epoch {epoch:3d}/{total_epochs} "
             f"| train={train_loss:.4f} "
             f"| val={val_metrics.get('loss_total', 0):.4f} "
             f"| margin={quality_metrics.get('pair_margin', 0):.4f} "
-            f"| STS={quality_metrics.get('STS_exported', 0):.4f}"
+            f"| STS={quality_metrics.get('STS_exported', 0):.4f} "
+            f"| score={score:.4f}"
         )
+        if nan_batches_epoch > 0:
+            msg += f" | NaN={nan_batches_epoch}"
         if gpu_stats:
             msg += f" | GPU={gpu_stats.get('gpu_allocated_gb', 0):.2f}GB"
         print(msg)
@@ -187,11 +202,12 @@ class GPUTrainingMonitor:
     def summary(self) -> dict:
         if not self.history:
             return {}
-        best = max(self.history, key=lambda x: x.get("pair_margin", -float("inf")))
+        best = max(self.history, key=lambda x: x.get("score", -float("inf")))
         return {
             "best_epoch": best["epoch"],
             "best_pair_margin": best["pair_margin"],
             "best_STS_exported": best["STS_exported"],
+            "best_score": best["score"],
             "total_epochs": len(self.history),
             "total_time_s": round(time.time() - self.start_time, 1),
         }
@@ -205,20 +221,12 @@ def run_gpu_training(
 ) -> dict[str, Any]:
     """Основной цикл GPU обучения."""
 
-    # Создаём модель
-    model = build_model_with_advanced_components(
-        cfg,
-        use_advanced_encoder=args.advanced_encoder,
-        use_hierarchical_memory=args.hierarchical_memory,
-        use_soft_router=args.soft_router,
-        text_mode=args.text_mode,
-    )
+    model = _build_model(cfg, args)
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -226,34 +234,22 @@ def run_gpu_training(
         betas=(0.9, 0.999),
     )
 
-    # LR Scheduler — cosine with warmup
-    # LR Scheduler: cosine annealing with linear warmup
-    # Use CosineAnnealingLR to avoid ZeroDivisionError when epochs <= warmup_epochs
-    warmup_steps = max(1, min(args.warmup_epochs, args.epochs - 1))
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        schedulers=[
-            torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=1e-3,
-                end_factor=1.0,
-                total_iters=warmup_steps,
-            ),
-            torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=max(1, args.epochs - warmup_steps),
-                eta_min=args.lr * 1e-2,
-            ),
-        ],
-        milestones=[warmup_steps],
+        max_lr=args.lr,
+        epochs=args.epochs,
+        steps_per_epoch=1,
+        pct_start=min(args.warmup_epochs / max(args.epochs, 1), 0.3),
+        anneal_strategy="cos",
+        div_factor=1e3,
+        final_div_factor=1e2,
     )
-    # AMP Scaler для GPU
+
     use_amp = (device.type == "cuda") and args.amp
-    scaler = GradScaler() if use_amp else None
+    scaler = GradScaler("cuda") if use_amp else None
     if use_amp:
         print("Using Automatic Mixed Precision (AMP)")
 
-    # Dataset
     trainer = HDIMTrainer(
         model, optimizer,
         device=device,
@@ -261,6 +257,7 @@ def run_gpu_training(
         lambda_pair=args.lambda_pair,
         lambda_routing=args.lambda_routing,
         lambda_memory=args.lambda_memory,
+        ranking_margin=args.ranking_margin,
     )
 
     dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
@@ -274,207 +271,199 @@ def run_gpu_training(
 
     dataset = dataset_factory(**dataset_kwargs)
     train_ds, val_ds = create_group_aware_split(dataset, train_fraction=args.train_fraction, seed=args.seed)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=(device.type=="cuda"))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=(device.type=="cuda"))
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=(device.type == "cuda"))
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"))
 
-    print(f"Dataset: {len(train_ds)} train / {len(val_ds)} val samples")
+    # Metrics loader: random split to ensure both pos/neg pairs in val for pair_margin
+    # Group-aware split may put all negatives in val; random split ensures mixed labels.
+    metrics_dataset = dataset_factory(**dataset_kwargs)
+    metrics_n = max(64, int(len(metrics_dataset) * (1 - args.train_fraction)))
+    metrics_ds, _ = torch.utils.data.random_split(
+        metrics_dataset,
+        [metrics_n, len(metrics_dataset) - metrics_n],
+        generator=torch.Generator().manual_seed(args.seed + 99),
+    )
+    metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"))
 
-    # Monitor
+    print(f"Dataset: {len(train_ds)} train / {len(val_ds)} val / {metrics_n} metrics samples")
+
     monitor = GPUTrainingMonitor(
         device,
         log_path=output_dir / "training_log.jsonl",
     )
 
-    best_margin = float("-inf")
+    best_score = float("-inf")
     best_checkpoint = output_dir / "checkpoints" / "best.pt"
     final_checkpoint = output_dir / "checkpoints" / "hdim_final.pt"
     (output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     val_metrics: dict = {}
     quality_metrics: dict = {"STS_exported": 0.0, "STS_training": 0.0, "DRS": 0.0, "AFR": 0.0, "pair_margin": 0.0}
-
-    nan_batches_total = 0
+    nan_batches_total: int = 0
 
     for epoch in range(1, args.epochs + 1):
-        # Training
         model.train()
         epoch_loss = 0.0
         n_batches = 0
         nan_batches_epoch = 0
+
         for batch in train_loader:
-            if use_amp:
-                # AMP-aware loop: не используем trainer.train_step (не поддерживает scaler)
-                optimizer.zero_grad()
-                try:
-                    with autocast():
-                        losses = trainer._compute_batch_losses(batch)
-                        loss = losses["loss_total"]
+            try:
+                if use_amp and scaler is not None:
+                    with autocast("cuda"):
+                        loss = trainer.train_step(batch)
                     if torch.isnan(loss) or torch.isinf(loss):
                         nan_batches_epoch += 1
-                        optimizer.zero_grad()
+                        nan_batches_total += 1
                         continue
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                except RuntimeError as e:
-                    if "nan" in str(e).lower() or "inf" in str(e).lower():
-                        nan_batches_epoch += 1
-                        optimizer.zero_grad()
-                        if scaler is not None:
-                            scaler.update()
-                        continue
-                    raise
-            else:
-                # trainer.train_step уже делает zero_grad, backward, clip_grad, step
-                try:
+                else:
                     loss = trainer.train_step(batch)
                     if torch.isnan(loss) or torch.isinf(loss):
                         nan_batches_epoch += 1
+                        nan_batches_total += 1
                         continue
-                except RuntimeError as e:
-                    if "nan" in str(e).lower() or "inf" in str(e).lower():
-                        nan_batches_epoch += 1
-                        continue
+                epoch_loss += loss.item()
+                n_batches += 1
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    torch.cuda.empty_cache()
+                    print(f"OOM at epoch {epoch}, skipping batch")
+                    nan_batches_epoch += 1
+                    nan_batches_total += 1
+                else:
                     raise
-            epoch_loss += loss.item()
-            n_batches += 1
 
-        if nan_batches_epoch > 0:
-            nan_batches_total += nan_batches_epoch
-            print(f"  [WARN] Epoch {epoch}: {nan_batches_epoch} NaN batches skipped")
+        train_loss = epoch_loss / max(n_batches, 1)
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
 
-        avg_loss = epoch_loss / max(n_batches, 1)
-
-        # Validation каждые eval_every эпох
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val_metrics = trainer.validate(val_loader)
-            quality_metrics = compute_all_metrics(model, val_loader)
+            from src.models.metrics import compute_all_metrics
+            quality_metrics = compute_all_metrics(model, metrics_loader)
 
-            # Checkpoint если лучше
-            current_margin = quality_metrics.get("pair_margin", 0.0)
-            if current_margin > best_margin:
-                best_margin = current_margin
+            score = compute_primary_score(quality_metrics)
+            monitor.log_epoch(
+                epoch, args.epochs, train_loss, val_metrics, quality_metrics,
+                current_lr, nan_batches_epoch, nan_batches_total
+            )
+
+            if score > best_score:
+                best_score = score
                 trainer.save_checkpoint(str(best_checkpoint))
+        else:
+            monitor.log_epoch(
+                epoch, args.epochs, train_loss, val_metrics, quality_metrics,
+                current_lr, nan_batches_epoch, nan_batches_total
+            )
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step()
-
-        monitor.log_epoch(
-            epoch=epoch,
-            total_epochs=args.epochs,
-            train_loss=avg_loss,
-            val_metrics=val_metrics,
-            quality_metrics=quality_metrics,
-            lr=current_lr,
-        )
-
-        # Checkpoint каждые save_every эпох
         if epoch % args.save_every == 0:
             trainer.save_checkpoint(str(output_dir / "checkpoints" / f"epoch_{epoch:04d}.pt"))
 
-    # Final save
     trainer.save_checkpoint(str(final_checkpoint))
 
     training_summary = monitor.summary()
-    print(f"\nTraining complete. Best pair_margin={best_margin:.4f} at epoch {training_summary.get('best_epoch', '?')}")
-
-    # Results JSON
-    # Serialize args and device: convert non-JSON types to strings
-    run_args_dict = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     results = {
-        "run_args": run_args_dict,
-        "config": {
-            "hidden_dim": cfg.hidden_dim,
-            "num_domains": cfg.num_domains,
-            "num_experts": cfg.num_experts,
-            "num_params": total_params,
-        },
-        "device": str(device),
-        "validation": val_metrics,
-        "quality": quality_metrics,
+        "config": vars(args),
         "training_summary": training_summary,
-        "checkpoint": str(final_checkpoint),
+        "quality": quality_metrics,
+        "validation": val_metrics,
         "best_checkpoint": str(best_checkpoint),
-        "status": "keep",
+        "final_checkpoint": str(final_checkpoint),
+        "nan_batches_total": nan_batches_total,
+        "score": compute_primary_score(quality_metrics),
+        "status": "completed",
     }
 
     results_path = output_dir / "results.json"
-    results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    print(f"Results saved to {results_path}")
+    results_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
 
+    if args.results_json:
+        Path(args.results_json).write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+
+    if args.ledger_path:
+        append_ledger_row(
+            args.ledger_path,
+            {"score": results["score"], "quality": quality_metrics,
+             "training_summary": training_summary, "status": "completed"}
+        )
+
+    is_valid, fail_reason = check_run_validity(results)
+    if not is_valid:
+        print(f"WARNING: Run validity check failed: {fail_reason}")
+        results["validity"] = fail_reason
+
+    print(f"\nTraining complete. Best score: {best_score:.4f}")
+    print(f"Results saved to: {results_path}")
     return results
 
 
-def main():
-    parser = argparse.ArgumentParser(description="HDIM GPU Training")
-    parser.add_argument("--config", type=Path, default=None)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="HDIM GPU Training Script")
+    # Core training
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    parser.add_argument("--num_samples", type=int, default=200)
-    parser.add_argument("--use_pairs", action="store_true")
-    parser.add_argument("--negative_ratio", type=float, default=0.2)
-    parser.add_argument("--train_fraction", type=float, default=0.8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--text_mode", action="store_true")
-    parser.add_argument("--advanced_encoder", action="store_true", help="Use AdvancedTextEncoder")
-    parser.add_argument("--hierarchical_memory", action="store_true", help="Use HierarchicalTitansMemory")
-    parser.add_argument("--soft_router", action="store_true", help="Use SoftMoERouter")
-    parser.add_argument("--amp", action="store_true", default=True, help="Use AMP on GPU")
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--warmup_epochs", type=int, default=3)
-    parser.add_argument("--eval_every", type=int, default=5)
-    parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--no_amp", dest="amp", action="store_false")
+    # Model arch
+    parser.add_argument("--hidden_dim", type=int, default=128)
+    parser.add_argument("--num_experts", type=int, default=4)
+    parser.add_argument("--num_domains", type=int, default=4)
+    parser.add_argument("--clifford_dim", type=int, default=None)
+    # Loss weights
     parser.add_argument("--lambda_iso", type=float, default=0.1)
     parser.add_argument("--lambda_pair", type=float, default=0.1)
     parser.add_argument("--lambda_routing", type=float, default=0.05)
     parser.add_argument("--lambda_memory", type=float, default=0.01)
-    parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--num_domains", type=int, default=4)
-    parser.add_argument("--num_experts", type=int, default=4)
-    parser.add_argument("--output_dir", type=Path, default=None)
+    parser.add_argument("--ranking_margin", type=float, default=0.3)
+    # Dataset
+    parser.add_argument("--num_samples", type=int, default=500)
+    parser.add_argument("--use_pairs", action="store_true")
+    parser.add_argument("--text_mode", action="store_true")
+    parser.add_argument("--negative_ratio", type=float, default=0.3)
+    parser.add_argument("--train_fraction", type=float, default=0.8)
+    # Advanced components
+    parser.add_argument("--advanced_encoder", action="store_true")
+    parser.add_argument("--hierarchical_memory", action="store_true")
+    parser.add_argument("--soft_router", action="store_true")
+    # Monitoring
+    parser.add_argument("--eval_every", type=int, default=5)
+    parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument("--output_dir", type=Path, default=Path("artifacts/gpu_training"))
+    parser.add_argument("--results_json", type=str, default=None)
+    parser.add_argument("--ledger_path", type=str, default=None)
+    parser.add_argument("--config", type=Path, default=None)
+
     args = parser.parse_args()
 
-    # Load experiment config if provided
-    if args.config:
+    if args.config is not None:
+        from src.training.experiment_config import ExperimentConfig
         exp = ExperimentConfig.from_json(args.config)
-        args.epochs = exp.epochs
-        args.batch_size = exp.batch_size
-        args.lr = exp.lr
-        args.device = exp.device
-        args.num_samples = exp.num_samples
-        args.use_pairs = exp.use_pairs
-        args.negative_ratio = exp.negative_ratio
-        args.train_fraction = exp.train_fraction
-        args.seed = exp.seed
-        args.text_mode = exp.text_mode
+        for key, val in exp.to_dict().items():
+            if hasattr(args, key) and key != "config":
+                setattr(args, key, val)
+
+    torch.manual_seed(args.seed)
 
     device = detect_device(args.device)
 
-    output_dir = args.output_dir or Path("artifacts") / "gpu_training"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     cfg = HDIMConfig(
         hidden_dim=args.hidden_dim,
-        num_domains=args.num_domains,
         num_experts=args.num_experts,
+        num_domains=args.num_domains,
     )
 
-    print(f"\n{'='*60}")
-    print(f"HDIM GPU Training")
-    print(f"Device: {device} | Epochs: {args.epochs} | Batch: {args.batch_size}")
-    print(f"Advanced Encoder: {args.advanced_encoder} | Hierarchical Memory: {args.hierarchical_memory}")
-    print(f"Soft Router: {args.soft_router} | Text Mode: {args.text_mode}")
-    print(f"{'='*60}\n")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"HDIM GPU Training | device={device} | epochs={args.epochs} | hidden={args.hidden_dim}")
 
     results = run_gpu_training(cfg, args, device, output_dir)
-
-    quality = results.get("quality", {})
-    print(f"\nFinal Quality Metrics:")
-    for k, v in quality.items():
-        print(f"  {k}: {v:.4f}")
+    print(f"Score: {results.get('score', 0):.4f}")
 
 
 if __name__ == "__main__":
