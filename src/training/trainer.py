@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
-from src.models.hdim_model import HDIMModel
+from src.models.hdim_model import HDIMAuxState, HDIMModel
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,7 @@ class HDIMTrainer:
     def _extract_iso_targets(
         self,
         batch: Dict[str, torch.Tensor],
-        aux_state: Dict[str, torch.Tensor],
+        aux_state: HDIMAuxState,
     ) -> torch.Tensor:
         if "pair_encoding" not in batch or "pair_domain_id" not in batch:
             return self._training_invariant(aux_state).detach()
@@ -62,13 +62,13 @@ class HDIMTrainer:
         pair_domain_id = batch["pair_domain_id"].to(self.device)
         return self._compute_pair_iso_targets(pair_encoding, pair_domain_id)
 
-    def _exported_invariant(self, aux_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        return aux_state["exported_invariant"]
+    def _exported_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
+        return aux_state.exported_invariant
 
-    def _training_invariant(self, aux_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        return aux_state["training_invariant"]
+    def _training_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
+        return aux_state.training_invariant
 
-    def _iso_reference_invariant(self, aux_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _iso_reference_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
         return self._training_invariant(aux_state)
 
     def _has_pairs(self, batch: Dict[str, torch.Tensor]) -> bool:
@@ -94,6 +94,18 @@ class HDIMTrainer:
         target: torch.Tensor,
     ) -> torch.Tensor:
         return nn.functional.mse_loss(output, target)
+
+    def _compute_router_diagnostics(
+        self,
+        aux_state: HDIMAuxState,
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            "routing_entropy": aux_state.routing_entropy,
+            "expert_usage": aux_state.expert_usage,
+            "topk_idx": aux_state.topk_idx,
+            "topk_gate_weights": aux_state.topk_gate_weights,
+            "train_scores_snapshot": aux_state.train_scores_snapshot,
+        }
 
     def _compute_batch_losses(
         self,
@@ -126,8 +138,8 @@ class HDIMTrainer:
         iso_target = self._extract_iso_targets(batch, aux_state)
         loss_recon = self._compute_reconstruction_loss(output, recon_target)
         loss_iso = self.compute_iso_loss(training_invariant, iso_target)
-        loss_routing = aux_state["router_loss"]
-        loss_memory = aux_state["memory_loss"]
+        loss_routing = aux_state.router_loss
+        loss_memory = aux_state.memory_loss
         loss_total = (
             loss_recon
             + self.lambda_iso * loss_iso
@@ -135,7 +147,7 @@ class HDIMTrainer:
             + loss_memory
         )
 
-        return {
+        batch_losses = {
             "loss_total": loss_total,
             "loss_recon": loss_recon,
             "loss_iso": loss_iso,
@@ -143,12 +155,14 @@ class HDIMTrainer:
             "loss_memory": loss_memory,
             "routing_weights": routing_weights,
             "invariant": invariant,
-            "raw_invariant": aux_state["raw_invariant"],
-            "memory_augmented_invariant": aux_state["memory_augmented_invariant"],
-            "exported_invariant": aux_state["exported_invariant"],
+            "raw_invariant": aux_state.raw_invariant,
+            "memory_augmented_invariant": aux_state.memory_augmented_invariant,
+            "exported_invariant": aux_state.exported_invariant,
             "training_invariant": training_invariant,
             "training_mode": regime.mode,
         }
+        batch_losses.update(self._compute_router_diagnostics(aux_state))
+        return batch_losses
 
     def evaluate_batch(
         self,
@@ -163,7 +177,7 @@ class HDIMTrainer:
         encoding: torch.Tensor,
         domain_id: torch.Tensor,
         regime: TrainingRegime,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
         output, routing_weights, invariant, aux_state = self.model(
             encoding,
             domain_id,

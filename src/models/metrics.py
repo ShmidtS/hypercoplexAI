@@ -61,8 +61,8 @@ def _paired_batch_metrics(model, batch) -> Tuple[List[float], torch.Tensor]:
             memory_mode="retrieve",
         )
         sts_values = structural_transfer_score(
-            state["exported_invariant"],
-            state["memory_augmented_invariant"],
+            state.exported_invariant,
+            state.memory_augmented_invariant,
         ).repeat(len(enc))
         return sts_values.tolist(), routing.cpu()
 
@@ -83,8 +83,8 @@ def _paired_batch_metrics(model, batch) -> Tuple[List[float], torch.Tensor]:
         memory_mode="retrieve",
     )
     sts_values = F.cosine_similarity(
-        src_state["exported_invariant"],
-        tgt_state["exported_invariant"],
+        src_state.exported_invariant,
+        tgt_state.exported_invariant,
         dim=-1,
     )
     return sts_values.tolist(), routing.cpu()
@@ -157,7 +157,10 @@ def compute_all_metrics(
 
     routing_weights_list = [torch.cat(run, dim=0) for run in routing_runs if run]
     mean_sts = sum(sts_scores) / len(sts_scores) if sts_scores else 0.0
-    drs = domain_routing_stability(routing_weights_list).item() if routing_weights_list else 0.0
+    if len(routing_weights_list) >= 2:
+        drs = domain_routing_stability(routing_weights_list).item()
+    else:
+        drs = 0.0
     afr = sum(1 for s in sts_scores if s > 0.3) / len(sts_scores) if sts_scores else 0.0
 
     return {

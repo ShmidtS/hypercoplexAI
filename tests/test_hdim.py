@@ -49,13 +49,13 @@ def test_model_forward_return_state(model, cfg):
     assert out.shape == (bsz, cfg.hidden_dim)
     assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
-    assert state["raw_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    assert state["memory_augmented_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    assert state["exported_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    expected_inv = model.training_inv_head(state["exported_invariant"])
+    assert state.raw_invariant.shape == (bsz, model.pipeline.clifford_dim)
+    assert state.memory_augmented_invariant.shape == (bsz, model.pipeline.clifford_dim)
+    assert state.exported_invariant.shape == (bsz, model.pipeline.clifford_dim)
+    expected_inv = model.training_inv_head(state.exported_invariant)
     assert torch.allclose(inv, expected_inv, atol=1e-5)
-    assert state["router_loss"].ndim == 0
-    assert state["memory_loss"].ndim == 0
+    assert state.router_loss.ndim == 0
+    assert state.memory_loss.ndim == 0
 
 def test_model_transfer(model, cfg):
     bsz = 2
@@ -85,10 +85,10 @@ def test_transfer_pairs(model, cfg):
     assert out.shape == (bsz, cfg.hidden_dim)
     assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
-    assert state["raw_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    assert state["memory_augmented_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    assert state["exported_invariant"].shape == (bsz, model.pipeline.clifford_dim)
-    expected_inv = model.training_inv_head(state["exported_invariant"])
+    assert state.raw_invariant.shape == (bsz, model.pipeline.clifford_dim)
+    assert state.memory_augmented_invariant.shape == (bsz, model.pipeline.clifford_dim)
+    assert state.exported_invariant.shape == (bsz, model.pipeline.clifford_dim)
+    expected_inv = model.training_inv_head(state.exported_invariant)
     assert torch.allclose(inv, expected_inv, atol=1e-5)
 
 
@@ -184,6 +184,10 @@ def test_evaluate_batch_with_pairs(trainer):
     assert losses["loss_iso"].item() >= 0
     assert losses["training_invariant"].shape == (8, trainer.model.config.hidden_dim)
     assert losses["exported_invariant"].shape == (8, trainer.model.pipeline.clifford_dim)
+    assert losses["routing_entropy"].ndim == 0
+    assert losses["expert_usage"].shape == (trainer.model.config.num_experts,)
+    assert losses["topk_idx"].shape == (8, trainer.model.config.top_k)
+    assert losses["topk_gate_weights"].shape == (8, trainer.model.config.top_k)
 
 
 def test_model_return_state_exposes_memory_lifecycle(model, cfg):
@@ -196,10 +200,10 @@ def test_model_return_state_exposes_memory_lifecycle(model, cfg):
         update_memory=False,
         memory_mode="retrieve",
     )
-    assert state["memory_mode"] == "retrieve"
-    assert state["update_memory"] is False
-    assert state["memory_updated"] is False
-    assert state["training_invariant"].shape == (4, cfg.hidden_dim)
+    assert state.memory_mode == "retrieve"
+    assert state.update_memory is False
+    assert state.memory_updated is False
+    assert state.training_invariant.shape == (4, cfg.hidden_dim)
 
 
 def test_model_rejects_invalid_memory_mode(model, cfg):
@@ -216,6 +220,23 @@ def test_model_forward_rejects_invalid_domain_id(model, cfg):
         model(x, domain_id, update_memory=False, memory_mode="retrieve")
 
 
+def test_model_memory_mode_none_skips_memory_augmentation(model, cfg):
+    x = torch.randn(3, cfg.hidden_dim)
+    domain_id = torch.zeros(3, dtype=torch.long)
+    _, _, _, state = model(
+        x,
+        domain_id,
+        return_state=True,
+        update_memory=True,
+        memory_mode="none",
+    )
+    assert state.memory_mode == "none"
+    assert state.update_memory is False
+    assert state.memory_updated is False
+    assert torch.allclose(state.memory_augmented_invariant, state.raw_invariant, atol=1e-6)
+    assert state.memory_loss.item() == pytest.approx(0.0)
+
+
 def test_transfer_pairs_rejects_invalid_target_domain(model, cfg):
     x = torch.randn(2, cfg.hidden_dim)
     source_domain_id = torch.tensor([0, 1], dtype=torch.long)
@@ -228,6 +249,113 @@ def test_transfer_pairs_rejects_invalid_target_domain(model, cfg):
             update_memory=False,
             memory_mode="retrieve",
         )
+
+def test_forward_and_transfer_pairs_expose_same_lifecycle_contract(model, cfg):
+    x = torch.randn(4, cfg.hidden_dim)
+    source_domain_id = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+    target_domain_id = torch.tensor([1, 2, 0, 3], dtype=torch.long)
+
+    _, _, _, forward_state = model(
+        x,
+        source_domain_id,
+        return_state=True,
+        update_memory=False,
+        memory_mode="retrieve",
+    )
+    _, _, _, pair_state = model.transfer_pairs(
+        x,
+        source_domain_id,
+        target_domain_id,
+        update_memory=False,
+        memory_mode="retrieve",
+    )
+
+    lifecycle_fields = [
+        "raw_invariant",
+        "memory_augmented_invariant",
+        "exported_invariant",
+        "training_invariant",
+    ]
+    for field in lifecycle_fields:
+        forward_value = getattr(forward_state, field)
+        pair_value = getattr(pair_state, field)
+        assert forward_value.shape == pair_value.shape
+
+
+def test_router_topk_contract_on_eval_path(model):
+    ds = create_paired_demo_dataset(n_samples=16)
+    batch = next(iter(DataLoader(ds, batch_size=8)))
+    losses = HDIMTrainer(model, torch.optim.Adam(model.parameters(), lr=1e-3), device="cpu").evaluate_batch(batch)
+    routing_weights = losses["routing_weights"]
+    topk_idx = losses["topk_idx"]
+    topk_gate_weights = losses["topk_gate_weights"]
+
+    assert torch.allclose(routing_weights.sum(dim=-1), torch.ones(routing_weights.shape[0]), atol=1e-5)
+    active_counts = (routing_weights > 0).sum(dim=-1)
+    assert torch.all(active_counts <= model.config.top_k)
+    gathered = torch.gather(routing_weights, -1, topk_idx)
+    assert torch.allclose(gathered, topk_gate_weights, atol=1e-6)
+
+
+def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
+    x = torch.randn(8, cfg.hidden_dim)
+    domain_id = torch.randint(0, cfg.num_domains, (8,))
+
+    model.train()
+    _ = model(x, domain_id, update_memory=True, memory_mode="update")
+    memory_weight_before = model.pipeline.memory.memory.weight.detach().clone()
+    momentum_before = model.pipeline.memory.momentum_S.detach().clone()
+    train_scores_before = model.pipeline.moe.train_scores.detach().clone()
+
+    model.eval()
+    with torch.no_grad():
+        _, routing_a, inv_a, state_a = model(
+            x,
+            domain_id,
+            return_state=True,
+            update_memory=False,
+            memory_mode="retrieve",
+        )
+        _, routing_b, inv_b, state_b = model(
+            x,
+            domain_id,
+            return_state=True,
+            update_memory=False,
+            memory_mode="retrieve",
+        )
+
+    assert torch.allclose(model.pipeline.memory.memory.weight, memory_weight_before)
+    assert torch.allclose(model.pipeline.memory.momentum_S, momentum_before)
+    assert torch.allclose(model.pipeline.moe.train_scores, train_scores_before)
+    assert torch.allclose(routing_a, routing_b)
+    assert torch.allclose(inv_a, inv_b)
+    assert torch.allclose(state_a.raw_invariant, state_b.raw_invariant)
+    assert torch.allclose(state_a.memory_augmented_invariant, state_b.memory_augmented_invariant)
+    assert torch.allclose(state_a.exported_invariant, state_b.exported_invariant)
+
+
+def test_model_reset_memory_clears_memory_and_router_state(model, cfg):
+    x = torch.randn(4, cfg.hidden_dim)
+    domain_id = torch.zeros(4, dtype=torch.long)
+    model.train()
+    model(x, domain_id, update_memory=True, memory_mode="update")
+
+    assert torch.count_nonzero(model.pipeline.memory.memory.weight).item() > 0
+    assert torch.count_nonzero(model.pipeline.memory.momentum_S).item() > 0
+    train_scores_before_reset = model.pipeline.moe.train_scores.clone()
+    assert not torch.allclose(
+        train_scores_before_reset,
+        torch.full_like(train_scores_before_reset, 1.0 / cfg.num_experts),
+    )
+
+    model.reset_memory()
+
+    assert torch.allclose(model.pipeline.memory.memory.weight, torch.zeros_like(model.pipeline.memory.memory.weight))
+    assert torch.allclose(model.pipeline.memory.momentum_S, torch.zeros_like(model.pipeline.memory.momentum_S))
+    assert torch.allclose(
+        model.pipeline.moe.train_scores,
+        torch.full_like(model.pipeline.moe.train_scores, 1.0 / cfg.num_experts),
+    )
 
 def test_compute_all_metrics_runs_on_model_device(trainer):
     ds = create_demo_dataset(n_samples=16)
@@ -305,8 +433,8 @@ def test_raw_invariant_differs_from_exported(model, cfg):
             update_memory=False,
             memory_mode="retrieve",
         )
-    raw = state["raw_invariant"]
-    exported = state["exported_invariant"]
+    raw = state.raw_invariant
+    exported = state.exported_invariant
     assert raw.shape == exported.shape
     assert raw.shape == (4, model.pipeline.clifford_dim)
 

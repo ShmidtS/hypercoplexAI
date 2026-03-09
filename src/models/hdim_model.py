@@ -8,7 +8,7 @@ batch training scenarios.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,46 @@ class HDIMRuntimeConfig:
 
     update_memory: bool = True
     memory_mode: Literal["none", "retrieve", "update"] = "update"
+
+
+@dataclass(frozen=True)
+class HDIMAuxState:
+    """Typed lifecycle state exported by HDIMModel public paths."""
+
+    memory_loss: torch.Tensor
+    router_loss: torch.Tensor
+    raw_invariant: torch.Tensor
+    memory_augmented_invariant: torch.Tensor
+    exported_invariant: torch.Tensor
+    training_invariant: torch.Tensor
+    routing_weights: torch.Tensor
+    topk_idx: torch.Tensor
+    topk_gate_weights: torch.Tensor
+    train_scores_snapshot: torch.Tensor
+    expert_usage: torch.Tensor
+    routing_entropy: torch.Tensor
+    memory_updated: bool
+    memory_mode: str
+    update_memory: bool
+
+    def to_dict(self) -> Dict[str, Union[torch.Tensor, bool, str]]:
+        return {
+            "memory_loss": self.memory_loss,
+            "router_loss": self.router_loss,
+            "raw_invariant": self.raw_invariant,
+            "memory_augmented_invariant": self.memory_augmented_invariant,
+            "exported_invariant": self.exported_invariant,
+            "training_invariant": self.training_invariant,
+            "routing_weights": self.routing_weights,
+            "topk_idx": self.topk_idx,
+            "topk_gate_weights": self.topk_gate_weights,
+            "train_scores_snapshot": self.train_scores_snapshot,
+            "expert_usage": self.expert_usage,
+            "routing_entropy": self.routing_entropy,
+            "memory_updated": self.memory_updated,
+            "memory_mode": self.memory_mode,
+            "update_memory": self.update_memory,
+        }
 
 
 @dataclass
@@ -119,22 +159,34 @@ class HDIMModel(nn.Module):
         raw_invariant: torch.Tensor,
         memory_augmented_invariant: torch.Tensor,
         exported_invariant: torch.Tensor,
+        routing_weights: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_gate_weights: torch.Tensor,
+        train_scores_snapshot: torch.Tensor,
+        expert_usage: torch.Tensor,
+        routing_entropy: torch.Tensor,
         memory_loss: torch.Tensor,
         router_loss: torch.Tensor,
         memory_updated: bool,
         runtime: HDIMRuntimeConfig,
-    ) -> Dict[str, torch.Tensor | bool | str]:
-        return {
-            "memory_loss": memory_loss,
-            "router_loss": router_loss,
-            "raw_invariant": raw_invariant,
-            "memory_augmented_invariant": memory_augmented_invariant,
-            "exported_invariant": exported_invariant,
-            "training_invariant": self.training_inv_head(exported_invariant),
-            "memory_updated": memory_updated,
-            "memory_mode": runtime.memory_mode,
-            "update_memory": runtime.update_memory,
-        }
+    ) -> HDIMAuxState:
+        return HDIMAuxState(
+            memory_loss=memory_loss,
+            router_loss=router_loss,
+            raw_invariant=raw_invariant,
+            memory_augmented_invariant=memory_augmented_invariant,
+            exported_invariant=exported_invariant,
+            training_invariant=self.training_inv_head(exported_invariant),
+            routing_weights=routing_weights,
+            topk_idx=topk_idx,
+            topk_gate_weights=topk_gate_weights,
+            train_scores_snapshot=train_scores_snapshot,
+            expert_usage=expert_usage,
+            routing_entropy=routing_entropy,
+            memory_updated=memory_updated,
+            memory_mode=runtime.memory_mode,
+            update_memory=runtime.update_memory,
+        )
 
     def _allocate_state_tensors(
         self,
@@ -142,7 +194,7 @@ class HDIMModel(nn.Module):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         raw_invariant = torch.empty(
             batch_size,
             self.pipeline.clifford_dim,
@@ -161,7 +213,32 @@ class HDIMModel(nn.Module):
             device=device,
             dtype=dtype,
         )
-        return raw_invariant, memory_augmented_invariant, exported_invariant
+        routing_weights = torch.empty(
+            batch_size,
+            self.config.num_experts,
+            device=device,
+            dtype=dtype,
+        )
+        topk_idx = torch.empty(
+            batch_size,
+            self.config.top_k,
+            device=device,
+            dtype=torch.long,
+        )
+        topk_gate_weights = torch.empty(
+            batch_size,
+            self.config.top_k,
+            device=device,
+            dtype=dtype,
+        )
+        return (
+            raw_invariant,
+            memory_augmented_invariant,
+            exported_invariant,
+            routing_weights,
+            topk_idx,
+            topk_gate_weights,
+        )
 
     def forward(
         self,
@@ -175,7 +252,7 @@ class HDIMModel(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor | bool | str],
+        HDIMAuxState,
     ]:
         """Run the HDIM forward pass for same-domain reconstruction batches."""
         x = self.dropout(x)
@@ -187,19 +264,31 @@ class HDIMModel(nn.Module):
 
         batch_size = x.shape[0]
         output = torch.empty_like(x)
-        routing_weights = torch.empty(
-            batch_size,
+        (
+            raw_invariant,
+            memory_augmented_invariant,
+            exported_invariant,
+            routing_weights,
+            topk_idx,
+            topk_gate_weights,
+        ) = self._allocate_state_tensors(
+            batch_size=batch_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        train_scores_snapshot = torch.empty(
             self.config.num_experts,
             device=x.device,
             dtype=x.dtype,
         )
-        raw_invariant, memory_augmented_invariant, exported_invariant = self._allocate_state_tensors(
-            batch_size=batch_size,
+        expert_usage = torch.empty(
+            self.config.num_experts,
             device=x.device,
             dtype=x.dtype,
         )
         memory_loss = torch.zeros((), device=x.device, dtype=x.dtype)
         router_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+        routing_entropy = torch.zeros((), device=x.device, dtype=x.dtype)
         memory_updated = False
 
         for batch_domain_idx in domain_id.unique(sorted=True):
@@ -217,11 +306,16 @@ class HDIMModel(nn.Module):
 
             output[mask] = group_output
             routing_weights[mask] = transfer_state["routing_weights"].to(dtype=x.dtype)
+            topk_idx[mask] = transfer_state["router_state"]["topk_idx"].to(device=x.device)
+            topk_gate_weights[mask] = transfer_state["router_state"]["topk_gate_weights"].to(dtype=x.dtype)
             exported_invariant[mask] = transfer_state["exported_invariant"].to(dtype=x.dtype)
             raw_invariant[mask] = transfer_state["raw_invariant"].to(dtype=x.dtype)
             memory_augmented_invariant[mask] = transfer_state["memory_augmented_invariant"].to(dtype=x.dtype)
             memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=x.dtype)
             router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=x.dtype)
+            routing_entropy = routing_entropy + transfer_state["router_state"]["routing_entropy"].to(dtype=x.dtype)
+            train_scores_snapshot.copy_(transfer_state["router_state"]["train_scores_snapshot"].to(dtype=x.dtype))
+            expert_usage.copy_(transfer_state["router_state"]["expert_usage"].to(dtype=x.dtype))
             memory_updated = memory_updated or bool(transfer_state["memory_updated"])
 
         invariant = self.training_inv_head(exported_invariant).to(dtype=x.dtype)
@@ -231,6 +325,12 @@ class HDIMModel(nn.Module):
                 raw_invariant=raw_invariant,
                 memory_augmented_invariant=memory_augmented_invariant,
                 exported_invariant=exported_invariant,
+                routing_weights=routing_weights,
+                topk_idx=topk_idx,
+                topk_gate_weights=topk_gate_weights,
+                train_scores_snapshot=train_scores_snapshot,
+                expert_usage=expert_usage,
+                routing_entropy=routing_entropy,
                 memory_loss=memory_loss,
                 router_loss=router_loss,
                 memory_updated=memory_updated,
@@ -248,7 +348,7 @@ class HDIMModel(nn.Module):
         return_state: bool = False,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor | Dict[str, torch.Tensor]]]:
+    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]]:
         """Transfer a problem encoding from source to target domain."""
         runtime = self._resolve_runtime_config(
             update_memory=update_memory,
@@ -267,6 +367,12 @@ class HDIMModel(nn.Module):
             return output, transfer_state
         return output
 
+    def reset_memory(self) -> None:
+        """Reset stateful HDIM memory and router replay state."""
+        self.pipeline.reset_memory()
+        with torch.no_grad():
+            self.pipeline.moe.train_scores.fill_(1.0 / self.config.num_experts)
+
     def transfer_pairs(
         self,
         source_encoding: torch.Tensor,
@@ -275,7 +381,7 @@ class HDIMModel(nn.Module):
         *,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor | bool | str]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
         """Run explicit paired transfer for mixed-domain batches."""
         source_domain_id = source_domain_id.to(device=source_encoding.device, dtype=torch.long)
         target_domain_id = target_domain_id.to(device=source_encoding.device, dtype=torch.long)
@@ -285,20 +391,32 @@ class HDIMModel(nn.Module):
         )
 
         batch_size = source_encoding.shape[0]
-        output = torch.empty_like(source_encoding)
-        routing_weights = torch.empty(
-            batch_size,
-            self.config.num_experts,
-            device=source_encoding.device,
-            dtype=source_encoding.dtype,
-        )
-        raw_invariant, memory_augmented_invariant, exported_invariant = self._allocate_state_tensors(
+        (
+            raw_invariant,
+            memory_augmented_invariant,
+            exported_invariant,
+            routing_weights,
+            topk_idx,
+            topk_gate_weights,
+        ) = self._allocate_state_tensors(
             batch_size=batch_size,
             device=source_encoding.device,
             dtype=source_encoding.dtype,
         )
+        train_scores_snapshot = torch.empty(
+            self.config.num_experts,
+            device=source_encoding.device,
+            dtype=source_encoding.dtype,
+        )
+        expert_usage = torch.empty(
+            self.config.num_experts,
+            device=source_encoding.device,
+            dtype=source_encoding.dtype,
+        )
+        output = torch.empty_like(source_encoding)
         memory_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
         router_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
+        routing_entropy = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
         memory_updated = False
 
         pair_keys = torch.stack((source_domain_id, target_domain_id), dim=1)
@@ -318,11 +436,16 @@ class HDIMModel(nn.Module):
             )
             output[mask] = group_output
             routing_weights[mask] = transfer_state["routing_weights"].to(dtype=source_encoding.dtype)
+            topk_idx[mask] = transfer_state["router_state"]["topk_idx"].to(device=source_encoding.device)
+            topk_gate_weights[mask] = transfer_state["router_state"]["topk_gate_weights"].to(dtype=source_encoding.dtype)
             exported_invariant[mask] = transfer_state["exported_invariant"].to(dtype=source_encoding.dtype)
             raw_invariant[mask] = transfer_state["raw_invariant"].to(dtype=source_encoding.dtype)
             memory_augmented_invariant[mask] = transfer_state["memory_augmented_invariant"].to(dtype=source_encoding.dtype)
             memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=source_encoding.dtype)
             router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=source_encoding.dtype)
+            routing_entropy = routing_entropy + transfer_state["router_state"]["routing_entropy"].to(dtype=source_encoding.dtype)
+            train_scores_snapshot.copy_(transfer_state["router_state"]["train_scores_snapshot"].to(dtype=source_encoding.dtype))
+            expert_usage.copy_(transfer_state["router_state"]["expert_usage"].to(dtype=source_encoding.dtype))
             memory_updated = memory_updated or bool(transfer_state["memory_updated"])
 
         invariant = self.training_inv_head(exported_invariant).to(dtype=source_encoding.dtype)
@@ -330,6 +453,12 @@ class HDIMModel(nn.Module):
             raw_invariant=raw_invariant,
             memory_augmented_invariant=memory_augmented_invariant,
             exported_invariant=exported_invariant,
+            routing_weights=routing_weights,
+            topk_idx=topk_idx,
+            topk_gate_weights=topk_gate_weights,
+            train_scores_snapshot=train_scores_snapshot,
+            expert_usage=expert_usage,
+            routing_entropy=routing_entropy,
             memory_loss=memory_loss,
             router_loss=router_loss,
             memory_updated=memory_updated,
