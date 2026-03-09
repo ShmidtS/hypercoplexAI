@@ -10,14 +10,11 @@ import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from src.models.hdim_model import HDIMAuxState, HDIMModel
-
-
 @dataclass(frozen=True)
 class TrainingRegime:
     mode: Literal["reconstruction", "paired"]
     update_memory: bool
     memory_mode: Literal["none", "retrieve", "update"]
-
 
 class HDIMTrainer:
     """Trainer for the HDIMModel."""
@@ -29,16 +26,19 @@ class HDIMTrainer:
         device: str | torch.device = "cpu",
         lambda_iso: float = 0.1,
         lambda_routing: float = 0.05,
+        lambda_pair: float = 0.1,
         negative_margin: float = 1.0,
+        ranking_margin: float = 0.2,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer
         self.device = torch.device(device)
         self.lambda_iso = lambda_iso
         self.lambda_routing = lambda_routing
+        self.lambda_pair = lambda_pair
         self.negative_margin = negative_margin
+        self.ranking_margin = ranking_margin
         self._step: int = 0
-
     def _resolve_training_regime(self, batch: Dict[str, Any]) -> TrainingRegime:
         is_pair_batch = self._has_pairs(batch)
         return TrainingRegime(
@@ -86,10 +86,8 @@ class HDIMTrainer:
 
     def _exported_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
         return aux_state.exported_invariant
-
     def _training_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
         return aux_state.training_invariant
-
     def _iso_reference_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
         return self._training_invariant(aux_state)
 
@@ -172,6 +170,158 @@ class HDIMTrainer:
             return per_sample_mse.mean()
         return torch.stack(losses).mean()
 
+    def _zero_loss(self, reference: torch.Tensor) -> torch.Tensor:
+        return torch.zeros((), device=reference.device, dtype=reference.dtype)
+
+    def _resolve_pair_group_id(self, batch: Dict[str, Any]) -> torch.Tensor | None:
+        pair_group_id = batch.get("pair_group_id")
+        if pair_group_id is None:
+            pair_group_id = batch.get("pair_family_id")
+        if pair_group_id is None:
+            return None
+        return pair_group_id.to(self.device)
+
+    def _extract_pair_target_state(
+        self, batch: Dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self._uses_text_model() and self._has_pair_texts(batch):
+            pair_texts = self._extract_texts(batch, "pair_text")
+            pair_domain_id = batch["pair_domain_id"].to(self.device)
+            _, _, _, aux_state = self._forward_text_batch(
+                pair_texts,
+                pair_domain_id,
+                TrainingRegime(
+                    mode="reconstruction",
+                    update_memory=False,
+                    memory_mode="retrieve",
+                ),
+            )
+            return (
+                self._training_invariant(aux_state).detach(),
+                aux_state.exported_invariant.detach(),
+            )
+
+        pair_encoding = batch.get("pair_encoding")
+        pair_domain_id = batch.get("pair_domain_id")
+        if pair_encoding is None or pair_domain_id is None:
+            return None
+        _, _, _, aux_state = self._forward_batch(
+            pair_encoding.to(self.device),
+            pair_domain_id.to(self.device),
+            TrainingRegime(
+                mode="reconstruction",
+                update_memory=False,
+                memory_mode="retrieve",
+            ),
+        )
+        return (
+            self._training_invariant(aux_state).detach(),
+            aux_state.exported_invariant.detach(),
+        )
+
+    def _compute_negative_pair_indices(
+        self,
+        pair_group_id: torch.Tensor,
+        domain_id: torch.Tensor,
+        pair_domain_id: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = pair_group_id.shape[0]
+        batch_indices = torch.arange(batch_size, device=self.device)
+        negative_indices = torch.full(
+            (batch_size,), -1, dtype=torch.long, device=self.device
+        )
+        for idx in range(batch_size):
+            valid_candidates = batch_indices[pair_group_id != pair_group_id[idx]]
+            if valid_candidates.numel() == 0:
+                continue
+            cross_domain_candidates = valid_candidates[
+                pair_domain_id[valid_candidates] != domain_id[idx]
+            ]
+            negative_indices[idx] = (
+                cross_domain_candidates[0]
+                if cross_domain_candidates.numel() > 0
+                else valid_candidates[0]
+            )
+        return negative_indices
+    def _compute_pair_ranking_loss(
+        self,
+        exported_invariant: torch.Tensor,
+        pair_exported_target: torch.Tensor | None,
+        batch: Dict[str, Any],
+    ) -> torch.Tensor:
+        if not self._has_pairs(batch) or pair_exported_target is None:
+            return self._zero_loss(exported_invariant)
+
+        pair_relation_label = batch.get("pair_relation_label")
+        pair_weight = batch.get("pair_weight")
+        pair_group_id = self._resolve_pair_group_id(batch)
+        if pair_relation_label is None or pair_weight is None or pair_group_id is None:
+            return self._zero_loss(exported_invariant)
+
+        pair_relation_label = pair_relation_label.to(
+            self.device, dtype=exported_invariant.dtype
+        )
+        pair_weight = pair_weight.to(self.device, dtype=exported_invariant.dtype)
+        pair_domain_id = batch["pair_domain_id"].to(self.device)
+        domain_id = batch["domain_id"].to(self.device)
+
+        positive_mask = pair_relation_label > 0.5
+        if not positive_mask.any() or exported_invariant.shape[0] < 2:
+            return self._zero_loss(exported_invariant)
+
+        source_normalized = F.normalize(exported_invariant, dim=-1)
+        target_normalized = F.normalize(pair_exported_target, dim=-1)
+        similarities = source_normalized @ target_normalized.transpose(0, 1)
+        anchor_indices = torch.arange(exported_invariant.shape[0], device=self.device)
+        negative_indices = self._compute_negative_pair_indices(
+            pair_group_id,
+            domain_id,
+            pair_domain_id,
+        )
+        valid_mask = positive_mask & (negative_indices >= 0)
+        if not valid_mask.any():
+            return self._zero_loss(exported_invariant)
+
+        positive_scores = similarities[
+            anchor_indices[valid_mask], anchor_indices[valid_mask]
+        ]
+        negative_scores = similarities[
+            anchor_indices[valid_mask],
+            negative_indices[valid_mask],
+        ]
+        margin_loss = F.relu(self.ranking_margin - positive_scores + negative_scores)
+        weighted_loss = margin_loss * pair_weight[valid_mask]
+        return weighted_loss.sum() / pair_weight[valid_mask].sum().clamp_min(1e-8)
+
+    def compute_pair_ranking_loss(
+        self,
+        exported_invariant: torch.Tensor,
+        pair_exported_target: torch.Tensor | None,
+        batch: Dict[str, Any],
+    ) -> torch.Tensor:
+        return self._compute_pair_ranking_loss(
+            exported_invariant,
+            pair_exported_target,
+            batch,
+        )
+
+    def _compute_pair_loss_terms(
+        self,
+        aux_state: HDIMAuxState,
+        batch: Dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pair_target_state = self._extract_pair_target_state(batch)
+        if pair_target_state is None:
+            iso_target = self._extract_iso_targets(batch, aux_state)
+            pair_exported_target = None
+        else:
+            iso_target, pair_exported_target = pair_target_state
+        loss_pair = self._compute_pair_ranking_loss(
+            aux_state.exported_invariant,
+            pair_exported_target,
+            batch,
+        )
+        return iso_target, loss_pair
     def _compute_router_diagnostics(
         self, aux_state: HDIMAuxState
     ) -> Dict[str, torch.Tensor]:
@@ -191,6 +341,20 @@ class HDIMTrainer:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
         return self.model.forward_texts(
             texts,
+            domain_id,
+            return_state=True,
+            update_memory=regime.update_memory,
+            memory_mode=regime.memory_mode,
+        )
+
+    def _forward_batch(
+        self,
+        encoding: torch.Tensor,
+        domain_id: torch.Tensor,
+        regime: TrainingRegime,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
+        return self.model(
+            encoding,
             domain_id,
             return_state=True,
             update_memory=regime.update_memory,
@@ -218,8 +382,8 @@ class HDIMTrainer:
                 )
                 recon_target = self._encode_texts(pair_texts)
             else:
-                output, routing_weights, invariant, aux_state = (
-                    self._forward_text_batch(texts, domain_id, regime)
+                output, routing_weights, invariant, aux_state = self._forward_text_batch(
+                    texts, domain_id, regime
                 )
                 recon_target = self._encode_texts(texts)
         else:
@@ -227,14 +391,12 @@ class HDIMTrainer:
             if regime.mode == "paired":
                 pair_encoding = batch["pair_encoding"].to(self.device)
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
-                output, routing_weights, invariant, aux_state = (
-                    self.model.transfer_pairs(
-                        encoding,
-                        domain_id,
-                        pair_domain_id,
-                        update_memory=regime.update_memory,
-                        memory_mode=regime.memory_mode,
-                    )
+                output, routing_weights, invariant, aux_state = self.model.transfer_pairs(
+                    encoding,
+                    domain_id,
+                    pair_domain_id,
+                    update_memory=regime.update_memory,
+                    memory_mode=regime.memory_mode,
                 )
                 recon_target = pair_encoding
             else:
@@ -243,7 +405,7 @@ class HDIMTrainer:
                 )
                 recon_target = encoding
         training_invariant = self._training_invariant(aux_state)
-        iso_target = self._extract_iso_targets(batch, aux_state)
+        iso_target, loss_pair = self._compute_pair_loss_terms(aux_state, batch)
         loss_recon = self._compute_reconstruction_loss(output, recon_target)
         loss_iso = self._compute_pair_iso_loss(training_invariant, iso_target, batch)
         loss_routing = aux_state.router_loss
@@ -253,6 +415,7 @@ class HDIMTrainer:
         loss_total = (
             loss_recon
             + self.lambda_iso * loss_iso
+            + self.lambda_pair * loss_pair
             + self.lambda_routing * loss_routing
             + loss_memory
         )
@@ -260,6 +423,7 @@ class HDIMTrainer:
             "loss_total": loss_total,
             "loss_recon": loss_recon,
             "loss_iso": loss_iso,
+            "loss_pair": loss_pair,
             "loss_routing": loss_routing,
             "loss_memory": loss_memory,
             "routing_weights": routing_weights,
@@ -282,25 +446,10 @@ class HDIMTrainer:
             batch_losses["iso_target"] = iso_target
         batch_losses.update(self._compute_router_diagnostics(aux_state))
         return batch_losses
-
     def evaluate_batch(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         self.model.eval()
         with torch.no_grad():
             return self._compute_batch_losses(batch)
-
-    def _forward_batch(
-        self,
-        encoding: torch.Tensor,
-        domain_id: torch.Tensor,
-        regime: TrainingRegime,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
-        return self.model(
-            encoding,
-            domain_id,
-            return_state=True,
-            update_memory=regime.update_memory,
-            memory_mode=regime.memory_mode,
-        )
 
     def train_step(self, batch: Dict[str, Any]) -> torch.Tensor:
         self.model.train()
@@ -323,12 +472,12 @@ class HDIMTrainer:
         eps = 1e-8
         entropy = -(mean_routing * (mean_routing + eps).log()).sum()
         return -entropy
-
     def validate(self, dataloader: DataLoader) -> Dict[str, float]:
         self.model.eval()
         totals: Dict[str, float] = {
             "loss_recon": 0.0,
             "loss_iso": 0.0,
+            "loss_pair": 0.0,
             "loss_routing": 0.0,
             "loss_memory": 0.0,
             "loss_total": 0.0,
@@ -344,7 +493,6 @@ class HDIMTrainer:
             for key in totals:
                 totals[key] /= n_batches
         return totals
-
     def save_checkpoint(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         torch.save(

@@ -25,9 +25,20 @@ class ExperimentRunner:
         stderr_path = run_dir / "stderr.txt"
         results_json = Path(config.results_json) if config.results_json else run_dir / "results.json"
         ledger_path = Path(config.ledger_path) if config.ledger_path else run_dir / "ledger.jsonl"
+        effective_metadata = dict(config.metadata)
+        effective_metadata["run_id"] = run_id
+        effective_config = ExperimentConfig(
+            **{
+                **config.to_dict(),
+                "output_dir": run_dir.as_posix(),
+                "results_json": results_json.as_posix(),
+                "ledger_path": ledger_path.as_posix(),
+                "metadata": effective_metadata,
+            }
+        )
 
-        command = self._build_command(config, results_json, ledger_path)
-        write_json(manifest_path, config.to_dict())
+        write_json(manifest_path, effective_config.to_dict())
+        command = self._build_command(manifest_path)
 
         started_at = datetime.now(UTC)
         completed = subprocess.run(
@@ -56,6 +67,24 @@ class ExperimentRunner:
             "finished_at": finished_at.isoformat(),
             "returncode": completed.returncode,
         }
+        payload["run_id"] = run_id
+        payload["config_hash"] = effective_config.config_hash()
+        payload["manifest"] = {
+            "run_id": run_id,
+            "path": manifest_path.as_posix(),
+            "config_hash": effective_config.config_hash(),
+        }
+        payload["artifacts"] = {
+            **payload.get("artifacts", {}),
+            "checkpoint": payload.get("checkpoint"),
+            "manifest": manifest_path.as_posix(),
+            "results_json": results_json.as_posix(),
+            "ledger_path": ledger_path.as_posix(),
+            "stdout": stdout_path.as_posix(),
+            "stderr": stderr_path.as_posix(),
+        }
+        payload["runner"]["artifacts"] = payload["artifacts"]
+        payload["runner"]["config_hash"] = payload["config_hash"]
         write_json(results_json, payload)
         return payload
 
@@ -63,48 +92,14 @@ class ExperimentRunner:
         output_dir = Path(config.output_dir) if config.output_dir else self.repo_root / "artifacts" / "experiments"
         return output_dir / run_id
 
-    def _build_command(
-        self,
-        config: ExperimentConfig,
-        results_json: Path,
-        ledger_path: Path,
-    ) -> list[str]:
-        command = [
+    def _build_command(self, manifest_path: Path) -> list[str]:
+        return [
             sys.executable,
             "-m",
             "src.training.train",
-            "--epochs",
-            str(config.epochs),
-            "--batch_size",
-            str(config.batch_size),
-            "--lr",
-            str(config.lr),
-            "--device",
-            config.device,
-            "--num_samples",
-            str(config.num_samples),
-            "--negative_ratio",
-            str(config.negative_ratio),
-            "--train_fraction",
-            str(config.train_fraction),
-            "--seed",
-            str(config.seed),
-            "--description",
-            config.description,
-            "--results_json",
-            str(results_json),
-            "--ledger_path",
-            str(ledger_path),
+            "--config",
+            str(manifest_path),
         ]
-        if config.use_pairs:
-            command.append("--use_pairs")
-        if config.text_mode:
-            command.append("--text_mode")
-        for key, value in config.model_overrides.items():
-            command.extend(["--model_override", f"{key}={value}"])
-        for key, value in config.trainer_overrides.items():
-            command.extend(["--trainer_override", f"{key}={value}"])
-        return command
 
 
 class AutoResearchRunner:
@@ -128,8 +123,17 @@ class AutoResearchRunner:
             run_id = config.metadata.get("run_id") or f"{session_name}-{index:03d}-{config.config_hash()}"
             merged_metadata = dict(config.metadata)
             merged_metadata.update({"run_id": run_id, "session_name": session_name, "run_index": index})
-            run_config = ExperimentConfig(**{**config.to_dict(), "output_dir": session_dir.as_posix(), "ledger_path": str(session_ledger), "metadata": merged_metadata})
+            run_config = ExperimentConfig(
+                **{
+                    **config.to_dict(),
+                    "output_dir": session_dir.as_posix(),
+                    "results_json": None,
+                    "ledger_path": None,
+                    "metadata": merged_metadata,
+                }
+            )
             payload = self.runner.run(run_config)
+            payload["runner"]["session_ledger"] = session_ledger.as_posix()
             run_summary = self._summarise_run(payload)
             append_ledger_row(session_ledger, run_summary)
             runs.append(run_summary)
@@ -171,6 +175,8 @@ class AutoResearchRunner:
             "decision": payload.get("status", "keep"),
             "config_hash": payload.get("config_hash"),
             "results_json": payload.get("runner", {}).get("results_json"),
+            "checkpoint": payload.get("artifacts", {}).get("checkpoint") or payload.get("checkpoint"),
+            "manifest_path": payload.get("manifest", {}).get("path") or payload.get("runner", {}).get("manifest_path"),
             "run_dir": payload.get("runner", {}).get("run_dir"),
             "quality": quality,
             "validation": payload.get("validation", {}),

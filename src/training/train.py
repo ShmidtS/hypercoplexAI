@@ -99,9 +99,11 @@ def _build_run_summary(
     quality_metrics: dict,
     checkpoint_path: Path,
     config_hash: str | None,
+    run_id: str | None,
     status: str,
 ) -> dict:
     return {
+        "run_id": run_id,
         "config": {
             "hidden_dim": cfg.hidden_dim,
             "num_domains": cfg.num_domains,
@@ -133,6 +135,23 @@ def _build_run_summary(
         "config_hash": config_hash,
         "status": status,
     }
+
+
+def _resolve_run_id(experiment: ExperimentConfig | None) -> str | None:
+    if experiment is None:
+        return None
+    return str(experiment.metadata.get("run_id")) if experiment.metadata.get("run_id") is not None else None
+
+def _resolve_checkpoint_path(args: argparse.Namespace, experiment: ExperimentConfig | None, run_id: str | None) -> Path:
+    if args.results_json is not None:
+        return args.results_json.parent / "checkpoints" / "hdim_final.pt"
+    if experiment is not None and experiment.output_dir is not None:
+        checkpoint_dir = Path(experiment.output_dir)
+        if run_id is not None:
+            checkpoint_dir = checkpoint_dir / run_id
+        return checkpoint_dir / "checkpoints" / "hdim_final.pt"
+    checkpoint_dir = Path(__file__).resolve().parents[2] / "checkpoints"
+    return checkpoint_dir / "hdim_final.pt"
 
 
 def main():
@@ -210,9 +229,9 @@ def main():
         f'pair_margin={quality_metrics["pair_margin"]:.4f}'
     )
 
-    checkpoint_dir = Path(__file__).resolve().parents[2] / "checkpoints"
-    checkpoint_dir.mkdir(exist_ok=True)
-    checkpoint_path = checkpoint_dir / "hdim_final.pt"
+    run_id = _resolve_run_id(experiment)
+    checkpoint_path = _resolve_checkpoint_path(args, experiment, run_id)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     trainer.save_checkpoint(str(checkpoint_path))
 
     config_hash = experiment.config_hash() if experiment is not None else None
@@ -225,6 +244,7 @@ def main():
             quality_metrics=quality_metrics,
             checkpoint_path=checkpoint_path,
             config_hash=config_hash,
+            run_id=run_id,
             status=status,
         )
         args.results_json.parent.mkdir(parents=True, exist_ok=True)
@@ -234,9 +254,11 @@ def main():
             append_ledger_row(
                 args.ledger_path,
                 {
+                    "run_id": run_id,
                     "status": status,
                     "config_hash": config_hash,
                     "results_json": args.results_json.as_posix(),
+                    "checkpoint": checkpoint_path.as_posix(),
                     "quality": quality_metrics,
                     "validation": val_metrics,
                     "description": args.description,

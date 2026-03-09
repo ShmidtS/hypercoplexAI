@@ -1,6 +1,6 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
 ## Implementable-first architecture specification
-*Версия документа: 4.1 | Дата обновления: 2026-03-09 | Статус: MVP-oriented active development*
+*Версия документа: 4.2 | Дата обновления: 2026-03-09 | Статус: MVP-oriented active development*
 
 ---
 
@@ -94,7 +94,7 @@ $$
 Итоговый тренировочный контракт в MVP:
 
 $$
-L_{\mathrm{total}} = L_{\mathrm{recon}} + \lambda_{\mathrm{iso}} L_{\mathrm{iso}} + \lambda_{\mathrm{routing}} L_{\mathrm{routing}} + L_{\mathrm{memory}}
+L_{\mathrm{total}} = L_{\mathrm{recon}} + \lambda_{\mathrm{iso}} L_{\mathrm{iso}} + \lambda_{\mathrm{pair}} L_{\mathrm{pair}} + \lambda_{\mathrm{routing}} L_{\mathrm{routing}} + L_{\mathrm{memory}}
 $$
 
 Это и есть основной implementable objective, на который нужно опираться при развитии проекта.
@@ -211,7 +211,22 @@ MVP не должен описываться как уже имеющий:
 - `--text_mode` в CLI только переключает training/eval path на `TextHDIMModel` поверх того же HDIM core и не добавляет отдельный inference service;
 - manifest wiring через `ExperimentConfig` покрывает reproducible local runs, но не является scheduler, queue system или distributed execution layer;
 - `ExperimentRunner` и `AutoResearchRunner` сохраняют артефакты и score summaries, но не выполняют внешнюю литературную валидацию и не заменяют human review;
-- текущий autoresearch loop — это local experiment orchestration around `src.training.train`, а не автономный scientific agent runtime.
+- текущий autoresearch loop — это local experiment orchestration around `src.training.train`, а не автономный scientific agent runtime;
+- текущий runtime оценивает качество прогона в первую очередь через `pair_margin`, потому что именно он используется для выбора `best_run` в `AutoResearchRunner`.
+
+### 4.7 Autoresearch integration contract
+Новая autoresearch-поверхность уже существует как orchestration layer вокруг обучающего CLI и manifest schema.
+
+Её честный контракт в текущем проекте:
+
+1. `ExperimentConfig` фиксирует воспроизводимый run manifest (`text_mode`, `use_pairs`, `negative_ratio`, override-поля, `results_json`, `ledger_path`, `metadata`, `status`).
+2. `ExperimentRunner` материализует один запуск в `manifest.json`, `stdout.txt`, `stderr.txt`, `results.json` и ledger-строку.
+3. `AutoResearchRunner` выполняет серию manifest-driven прогонов, пишет `session_ledger.jsonl` и `session_summary.json`, а затем выбирает `best_run` полю `score`.
+4. В текущей реализации `score = quality.pair_margin`, то есть autoresearch оптимизирует не абстрактное качество открытия, а proxy separability aligned vs mismatched pairs.
+5. Loop stages жёстко ограничены локальным циклом `plan_manifest -> execute_training -> collect_artifacts -> score_quality -> record_decision`.
+
+Следствие: autoresearch в HDIM сегодня — это reproducible local experiment loop для отбора конфигураций, а не self-improving scientific agent с внешним knowledge ingestion.
+
 
 ---
 
@@ -247,7 +262,8 @@ MVP не должен описываться как уже имеющий:
 - `DomainProblemDataset`;
 - paired supervision via `pair_encoding` / `pair_domain_id`;
 - pair metadata via `pair_group_id`, `pair_family_id`, `pair_relation_type`, `pair_relation_label`, `pair_weight`;
-- `create_group_aware_split(...)` для leakage-aware group/family validation semantics без пересечения pair groups между train и validation.
+- в текущем dataset surface `pair_family_id` дублирует `pair_group_id`, поэтому реальная split semantics сейчас group-aware, а не independent family-aware;
+- `create_group_aware_split(...)` для leakage-aware validation semantics без пересечения `pair_group_id` между train и validation.
 - `HDIMTrainer`;
 - CLI training loop with optional machine-readable run summary JSON;
 - tests forward, paired transfer, validation, metrics.
@@ -289,31 +305,55 @@ MVP не должен описываться как уже имеющий:
 ---
 
 ## 6. Training contract
-## 6.1 Baseline mode
+### 6.1 Baseline mode
 Same-domain reconstruction mode:
 
-- вход: `encoding`, `domain_id`
-- путь: same-domain transfer / reconstruction
-- цель: стабилизировать representation, memory, routing, decode path
-## 6.2 Paired isomorphism mode
+- вход: `encoding`, `domain_id` или raw texts + `domain_id` при text path;
+- путь: same-domain transfer / reconstruction;
+- цель: стабилизировать representation, memory, routing, decode path.
+
+### 6.2 Paired isomorphism mode
 Cross-domain paired mode:
 
-- вход: `encoding`, `domain_id`, `pair_encoding`, `pair_domain_id`
-- путь: explicit transfer from source domain to paired target domain
-- цель: приближать invariants между функционально связанными примерами
-## 6.3 Loss composition
+- вход: `encoding`, `domain_id`, `pair_encoding`, `pair_domain_id` либо raw text batch с `text` / `pair_text` и теми же domain ids;
+- путь: explicit transfer from source domain to paired target domain;
+- цель: приближать invariants между функционально связанными примерами и одновременно отделять aligned pair от mismatched pair.
+
+### 6.3 Loss composition
 В implementable версии HDIM тренируется не на «чистой философской изоморфности», а на комбинации наблюдаемых loss-компонент:
 
-- `L_recon` — reconstruction / paired reconstruction target
-- `L_iso` — MSE между paired invariant representations
-- `L_routing` — router auxiliary term
-- `L_memory` — memory adaptation term
+- `L_recon` — reconstruction / paired reconstruction target;
+- `L_iso` — MSE между paired invariant representations с positive/negative semantics через `pair_relation_label` и `pair_weight`;
+- `L_pair` — ranking-margin term в пространстве `exported_invariant` для aligned vs mismatched pairs;
+- `L_routing` — router auxiliary term;
+- `L_memory` — memory adaptation term.
+
 Это ключевой engineering contract текущей системы.
+
+### 6.4 Validation semantics
+`HDIMTrainer.validate()` в текущем коде агрегирует batch-level значения `loss_recon`, `loss_iso`, `loss_pair`, `loss_routing`, `loss_memory`, `loss_total` по validation dataloader.
+
+Важно: `loss_pair` не только участвует в training/eval batch objective внутри `_compute_batch_losses()`, но и действительно возвращается отдельным агрегированным полем из `validate()`. Поэтому validation contract документа должен явно включать эту компоненту.
+
+### 6.5 Data split semantics
+Для paired datasets validation строится через `create_group_aware_split(...)`, который удерживает `pair_group_id` в непересекающихся train/validation split'ах и тем самым задаёт текущую leakage-aware semantics для MVP.
+
+Важно: хотя sample payload экспортирует и `pair_family_id`, в текущей реализации `src/training/dataset.py` он заполняется тем же значением, что и `pair_group_id`. Поэтому документ не должен обещать отдельную family-level split semantics, пока она не появится в коде.
+
+Для non-paired datasets тот же helper откатывается к обычному random split.
+
+### 6.6 Metrics and reporting semantics
+После training loop текущий CLI вызывает `compute_all_metrics()` и пишет quality surface `STS_exported`, `STS_training`, `DRS`, `AFR`, `pair_margin`.
+
+Если задан `results_json`, `src.training.train` сохраняет machine-readable run summary с config/run args/validation/quality/checkpoint/status; если задан `ledger_path`, дополнительно дописывается JSONL ledger row. Это reporting/orchestration contract, а не внешняя scientific validation layer.
+
+### 6.7 Section numbering note
+Раздел `7` фиксирует invariant lifecycle, а следующий самостоятельный блок оценки начинается с раздела `8`.
 
 ---
 
-## 6. Canonical invariant and memory lifecycle
-### 6.1 Frozen invariant naming
+## 7. Canonical invariant and memory lifecycle
+### 7.1 Frozen invariant naming
 Текущий код фиксирует четыре разные стадии invariant lifecycle:
 
 - `raw_invariant` — результат `InvariantExtractor` до памяти;
@@ -326,7 +366,7 @@ Cross-domain paired mode:
 - основной объект переноса = `exported_invariant`;
 - основной объект оптимизации = `training_invariant`.
 
-### 6.2 Memory protocol
+### 7.2 Memory protocol
 Memory lifecycle в MVP должен трактоваться как явный runtime contract с режимами:
 
 - `memory_mode="update"` — train-path, retrieval + update памяти;
@@ -337,7 +377,7 @@ Memory lifecycle в MVP должен трактоваться как явный 
 
 Минимальная инженерная гарантия текущего кода: repeated eval в `retrieve` режиме не должен менять memory state и router replay state.
 
-### 6.3 Router observability contract
+### 7.3 Router observability contract
 Публичный runtime state теперь должен восприниматься как contract, а не debug payload. Минимальный набор полей router observability:
 
 - `routing_weights`
@@ -352,36 +392,36 @@ Memory lifecycle в MVP должен трактоваться как явный 
 
 ---
 
-## 7. Evaluation contract
-## 7.1 STS_exported — Structural Transfer Score in transfer space
+## 8. Evaluation contract
+## 8.1 STS_exported — Structural Transfer Score in transfer space
 В текущем проекте `STS_exported` означает косинусное сходство между aligned source/target `exported_invariant`.
 
 Практически это **proxy for structure preservation in canonical transfer space**, а не финальное доказательство физической эквивалентности.
 
-## 7.2 STS_training — Structural Transfer Score in optimization space
+## 8.2 STS_training — Structural Transfer Score in optimization space
 `STS_training` измеряет косинусное сходство между aligned source/target `training_invariant`.
 
 Эта метрика нужна, чтобы evaluation surface не смешивал runtime transfer object и optimization projection.
 
-## 7.3 DRS — Domain Routing Stability
+## 8.3 DRS — Domain Routing Stability
 DRS измеряет стабильность router weights при повторных вызовах.
 
 Это инженерная метрика устойчивости маршрутизации, а не формальная оценка корректности научного вывода.
 
-## 7.4 AFR — Analogy Feasibility Rate
+## 8.4 AFR — Analogy Feasibility Rate
 AFR в MVP теперь трактуется как **margin-aware feasibility proxy**: aligned pair считается успешной, если одновременно выполняются similarity threshold и pair-margin threshold.
 
 Следовательно, AFR остаётся **internal consistency metric**, но уже учитывает отличие aligned pair от mismatched negative pair.
 
-## 7.5 Pair margin
+## 8.5 Pair margin
 `pair_margin` — это средний зазор между similarity aligned pairs и similarity mismatched pairs в пространстве `exported_invariant`.
 
 Эта метрика нужна как минимальный honesty check, что paired evaluation различает корректное и некорректное сопоставление.
 
 ---
 
-## 8. Optional conceptual modules kept as approximations
-## 8.1 Q-Attention
+## 9. Optional conceptual modules kept as approximations
+## 9.1 Q-Attention
 Целевая формула сохраняется как conceptual extension:
 
 $$
@@ -390,7 +430,7 @@ $$
 
 Но в текущем HDIM это **не обязательный runtime-компонент MVP**. Его нужно трактовать как кандидат для следующей research-phase, а не как текущую основу пайплайна.
 
-## 8.2 TRIZ DSL
+## 9.2 TRIZ DSL
 ТРИЗ-формат полезен как интерфейс abstraction layer и может быть зафиксирован как внешний preprocessing contract:
 
 ```text
@@ -404,7 +444,7 @@ TRIZ primitive:
 
 Но в текущем коде это **ещё не реализованный parser/runtime layer**.
 
-## 8.3 Human-in-the-loop / avatars
+## 9.3 Human-in-the-loop / avatars
 Схема режимов полезна как продуктовая надстройка:
 
 | Mode | Interpretation |
@@ -415,23 +455,23 @@ TRIZ primitive:
 
 Но пока это следует понимать как **future interaction design**, а не как уже существующую часть runtime API.
 
-## 8.4 Scholar API integration
+## 9.4 Scholar API integration
 External scientific retrieval остаётся долгосрочной интеграцией. Текущий `TitansMemoryModule` — это internal learnable memory, а не подключённая база Google Scholar / Semantic Scholar / PubMed.
 
-## 8.5 MVP execution contract and implementation matrix
-### 8.5.1 Minimal execution contract
+## 9.5 MVP execution contract and implementation matrix
+### 9.5.1 Minimal execution contract
 Чтобы документ оставался синхронизированным с текущим кодом, MVP должен читаться как следующий исполнимый контракт:
 
 1. входом служит либо уже готовый `encoding`, либо raw text, который кодируется trainable text-entry encoder внутри `TextHDIMModel`;
 2. `HDIMModel` выполняет either same-domain reconstruction, либо explicit paired transfer;
 3. `TextHDIMModel` добавляет thin text-facing entry layer для retrieval / ranking / transfer experiments поверх того же HDIM core;
 4. text-pair scoring выполняется через cosine similarity в пространстве `exported_invariant` и может возвращать structured artifact со score и обеими runtime states;
-5. `HDIMTrainer` оптимизирует наблюдаемые objective-компоненты `loss_recon`, `loss_iso`, `loss_routing`, `loss_memory`;
+5. `HDIMTrainer` оптимизирует наблюдаемые objective-компоненты `loss_recon`, `loss_iso`, `loss_pair`, `loss_routing`, `loss_memory`;
 6. CLI training path может дополнительно записывать machine-readable run summary JSON для orchestration/reporting flows, а manifest schema (`ExperimentConfig`) фиксирует `text_mode`, `use_pairs`, `results_json`, `ledger_path`, `status`, override-поля и metadata;
 7. качество оценивается через `validate()` и `compute_all_metrics()`;
 8. корректность MVP подтверждается тестами на forward / transfer / paired dataset / metrics и minimal text-wrapper surface.
 
-### 8.5.2 Training loop tied to current code
+### 9.5.2 Training loop tied to current code
 Реалистичный цикл обучения для текущего MVP выглядит так:
 
 ```text
@@ -440,7 +480,7 @@ create_demo_dataset() or create_paired_demo_dataset()
 → DataLoader
 → HDIMModel.forward() or HDIMModel.transfer_pairs()
 → HDIMTrainer._compute_batch_losses()
-→ loss_total = loss_recon + λ_iso·loss_iso + λ_routing·loss_routing + loss_memory
+→ loss_total = loss_recon + λ_iso·loss_iso + λ_pair·loss_pair + λ_routing·loss_routing + loss_memory
 → optimizer.step()
 → trainer.validate(...)
 → compute_all_metrics(...)
@@ -461,7 +501,7 @@ raw texts
 
 То есть основной путь проекта уже определён не whitepaper-обещаниями, а конкретным training contract в `src/training/trainer.py`, text-entry scaffold в `src/models/text_hdim_model.py` и data contract в `src/training/dataset.py`.
 
-### 8.5.3 Implementation matrix
+### 9.5.3 Implementation matrix
 | Component | MVP status | Code anchor | Practical note |
 |---|---|---|---|
 | Domain rotor / rotation operators | implemented | `hypercoplexAI/src/core/domain_operators.py` | основной перенос между доменами уже есть |
@@ -479,7 +519,7 @@ raw texts
 | Q-Attention | research only | not present in runtime code | оставить как post-MVP extension |
 | TRIZ parser / avatars / Scholar ingestion | research only | not present in runtime code | внешний workflow, не ядро Python MVP |
 
-### 8.5.4 MVP acceptance criteria
+### 9.5.4 MVP acceptance criteria
 Документ следует считать честно выполненным относительно текущей архитектуры, если одновременно верны шесть условий:
 
 - paired dataset может быть создан без нарушения positive/negative cross-domain contract;
@@ -493,8 +533,8 @@ raw texts
 
 ---
 
-## 9. Roadmap
-## 9.1 Phase 1 — MVP baseline
+## 10. Roadmap
+## 10.1 Phase 1 — MVP baseline
 Цель: зафиксировать работающий, тестируемый transfer engine.
 
 Входит:
@@ -509,7 +549,7 @@ raw texts
 
 Статус: **частично реализовано и уже привязано к текущему коду**.
 
-## 9.2 Phase 2 — next implementation phase
+## 10.2 Phase 2 — next implementation phase
 Цель: усилить реализуемость и экспериментальную достоверность.
 
 Приоритеты:
@@ -520,7 +560,7 @@ raw texts
 5. выровнять training/eval semantics;
 6. канонизировать invariant-state naming и API.
 
-## 9.3 Phase 3 — long-term research
+## 10.3 Phase 3 — long-term research
 Цель: перейти от MVP transfer engine к исследовательской платформе.
 
 Может включать:
@@ -534,7 +574,7 @@ raw texts
 
 ---
 
-## 10. Engineering guidance for future edits
+## 11. Engineering guidance for future edits
 При дальнейшем редактировании архитектуры нужно соблюдать правило:
 
 **любое сильное научное утверждение должно быть помечено как одно из трёх:**
@@ -547,8 +587,8 @@ raw texts
 
 ---
 
-## 11. Practical status summary
-### 11.1 What exists today
+## 12. Practical status summary
+### 12.1 What exists today
 Сегодня HDIM — это:
 
 - реализуемый PyTorch prototype;
@@ -557,7 +597,7 @@ raw texts
 - memory + routing + domain transport stack;
 - система с уже существующими тестами и минимальным synthetic data loop.
 
-### 11.2 What it is not yet
+### 12.2 What it is not yet
 Сегодня HDIM — это ещё не:
 
 - научный discovery engine с подключённой мировой литературой;
@@ -565,12 +605,12 @@ raw texts
 - полноформатный graph reasoning platform;
 - finished human-in-the-loop research workstation.
 
-### 11.3 Honest one-line description
+### 12.3 Honest one-line description
 HDIM в текущем состоянии — это **MVP hypercomplex transfer prototype for learning and evaluating domain-invariant approximations under memory-augmented routing**, а не завершённая система автоматизации научных открытий.
 
 ---
 
-## 12. File-level implementation index
+## 13. File-level implementation index
 Для навигации по текущей implementable architecture:
 
 - `hypercoplexAI/HDIM.md` — this specification
@@ -581,12 +621,17 @@ HDIM в текущем состоянии — это **MVP hypercomplex transfer
 - `hypercoplexAI/src/core/hdim_pipeline.py` — orchestrated transfer pipeline
 - `hypercoplexAI/src/models/hdim_model.py` — batch-facing model API
 - `hypercoplexAI/src/models/metrics.py` — evaluation metrics
+- `hypercoplexAI/src/models/text_hdim_model.py` — text-entry wrapper and structured text-pair scoring
 - `hypercoplexAI/src/training/dataset.py` — demo and paired datasets
-- `hypercoplexAI/src/training/trainer.py` — training loop
+- `hypercoplexAI/src/training/trainer.py` — training loop and validation semantics
+- `hypercoplexAI/src/training/train.py` — CLI training entrypoint, validation/quality reporting, and optional run-summary writeout
+- `hypercoplexAI/src/training/experiment_config.py` — manifest schema for experiment runs
+- `hypercoplexAI/src/training/experiment_runner.py` — experiment/autoresearch orchestration, artifact materialization, and best-run selection by `quality.pair_margin`
+- `hypercoplexAI/src/training/results_logger.py` — JSON/JSONL helpers used by run summaries and ledgers
 - `hypercoplexAI/tests/test_hdim.py` — coverage for baseline and paired behavior
 ---
 
-## 13. Final position
+## 14. Final position
 HDIM следует развивать как **implementable-first research system**:
 
 - сначала выравнивать код, лоссы, метрики и contracts;

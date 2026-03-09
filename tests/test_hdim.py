@@ -17,7 +17,7 @@ from src.training.dataset import (
     texts_to_tensor,
 )
 from src.training.experiment_config import ExperimentConfig
-from src.training.experiment_runner import ExperimentRunner
+from src.training.experiment_runner import AutoResearchRunner, ExperimentRunner
 from src.training.trainer import HDIMTrainer
 
 
@@ -242,6 +242,36 @@ def test_pair_iso_loss_uses_negative_margin(trainer, cfg):
     }
     loss = trainer._compute_pair_iso_loss(training_invariant, iso_target, batch)
     assert loss.item() == pytest.approx(trainer.negative_margin)
+
+
+def test_pair_ranking_loss_uses_grouped_negatives(trainer):
+    exported_invariant = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]
+    )
+    pair_exported_target = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]
+    )
+    batch = {
+        "pair_encoding": torch.randn(3, trainer.model.config.hidden_dim),
+        "domain_id": torch.tensor([0, 1, 2], dtype=torch.long),
+        "pair_domain_id": torch.tensor([1, 2, 0], dtype=torch.long),
+        "pair_group_id": torch.tensor([10, 20, 30], dtype=torch.long),
+        "pair_relation_label": torch.tensor([1.0, 1.0, 0.0]),
+        "pair_weight": torch.tensor([1.0, 2.0, 5.0]),
+    }
+
+    loss = trainer.compute_pair_ranking_loss(exported_invariant, pair_exported_target, batch)
+
+    expected_loss = trainer.ranking_margin * (1.0 / 3.0)
+    assert loss.item() == pytest.approx(expected_loss, abs=1e-6)
 
 
 def test_train_step(trainer, cfg):
@@ -679,9 +709,43 @@ def test_train_script_writes_results_json(tmp_path):
     assert payload["run_args"]["text_mode"] is True
     assert payload["validation"]["loss_total"] >= 0.0
     assert set(payload["quality"]) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
-    assert payload["checkpoint"].replace("\\", "/").endswith("checkpoints/hdim_final.pt")
+    assert payload["checkpoint"] == (results_path.parent / "checkpoints" / "hdim_final.pt").as_posix()
+    assert payload["run_id"] is None
     assert payload["status"] == "keep"
     assert "Wrote run summary" in completed.stdout
+
+def test_train_script_manifest_preserves_run_identity_and_artifacts(tmp_path):
+    results_path = tmp_path / "results" / "manifest_run.json"
+    ledger_path = tmp_path / "results" / "ledger.jsonl"
+    config_path = tmp_path / "experiment.json"
+    config = ExperimentConfig(
+        description="manifest identity",
+        epochs=1,
+        batch_size=4,
+        num_samples=16,
+        text_mode=True,
+        results_json=str(results_path),
+        ledger_path=str(ledger_path),
+        metadata={"run_id": "manifest-run-001", "tag": "smoke"},
+    )
+    config_path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
+
+    subprocess.run(
+        [sys.executable, "-m", "src.training.train", "--config", str(config_path)],
+        cwd="E:/hypercoplexAI",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(results_path.read_text(encoding="utf-8"))
+    ledger_rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert payload["run_id"] == "manifest-run-001"
+    assert payload["config_hash"] == config.config_hash()
+    assert payload["checkpoint"] == (results_path.parent / "checkpoints" / "hdim_final.pt").as_posix()
+    assert ledger_rows[-1]["run_id"] == "manifest-run-001"
+    assert ledger_rows[-1]["config_hash"] == config.config_hash()
+    assert ledger_rows[-1]["checkpoint"] == payload["checkpoint"]
 
 
 def test_train_script_supports_manifest_and_ledger(tmp_path):
@@ -735,14 +799,83 @@ def test_experiment_runner_executes_manifest(tmp_path):
             text_mode=True,
             results_json=str(results_path),
             ledger_path=str(ledger_path),
+            metadata={"run_id": "runner-smoke-001"},
         )
     )
     assert payload["status"] == "keep"
     assert payload["run_args"]["text_mode"] is True
-    assert payload["runner"]["run_id"].startswith("hdim-")
-    assert "--text_mode" in payload["runner"]["command"]
+    assert payload["runner"]["run_id"] == "runner-smoke-001"
+    assert payload["run_id"] == "runner-smoke-001"
+    assert payload["manifest"]["run_id"] == "runner-smoke-001"
+    assert payload["manifest"]["config_hash"] == payload["config_hash"]
+    assert payload["runner"]["command"][-2] == "--config"
+    assert payload["runner"]["command"][-1].replace("\\", "/") == payload["manifest"]["path"]
+    assert payload["artifacts"]["checkpoint"] == (results_path.parent / "checkpoints" / "hdim_final.pt").as_posix()
     assert results_path.exists()
     assert ledger_path.exists()
+
+
+def test_autoresearch_runner_isolates_run_artifacts_and_preserves_identity(tmp_path):
+    session_dir = tmp_path / "autoresearch"
+    runner = AutoResearchRunner("E:/hypercoplexAI")
+    configs = [
+        ExperimentConfig(
+            description="run a",
+            epochs=1,
+            batch_size=4,
+            num_samples=16,
+            text_mode=True,
+            metadata={"run_id": "session-run-a"},
+        ),
+        ExperimentConfig(
+            description="run b",
+            epochs=1,
+            batch_size=4,
+            num_samples=16,
+            text_mode=True,
+            metadata={"run_id": "session-run-b"},
+        ),
+    ]
+
+    summary = runner.run_many(configs, session_name="session-smoke", output_dir=session_dir)
+
+    assert summary["run_count"] == 2
+    assert [run["run_id"] for run in summary["runs"]] == ["session-run-a", "session-run-b"]
+    assert summary["runs"][0]["checkpoint"].endswith("session-run-a/checkpoints/hdim_final.pt")
+    assert summary["runs"][1]["checkpoint"].endswith("session-run-b/checkpoints/hdim_final.pt")
+    assert summary["runs"][0]["checkpoint"] != summary["runs"][1]["checkpoint"]
+    assert summary["runs"][0]["manifest_path"].endswith("session-run-a/manifest.json")
+    assert summary["runs"][1]["manifest_path"].endswith("session-run-b/manifest.json")
+
+    run_a = runner.load_run_artifacts(summary["runs"][0]["run_dir"])
+    run_b = runner.load_run_artifacts(summary["runs"][1]["run_dir"])
+    assert run_a["manifest"]["metadata"]["run_id"] == "session-run-a"
+    assert run_b["manifest"]["metadata"]["run_id"] == "session-run-b"
+    assert run_a["results"]["run_id"] == "session-run-a"
+    assert run_b["results"]["run_id"] == "session-run-b"
+    assert run_a["results"]["config_hash"] == summary["runs"][0]["config_hash"]
+    assert run_b["results"]["config_hash"] == summary["runs"][1]["config_hash"]
+
+    session_ledger_rows = runner.load_session_ledger(summary["session_dir"])
+    quality_rows = [row for row in session_ledger_rows if "quality" in row]
+    assert len(quality_rows) == 2
+    assert {row["run_id"] for row in quality_rows} == {"session-run-a", "session-run-b"}
+    assert quality_rows[0]["checkpoint"] != quality_rows[1]["checkpoint"]
+    assert quality_rows[0]["manifest_path"] != quality_rows[1]["manifest_path"]
+    assert quality_rows[0]["results_json"] != quality_rows[1]["results_json"]
+    assert summary["best_run"]["run_id"] in {"session-run-a", "session-run-b"}
+    assert summary["best_run"]["config_hash"] in {
+        summary["runs"][0]["config_hash"],
+        summary["runs"][1]["config_hash"],
+    }
+    assert summary["best_run"]["checkpoint"] in {
+        summary["runs"][0]["checkpoint"],
+        summary["runs"][1]["checkpoint"],
+    }
+    assert summary["best_run"]["manifest_path"] in {
+        summary["runs"][0]["manifest_path"],
+        summary["runs"][1]["manifest_path"],
+    }
 
 
 # ============================================================
