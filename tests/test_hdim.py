@@ -16,6 +16,8 @@ from src.training.dataset import (
     create_paired_demo_dataset,
     texts_to_tensor,
 )
+from src.training.experiment_config import ExperimentConfig
+from src.training.experiment_runner import ExperimentRunner
 from src.training.trainer import HDIMTrainer
 
 
@@ -486,6 +488,13 @@ def test_text_model_scores_text_pairs_with_state(text_model, cfg):
     assert flattened["target_update_memory"] is False
 
 
+def test_text_model_encode_texts_is_trainable(text_model, cfg):
+    texts = ["alpha", "beta"]
+    encodings = text_model.encode_texts(texts)
+    assert encodings.shape == (2, cfg.hidden_dim)
+    assert encodings.requires_grad
+
+
 def test_compute_all_metrics_runs_on_model_device(trainer):
     ds = create_demo_dataset(n_samples=16)
     dl = DataLoader(ds, batch_size=4)
@@ -553,7 +562,64 @@ def test_train_script_writes_results_json(tmp_path):
     assert payload["validation"]["loss_total"] >= 0.0
     assert set(payload["quality"]) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
     assert payload["checkpoint"].replace("\\", "/").endswith("checkpoints/hdim_final.pt")
+    assert payload["status"] == "keep"
     assert "Wrote run summary" in completed.stdout
+
+
+def test_train_script_supports_manifest_and_ledger(tmp_path):
+    results_path = tmp_path / "results" / "manifest_run.json"
+    ledger_path = tmp_path / "results" / "ledger.jsonl"
+    config_path = tmp_path / "experiment.json"
+    config = ExperimentConfig(
+        description="manifest smoke",
+        epochs=1,
+        batch_size=4,
+        num_samples=16,
+        use_pairs=True,
+        negative_ratio=0.25,
+        results_json=str(results_path),
+        ledger_path=str(ledger_path),
+    )
+    config_path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "src.training.train", "--config", str(config_path)],
+        cwd="E:/hypercoplexAI",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(results_path.read_text(encoding="utf-8"))
+    ledger_rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert payload["run_args"]["use_pairs"] is True
+    assert payload["run_args"]["negative_ratio"] == pytest.approx(0.25)
+    assert payload["run_args"]["description"] == "manifest smoke"
+    assert ledger_rows
+    assert ledger_rows[-1]["status"] == "keep"
+    assert "Appended run ledger row" in completed.stdout
+
+
+def test_experiment_runner_executes_manifest(tmp_path):
+    results_path = tmp_path / "runner" / "runner_summary.json"
+    ledger_path = tmp_path / "runner" / "runner_ledger.jsonl"
+    runner = ExperimentRunner("E:/hypercoplexAI")
+    payload = runner.run(
+        ExperimentConfig(
+            description="runner smoke",
+            epochs=1,
+            batch_size=4,
+            num_samples=16,
+            use_pairs=True,
+            negative_ratio=0.25,
+            results_json=str(results_path),
+            ledger_path=str(ledger_path),
+        )
+    )
+    assert payload["status"] == "keep"
+    assert payload["runner"]["run_id"].startswith("hdim-")
+    assert results_path.exists()
+    assert ledger_path.exists()
 
 
 # ============================================================
@@ -566,12 +632,9 @@ def test_identity_rotor_preserves_input():
     from src.core.domain_operators import DomainRotationOperator
     alg = CliffordAlgebra(p=2, q=0, r=0)  # dim=4
     rotor = DomainRotationOperator(alg, init_identity=True)
-    # sandwich работает поэлементно: R и x должны быть одинаковой формы.
-    # Передаём одиночный вектор (alg.dim,)
     x = torch.randn(alg.dim)
     with torch.no_grad():
         x_rotated = rotor(x)
-    # Identity rotor должен давать точное сохранение
     assert torch.allclose(x_rotated, x, atol=1e-5), f"Identity rotor changed input: max diff={(x_rotated - x).abs().max().item()}"
 
 
@@ -599,7 +662,6 @@ def test_round_trip_transfer_same_domain(model, cfg):
     domain_id = torch.zeros(4, dtype=torch.long)
     with torch.no_grad():
         out, _, _ = model(x, domain_id, update_memory=False, memory_mode="retrieve")
-    # Выход должен иметь ту же форму
     assert out.shape == x.shape
 
 
@@ -623,13 +685,11 @@ def test_raw_invariant_differs_from_exported(model, cfg):
 def test_clifford_geometric_product_anticommutativity():
     """e1 * e2 = -e2 * e1 в Cl_{2,0,0}."""
     from src.core.hypercomplex import CliffordAlgebra
-    alg = CliffordAlgebra(p=2, q=0, r=0)  # dim=4, basis: e0=1, e1, e2, e12
-    # e1 = index 1 (binary 01), e2 = index 2 (binary 10)
+    alg = CliffordAlgebra(p=2, q=0, r=0)
     e1 = torch.zeros(alg.dim)
     e1[1] = 1.0
     e2 = torch.zeros(alg.dim)
     e2[2] = 1.0
     e1e2 = alg.geometric_product(e1, e2)
     e2e1 = alg.geometric_product(e2, e1)
-    # e1*e2 должно быть -(e2*e1)
     assert torch.allclose(e1e2, -e2e1, atol=1e-6), f"e1*e2 != -e2*e1: {e1e2} vs {-e2e1}"
