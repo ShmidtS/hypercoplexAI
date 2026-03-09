@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import os
 from typing import Dict, Literal, Tuple
 
+import torch.nn.functional as F
+
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -18,7 +20,7 @@ from src.models.hdim_model import HDIMAuxState, HDIMModel
 class TrainingRegime:
     mode: Literal["reconstruction", "paired"]
     update_memory: bool
-    memory_mode: Literal["retrieve", "update"]
+    memory_mode: Literal["none", "retrieve", "update"]
 
 
 class HDIMTrainer:
@@ -31,6 +33,7 @@ class HDIMTrainer:
         device: str | torch.device = "cpu",
         lambda_iso: float = 0.1,
         lambda_routing: float = 0.05,
+        negative_margin: float = 1.0,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer

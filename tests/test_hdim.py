@@ -4,7 +4,12 @@ from torch.utils.data import DataLoader
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.metrics import compute_all_metrics
-from src.training.dataset import DomainProblemDataset, create_demo_dataset, create_paired_demo_dataset
+from src.training.dataset import (
+    DomainProblemDataset,
+    create_demo_dataset,
+    create_group_aware_split,
+    create_paired_demo_dataset,
+)
 from src.training.trainer import HDIMTrainer
 
 
@@ -111,7 +116,10 @@ def test_paired_dataset():
     assert sample["pair_encoding"].shape == (64,)
     assert sample["pair_domain_id"].dtype == torch.long
     assert sample["pair_group_id"].dtype == torch.long
-    assert sample["pair_relation_type"] == "cross_domain_analogy"
+    assert sample["pair_family_id"].dtype == torch.long
+    assert sample["pair_relation_type"] == "positive"
+    assert sample["pair_relation_label"].dtype == torch.float32
+    assert sample["pair_relation_label"].item() == 1.0
     assert sample["pair_weight"].dtype == torch.float32
     assert sample["pair_weight"].item() > 0.0
     assert sample["pair_domain_id"].item() != sample["domain_id"].item()
@@ -124,7 +132,7 @@ def test_dataset_rejects_same_domain_pairs():
             samples,
             pair_indices=[1, 0],
             pair_group_ids=[0, 0],
-            pair_relation_types=["cross_domain_analogy", "cross_domain_analogy"],
+            pair_relation_types=["positive", "positive"],
             pair_weights=[1.0, 1.0],
         )
 
@@ -136,7 +144,7 @@ def test_dataset_rejects_misaligned_pair_groups():
             samples,
             pair_indices=[1, 0, 1],
             pair_group_ids=[0, 1, 2],
-            pair_relation_types=["cross_domain_analogy", "cross_domain_analogy", "cross_domain_analogy"],
+            pair_relation_types=["positive", "positive", "positive"],
             pair_weights=[1.0, 1.0, 1.0],
         )
 
@@ -148,7 +156,7 @@ def test_dataset_rejects_non_positive_pair_weights():
             samples,
             pair_indices=[1, 0],
             pair_group_ids=[0, 0],
-            pair_relation_types=["cross_domain_analogy", "cross_domain_analogy"],
+            pair_relation_types=["positive", "positive"],
             pair_weights=[0.0, 1.0],
         )
 
@@ -160,9 +168,27 @@ def test_dataset_rejects_mismatched_pair_relation_types():
             samples,
             pair_indices=[1, 0],
             pair_group_ids=[0, 0],
-            pair_relation_types=["cross_domain_analogy", "other_relation"],
+            pair_relation_types=["positive", "negative"],
             pair_weights=[1.0, 1.0],
         )
+
+
+def test_dataset_exposes_negative_pair_metadata():
+    ds = create_paired_demo_dataset(n_samples=40, negative_ratio=1.0)
+    sample = next(item for item in (ds[idx] for idx in range(len(ds))) if item["pair_relation_type"] == "negative")
+    assert sample["pair_relation_label"].item() == 0.0
+    assert sample["pair_family_id"].item() == sample["pair_group_id"].item()
+    assert sample["pair_domain_id"].item() != sample["domain_id"].item()
+
+
+def test_group_aware_split_keeps_pair_groups_separate():
+    ds = create_paired_demo_dataset(n_samples=40, negative_ratio=0.0)
+    train_ds, val_ds = create_group_aware_split(ds, train_fraction=0.8, seed=42)
+    train_group_ids = {ds.pair_group_ids[idx] for idx in train_ds.indices}
+    val_group_ids = {ds.pair_group_ids[idx] for idx in val_ds.indices}
+    assert train_group_ids
+    assert val_group_ids
+    assert train_group_ids.isdisjoint(val_group_ids)
 
 
 def test_iso_loss(trainer, cfg):

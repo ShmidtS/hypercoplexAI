@@ -7,7 +7,11 @@ from torch.utils.data import DataLoader
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.metrics import compute_all_metrics
-from src.training.dataset import create_demo_dataset, create_paired_demo_dataset
+from src.training.dataset import (
+    create_demo_dataset,
+    create_group_aware_split,
+    create_paired_demo_dataset,
+)
 from src.training.trainer import HDIMTrainer
 
 
@@ -27,10 +31,7 @@ def main():
 
     dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
     dataset = dataset_factory()
-    # 80/20 split
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_ds, val_ds = create_group_aware_split(dataset, train_fraction=0.8, seed=42)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 

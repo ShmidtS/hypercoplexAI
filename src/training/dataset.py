@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -49,8 +50,9 @@ def _text_to_embedding(text: str, dim: int, seed: Optional[int] = None) -> torch
 class DomainProblemDataset(Dataset):
     """Dataset of domain-labelled problem samples for HDIM training.
 
-    Optionally exposes aligned cross-domain pairs for pair-supervised
-    isomorphism training.
+    Optionally exposes cross-domain pair metadata for pair-supervised
+    isomorphism training, including explicit relation types, group ids,
+    and per-pair weights.
     """
 
     def __init__(
@@ -96,12 +98,19 @@ class DomainProblemDataset(Dataset):
                     raise ValueError("pair_indices must reference a different sample")
                 if self._labels[pair_idx] == self._labels[idx]:
                     raise ValueError("pair_indices must point to a sample from a different domain")
-                if self.pair_group_ids[pair_idx] != self.pair_group_ids[idx]:
-                    raise ValueError("pair_indices must stay within the same cross-domain pair group")
-                if self.pair_relation_types[idx] != self.pair_relation_types[pair_idx]:
+                relation_type = self.pair_relation_types[idx]
+                if relation_type not in {"positive", "negative"}:
+                    raise ValueError("pair_relation_types must be either 'positive' or 'negative'")
+                if relation_type != self.pair_relation_types[pair_idx]:
                     raise ValueError("pair_relation_types must match across paired samples")
                 if self.pair_weights[idx] <= 0 or self.pair_weights[pair_idx] <= 0:
                     raise ValueError("pair_weights must be positive for all paired samples")
+                if relation_type == "positive":
+                    if self.pair_group_ids[pair_idx] != self.pair_group_ids[idx]:
+                        raise ValueError("positive pair_indices must stay within the same cross-domain pair group")
+                else:
+                    if self.pair_group_ids[pair_idx] == self.pair_group_ids[idx]:
+                        raise ValueError("negative pairs must not reuse the same pair group")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -114,11 +123,17 @@ class DomainProblemDataset(Dataset):
 
         if self.pair_indices is not None:
             pair_idx = self.pair_indices[idx]
+            pair_relation_type = self.pair_relation_types[idx]
             item["pair_encoding"] = self._encodings[pair_idx].float()
             item["pair_domain_id"] = torch.tensor(self._labels[pair_idx], dtype=torch.long)
             item["pair_index"] = torch.tensor(pair_idx, dtype=torch.long)
             item["pair_group_id"] = torch.tensor(self.pair_group_ids[idx], dtype=torch.long)
-            item["pair_relation_type"] = self.pair_relation_types[idx]
+            item["pair_family_id"] = torch.tensor(self.pair_group_ids[idx], dtype=torch.long)
+            item["pair_relation_type"] = pair_relation_type
+            item["pair_relation_label"] = torch.tensor(
+                1.0 if pair_relation_type == "positive" else 0.0,
+                dtype=torch.float32,
+            )
             item["pair_weight"] = torch.tensor(self.pair_weights[idx], dtype=torch.float32)
 
         return item
@@ -202,8 +217,9 @@ def create_paired_demo_dataset(
     num_domains: int = 4,
     embed_dim: int = 64,
     seed: int = 42,
+    negative_ratio: float = 0.0,
 ) -> DomainProblemDataset:
-    """Create a synthetic demo dataset with aligned cross-domain pairs."""
+    """Create a synthetic demo dataset with explicit positive and negative cross-domain pairs."""
     assert num_domains >= 2, "Paired demo dataset requires at least 2 domains."
     assert num_domains <= 4, "Demo dataset supports at most 4 domains."
     random.seed(seed)
@@ -215,19 +231,43 @@ def create_paired_demo_dataset(
         variant_to_indices.setdefault(variant_id, []).append(idx)
 
     pair_indices: List[int] = []
+    pair_relation_types: List[str] = []
+    pair_group_ids: List[int] = []
+    pair_weights: List[float] = []
+    next_negative_group_id = max(variant_ids, default=-1) + 1
+
     for idx, (_, domain_id) in enumerate(samples):
-        candidates = [
+        positive_candidates = [
             candidate_idx
             for candidate_idx in variant_to_indices[variant_ids[idx]]
             if candidate_idx != idx and samples[candidate_idx][1] != domain_id
         ]
-        if not candidates:
+        if not positive_candidates:
             raise ValueError("Could not construct cross-domain pair for sample")
-        pair_indices.append(random.choice(candidates))
 
-    pair_group_ids = list(variant_ids)
-    pair_relation_types = ["cross_domain_analogy" for _ in samples]
-    pair_weights = [1.0 for _ in samples]
+        should_use_negative = negative_ratio > 0.0 and random.random() < negative_ratio
+        if should_use_negative:
+            negative_candidates = [
+                candidate_idx
+                for candidate_idx, (_, candidate_domain_id) in enumerate(samples)
+                if candidate_idx != idx
+                and candidate_domain_id != domain_id
+                and variant_ids[candidate_idx] != variant_ids[idx]
+            ]
+            if negative_candidates:
+                pair_idx = random.choice(negative_candidates)
+                pair_indices.append(pair_idx)
+                pair_relation_types.append("negative")
+                pair_group_ids.append(next_negative_group_id)
+                pair_weights.append(1.0)
+                next_negative_group_id += 1
+                continue
+
+        pair_idx = random.choice(positive_candidates)
+        pair_indices.append(pair_idx)
+        pair_relation_types.append("positive")
+        pair_group_ids.append(variant_ids[idx])
+        pair_weights.append(1.0)
 
     order = list(range(len(samples)))
     random.shuffle(order)
@@ -235,7 +275,6 @@ def create_paired_demo_dataset(
     inverse_order = {old_idx: new_idx for new_idx, old_idx in enumerate(order)}
     shuffled_pairs = [inverse_order[pair_indices[old_idx]] for old_idx in order]
     shuffled_pair_groups = [pair_group_ids[old_idx] for old_idx in order]
-
     shuffled_pair_relations = [pair_relation_types[old_idx] for old_idx in order]
     shuffled_pair_weights = [pair_weights[old_idx] for old_idx in order]
 
@@ -246,4 +285,42 @@ def create_paired_demo_dataset(
         pair_group_ids=shuffled_pair_groups,
         pair_relation_types=shuffled_pair_relations,
         pair_weights=shuffled_pair_weights,
+    )
+
+
+def create_group_aware_split(
+    dataset: DomainProblemDataset,
+    train_fraction: float = 0.8,
+    seed: int = 42,
+) -> Tuple[torch.utils.data.Subset, torch.utils.data.Subset]:
+    """Split dataset by pair groups/families to avoid template leakage across splits."""
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError("train_fraction must be between 0 and 1")
+
+    if dataset.pair_group_ids is None:
+        generator = torch.Generator().manual_seed(seed)
+        train_size = int(train_fraction * len(dataset))
+        val_size = len(dataset) - train_size
+        return torch.utils.data.random_split(dataset, [train_size, val_size], generator=generator)
+
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for idx, group_id in enumerate(dataset.pair_group_ids):
+        groups[group_id].append(idx)
+
+    group_ids = list(groups.keys())
+    random.Random(seed).shuffle(group_ids)
+    target_train_size = int(round(train_fraction * len(dataset)))
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+
+    for group_id in group_ids:
+        destination = train_indices if len(train_indices) < target_train_size else val_indices
+        destination.extend(groups[group_id])
+
+    if not train_indices or not val_indices:
+        raise ValueError("group-aware split requires both train and validation groups")
+
+    return (
+        torch.utils.data.Subset(dataset, train_indices),
+        torch.utils.data.Subset(dataset, val_indices),
     )

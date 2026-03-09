@@ -62,7 +62,7 @@ $$
 G_B = R_B \otimes U \otimes R_B^{-1}
 $$
 
-Где $U$ в MVP — это не обязательно «чистый» инвариант, а чаще **processed invariant** после memory + router stages.
+Где $U$ в MVP — это canonical transfer object после memory + router stages, то есть `exported_invariant`, а не абстрактный «processed invariant».
 
 ### 3.4 Routing stabilization approximation
 Идея R3 сохраняется как приближение top-k replay-stabilized routing:
@@ -103,7 +103,7 @@ $$
 
 ## 4. MVP architecture
 ## 4.1 What is part of the MVP
-MVP HDIM — это **pair-supervised, invariant-centered transfer pipeline** с five-stage path:
+MVP HDIM — это **pair-supervised, invariant-centered transfer pipeline** с canonical transfer lifecycle:
 
 1. `encode source`
 2. `extract invariant`
@@ -156,7 +156,7 @@ x
 - `hypercoplexAI/src/training/trainer.py`
  - reconstruction + iso + routing + memory loss integration
 - `hypercoplexAI/src/models/metrics.py`
- - STS / DRS / AFR evaluation
+ - STS_exported / STS_training / DRS / AFR / pair_margin evaluation
 - `hypercoplexAI/tests/test_hdim.py`
  - baseline and paired-contract tests
 ### 4.4 What the MVP can honestly claim
@@ -168,8 +168,8 @@ x
 - stateful memory augmentation;
 - R3-inspired MoE routing;
 - explicit paired transfer training path;
-- базовые метрики STS/DRS/AFR;
-- синтетический paired dataset для обучения и валидации.
+- metric surface `STS_exported`, `STS_training`, `DRS`, `AFR`, `pair_margin`;
+- синтетический paired dataset с `pair_relation_type`, `pair_family_id`, `pair_weight` и group-aware split для обучения и валидации.
 
 ### 4.5 What the MVP must NOT claim
 MVP не должен описываться как уже имеющий:
@@ -214,6 +214,8 @@ MVP не должен описываться как уже имеющий:
 Реализовано:
 - `DomainProblemDataset`;
 - paired supervision via `pair_encoding` / `pair_domain_id`;
+- pair metadata via `pair_group_id`, `pair_family_id`, `pair_relation_type`, `pair_relation_label`, `pair_weight`;
+- `create_group_aware_split(...)` для leakage-aware group/family validation semantics без пересечения pair groups между train и validation.
 - `HDIMTrainer`;
 - tests forward, paired transfer, validation, metrics.
 
@@ -227,7 +229,7 @@ MVP не должен описываться как уже имеющий:
 3. алгебраические contract tests;
 4. более прозрачный router state и debug surface;
 5. alignment между training contract и evaluation contract;
-6. прояснение роли `processed invariant` как основного объекта переноса.
+6. канонизировать `exported_invariant` / `training_invariant` naming surface вместо старого umbrella-термина `processed invariant`.
 
 ## 5.3 Research / long-term components
 Следующие элементы остаются исследовательскими и не входят в MVP-contract:
@@ -416,12 +418,13 @@ create_demo_dataset() or create_paired_demo_dataset()
 | TRIZ parser / avatars / Scholar ingestion | research only | not present in runtime code | внешний workflow, не ядро Python MVP |
 
 ### 8.5.4 MVP acceptance criteria
-Документ следует считать честно выполненным относительно текущей архитектуры, если одновременно верны четыре условия:
+Документ следует считать честно выполненным относительно текущей архитектуры, если одновременно верны пять условий:
 
-- paired dataset может быть создан без нарушения cross-domain contract;
+- paired dataset может быть создан без нарушения positive/negative cross-domain contract;
+- train/validation split может быть построен через `create_group_aware_split(...)` без пересечения pair groups между split'ами;
 - `HDIMTrainer.train_step()` работает как для обычного, так и для paired batch;
 - `validate()` возвращает агрегированные loss-метрики;
-- `compute_all_metrics()` возвращает `STS`, `DRS`, `AFR` на том же model API.
+- `compute_all_metrics()` возвращает `STS_exported`, `STS_training`, `DRS`, `AFR`, `pair_margin` на том же model API.
 
 Именно эти критерии делают HDIM implementable-first системой уже сейчас.
 
@@ -438,7 +441,7 @@ create_demo_dataset() or create_paired_demo_dataset()
 - R3-inspired router;
 - paired dataset;
 - trainer;
-- STS/DRS/AFR proxies;
+- STS_exported / STS_training / DRS / AFR / pair_margin proxies;
 - tests.
 
 Статус: **частично реализовано и уже привязано к текущему коду**.
