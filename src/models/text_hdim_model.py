@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Sequence, Tuple
 
 import torch
@@ -10,6 +11,22 @@ import torch.nn.functional as F
 
 from src.models.hdim_model import HDIMAuxState, HDIMModel
 from src.training.dataset import texts_to_tensor
+
+
+@dataclass(frozen=True)
+class TextPairScoreResult:
+    """Structured text-pair scoring artifact for retrieval/ranking workflows."""
+
+    scores: torch.Tensor
+    source_state: HDIMAuxState
+    target_state: HDIMAuxState
+
+    def to_dict(self) -> dict[str, torch.Tensor | bool | str]:
+        result: dict[str, torch.Tensor | bool | str] = {"scores": self.scores}
+        for prefix, state in (("source", self.source_state), ("target", self.target_state)):
+            for key, value in state.to_dict().items():
+                result[f"{prefix}_{key}"] = value
+        return result
 
 
 class TextHDIMModel(nn.Module):
@@ -106,6 +123,20 @@ class TextHDIMModel(nn.Module):
         source_domain_id: torch.Tensor,
         target_domain_id: torch.Tensor,
     ) -> torch.Tensor:
+        return self.score_text_pairs_with_state(
+            source_texts,
+            target_texts,
+            source_domain_id,
+            target_domain_id,
+        ).scores
+
+    def score_text_pairs_with_state(
+        self,
+        source_texts: Sequence[str],
+        target_texts: Sequence[str],
+        source_domain_id: torch.Tensor,
+        target_domain_id: torch.Tensor,
+    ) -> TextPairScoreResult:
         _, _, _, src_state = self.transfer_text_pairs(
             source_texts,
             source_domain_id,
@@ -120,8 +151,13 @@ class TextHDIMModel(nn.Module):
             update_memory=False,
             memory_mode="retrieve",
         )
-        return F.cosine_similarity(
+        scores = F.cosine_similarity(
             src_state.exported_invariant,
             tgt_state.exported_invariant,
             dim=-1,
+        )
+        return TextPairScoreResult(
+            scores=scores,
+            source_state=src_state,
+            target_state=tgt_state,
         )

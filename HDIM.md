@@ -1,6 +1,6 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
 ## Implementable-first architecture specification
-*Версия документа: 4.0 | Дата обновления: 2026-03-08 | Статус: MVP-oriented active development*
+*Версия документа: 4.1 | Дата обновления: 2026-03-09 | Статус: MVP-oriented active development*
 
 ---
 
@@ -11,7 +11,7 @@
 2. **Следующую инженерную фазу**, которая логично продолжает существующую реализацию.
 3. **Долгосрочные research-компоненты**, которые остаются гипотезами и не должны восприниматься как уже реализованные возможности.
 
-HDIM сохраняет научное ядро исходной идеи: представлять проблемы как гиперкомплексные структуры, извлекать доменно-инвариантное представление и переносить его между доменами через routing + memory. Но текущая система должна трактоваться как **research prototype / MVP transfer engine**, а не как завершённая машина автоматизированных научных открытий.
+HDIM сохраняет научное ядро исходной идеи: представлять проблемы как гиперкомплексные структуры, извлекать доменно-инвариантное представление и переносить его между доменами через routing + memory. Текущий MVP уже допускает как embedding-first вход, так и minimal text-facing entry layer через `TextHDIMModel`, но эта текстовая поверхность остаётся thin wrapper над существующим HDIM core. Поэтому систему всё ещё нужно трактовать как **research prototype / MVP transfer engine**, а не как завершённую машину автоматизированных научных открытий или generative language model.
 
 ---
 
@@ -150,15 +150,24 @@ x
  - integer-indexed domain interface
  - same-domain forward path
  - explicit paired transfer path
+- `hypercoplexAI/src/models/text_hdim_model.py`
+ - thin text-entry wrapper around the HDIM core
+ - `forward_texts(...)`, `transfer_texts(...)`, `transfer_text_pairs(...)`
+ - structured retrieval/ranking artifact via `TextPairScoreResult`
 - `hypercoplexAI/src/training/dataset.py`
  - baseline dataset
  - paired demo dataset
+ - deterministic `texts_to_tensor(...)` scaffold for minimal text-mode experiments
 - `hypercoplexAI/src/training/trainer.py`
  - reconstruction + iso + routing + memory loss integration
+- `hypercoplexAI/src/training/train.py`
+ - CLI training loop
+ - optional machine-readable `results_json` run summary for orchestration/reporting flows
 - `hypercoplexAI/src/models/metrics.py`
  - STS_exported / STS_training / DRS / AFR / pair_margin evaluation
 - `hypercoplexAI/tests/test_hdim.py`
  - baseline and paired-contract tests
+ - text-wrapper scoring coverage with retrieve-only memory semantics
 ### 4.4 What the MVP can honestly claim
 Текущая архитектура уже поддерживает:
 
@@ -168,8 +177,11 @@ x
 - stateful memory augmentation;
 - R3-inspired MoE routing;
 - explicit paired transfer training path;
+- minimal text-facing retrieval/ranking/transfer wrapper over the same HDIM core;
+- structured text-pair scoring artifact with source/target runtime states for inspection/reporting;
 - metric surface `STS_exported`, `STS_training`, `DRS`, `AFR`, `pair_margin`;
 - синтетический paired dataset с `pair_relation_type`, `pair_family_id`, `pair_weight` и group-aware split для обучения и валидации.
+- machine-readable run summary JSON from the training CLI for orchestration/reporting workflows.
 
 ### 4.5 What the MVP must NOT claim
 MVP не должен описываться как уже имеющий:
@@ -179,7 +191,9 @@ MVP не должен описываться как уже имеющий:
 - полноценный Scholar / PubMed / Patents memory ingestion pipeline;
 - validated human-in-the-loop scientific review workflow;
 - завершённый Q-Attention graph transformer;
-- полноценную автоматическую интерпретацию ТРИЗ на runtime.
+- полноценную автоматическую интерпретацию ТРИЗ на runtime;
+- generative language model или pretrained semantic encoder;
+- externally verified autoresearch runtime с доказательной литературной валидацией.
 
 ---
 
@@ -217,7 +231,18 @@ MVP не должен описываться как уже имеющий:
 - pair metadata via `pair_group_id`, `pair_family_id`, `pair_relation_type`, `pair_relation_label`, `pair_weight`;
 - `create_group_aware_split(...)` для leakage-aware group/family validation semantics без пересечения pair groups между train и validation.
 - `HDIMTrainer`;
+- CLI training loop with optional machine-readable run summary JSON;
 - tests forward, paired transfer, validation, metrics.
+
+### F. Minimal text-facing wrapper
+Реализовано:
+- `TextHDIMModel` как thin wrapper поверх `HDIMModel`;
+- deterministic text-to-embedding entry via `texts_to_tensor(...)`;
+- `forward_texts(...)`, `transfer_texts(...)`, `transfer_text_pairs(...)`;
+- `score_text_pairs_with_state(...)` как retrieval/ranking surface, возвращающий scores и source/target runtime states;
+- retrieve-only scoring contract (`memory_mode="retrieve"`, `update_memory=False`) для text-pair comparison без мутации памяти во время scoring.
+
+Важно: этот слой предназначен для retrieval/ranking/transfer experiments и orchestration-friendly inspection, но не превращает HDIM в генеративную текстовую модель.
 
 ## 5.2 Next-phase engineering components
 Следующая фаза должна улучшать текущий код, а не подменять его новой абстрактной архитектурой.
@@ -379,18 +404,21 @@ External scientific retrieval остаётся долгосрочной инте
 ### 8.5.1 Minimal execution contract
 Чтобы документ оставался синхронизированным с текущим кодом, MVP должен читаться как следующий исполнимый контракт:
 
-1. входом служит уже готовый `encoding`, а не raw scientific corpus;
+1. входом служит либо уже готовый `encoding`, либо raw text, который детерминированно переводится в embedding через minimal text-entry scaffold;
 2. `HDIMModel` выполняет either same-domain reconstruction, либо explicit paired transfer;
-3. optional `TextHDIMModel` добавляет только deterministic text-to-embedding entry layer для retrieval / ranking / transfer experiments поверх того же HDIM core;
-4. `HDIMTrainer` оптимизирует наблюдаемые objective-компоненты `loss_recon`, `loss_iso`, `loss_routing`, `loss_memory`;
-5. качество оценивается через `validate()` и `compute_all_metrics()`;
-6. корректность MVP подтверждается тестами на forward / transfer / paired dataset / metrics и minimal text-wrapper surface.
+3. `TextHDIMModel` добавляет thin text-facing entry layer для retrieval / ranking / transfer experiments поверх того же HDIM core;
+4. text-pair scoring выполняется через cosine similarity в пространстве `exported_invariant` и может возвращать structured artifact со score и обеими runtime states;
+5. `HDIMTrainer` оптимизирует наблюдаемые objective-компоненты `loss_recon`, `loss_iso`, `loss_routing`, `loss_memory`;
+6. CLI training path может дополнительно записывать machine-readable run summary JSON для orchestration/reporting flows;
+7. качество оценивается через `validate()` и `compute_all_metrics()`;
+8. корректность MVP подтверждается тестами на forward / transfer / paired dataset / metrics и minimal text-wrapper surface.
 
 ### 8.5.2 Training loop tied to current code
 Реалистичный цикл обучения для текущего MVP выглядит так:
 
 ```text
 create_demo_dataset() or create_paired_demo_dataset()
+→ create_group_aware_split(...)
 → DataLoader
 → HDIMModel.forward() or HDIMModel.transfer_pairs()
 → HDIMTrainer._compute_batch_losses()
@@ -398,9 +426,21 @@ create_demo_dataset() or create_paired_demo_dataset()
 → optimizer.step()
 → trainer.validate(...)
 → compute_all_metrics(...)
+→ optional results_json writeout with config / validation / quality / checkpoint summary
 ```
 
-То есть основной путь проекта уже определён не whitepaper-обещаниями, а конкретным training contract в `src/training/trainer.py` и data contract в `src/training/dataset.py`.
+Text-facing retrieval/ranking flow поверх того же core выглядит отдельно:
+
+```text
+raw texts
+→ texts_to_tensor(...)
+→ TextHDIMModel.forward_texts(...) or transfer_text_pairs(...)
+→ exported_invariant
+→ cosine similarity scoring
+→ TextPairScoreResult for inspection/reporting
+```
+
+То есть основной путь проекта уже определён не whitepaper-обещаниями, а конкретным training contract в `src/training/trainer.py`, text-entry scaffold в `src/models/text_hdim_model.py` и data contract в `src/training/dataset.py`.
 
 ### 8.5.3 Implementation matrix
 | Component | MVP status | Code anchor | Practical note |
@@ -411,21 +451,24 @@ create_demo_dataset() or create_paired_demo_dataset()
 | Memory augmentation | implemented approximation | `hypercoplexAI/src/core/titans_memory.py` | компактная differentiable memory, не external knowledge base |
 | R3-style router | implemented approximation | `hypercoplexAI/src/core/moe_router.py` | top-k routing с auxiliary loss, не full RL replay stack |
 | Batch-facing model API | implemented | `hypercoplexAI/src/models/hdim_model.py` | поддерживает same-domain и paired transfer path |
-| Pair-supervised dataset | implemented | `hypercoplexAI/src/training/dataset.py` | synthetic paired supervision уже задаёт MVP data contract |
+| Text-facing model API | implemented | `hypercoplexAI/src/models/text_hdim_model.py` | thin wrapper для text entry, transfer и retrieval/ranking |
+| Pair-supervised dataset | implemented | `hypercoplexAI/src/training/dataset.py` | synthetic paired supervision и deterministic text scaffold уже задают MVP data contract |
 | Training loop | implemented | `hypercoplexAI/src/training/trainer.py` | total loss уже согласован с MVP objective |
+| Training CLI run summary | implemented | `hypercoplexAI/src/training/train.py` | optional JSON summary для orchestration/reporting, не external evidence engine |
 | STS / DRS / AFR metrics | implemented | `hypercoplexAI/src/models/metrics.py` | это proxy-метрики, не scientific proof layer |
-| Regression tests | implemented | `hypercoplexAI/tests/test_hdim.py` | покрывают forward, pairs, validate, metrics |
+| Regression tests | implemented | `hypercoplexAI/tests/test_hdim.py` | покрывают forward, pairs, validate, metrics и text-wrapper scoring contract |
 | Q-Attention | research only | not present in runtime code | оставить как post-MVP extension |
 | TRIZ parser / avatars / Scholar ingestion | research only | not present in runtime code | внешний workflow, не ядро Python MVP |
 
 ### 8.5.4 MVP acceptance criteria
-Документ следует считать честно выполненным относительно текущей архитектуры, если одновременно верны пять условий:
+Документ следует считать честно выполненным относительно текущей архитектуры, если одновременно верны шесть условий:
 
 - paired dataset может быть создан без нарушения positive/negative cross-domain contract;
 - train/validation split может быть построен через `create_group_aware_split(...)` без пересечения pair groups между split'ами;
 - `HDIMTrainer.train_step()` работает как для обычного, так и для paired batch;
 - `validate()` возвращает агрегированные loss-метрики;
-- `compute_all_metrics()` возвращает `STS_exported`, `STS_training`, `DRS`, `AFR`, `pair_margin` на том же model API.
+- `compute_all_metrics()` возвращает `STS_exported`, `STS_training`, `DRS`, `AFR`, `pair_margin` на том же model API;
+- text-wrapper scoring path возвращает retrieve-safe structured result без мутации памяти во время comparison.
 
 Именно эти критерии делают HDIM implementable-first системой уже сейчас.
 

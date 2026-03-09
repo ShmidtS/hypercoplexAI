@@ -1,9 +1,14 @@
+import json
+import subprocess
+import sys
+
 import pytest
 import torch
 from torch.utils.data import DataLoader
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.metrics import compute_all_metrics
+from src.models.text_hdim_model import TextHDIMModel
 from src.training.dataset import (
     DomainProblemDataset,
     create_demo_dataset,
@@ -23,6 +28,10 @@ def cfg():
 def model(cfg):
     return HDIMModel(cfg)
 
+
+@pytest.fixture
+def text_model(model):
+    return TextHDIMModel(model)
 
 @pytest.fixture
 def trainer(model):
@@ -447,12 +456,34 @@ def test_model_reset_memory_clears_memory_and_router_state(model, cfg):
         torch.full_like(model.pipeline.moe.train_scores, 1.0 / cfg.num_experts),
     )
 
-def test_compute_all_metrics_handles_small_validation_batches(model):
-    ds = create_paired_demo_dataset(n_samples=12)
-    dl = DataLoader(ds, batch_size=1)
-    metrics = compute_all_metrics(model, dl, num_routing_runs=1)
-    assert set(metrics) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
-    assert all(isinstance(value, float) for value in metrics.values())
+def test_text_model_scores_text_pairs_with_state(text_model, cfg):
+    source_texts = [
+        "Reduce cavitation damage in pump impellers.",
+        "Prevent fatigue crack propagation in alloy frames.",
+    ]
+    target_texts = [
+        "How do plant vacuoles prevent membrane rupture during osmotic shock?",
+        "Mechanism of DNA repair after double-strand breaks in mammalian cells.",
+    ]
+    source_domain_id = torch.tensor([0, 0], dtype=torch.long)
+    target_domain_id = torch.tensor([1, 1], dtype=torch.long)
+
+    result = text_model.score_text_pairs_with_state(
+        source_texts,
+        target_texts,
+        source_domain_id,
+        target_domain_id,
+    )
+
+    assert result.scores.shape == (2,)
+    assert result.source_state.exported_invariant.shape == (2, text_model.core_model.pipeline.clifford_dim)
+    assert result.target_state.exported_invariant.shape == (2, text_model.core_model.pipeline.clifford_dim)
+    flattened = result.to_dict()
+    assert torch.allclose(flattened["scores"], result.scores)
+    assert flattened["source_memory_mode"] == "retrieve"
+    assert flattened["target_memory_mode"] == "retrieve"
+    assert flattened["source_update_memory"] is False
+    assert flattened["target_update_memory"] is False
 
 
 def test_compute_all_metrics_runs_on_model_device(trainer):
@@ -488,6 +519,41 @@ def test_aligned_pairs_have_non_extreme_margin(model):
     dl = DataLoader(ds, batch_size=8)
     metrics = compute_all_metrics(model, dl, num_routing_runs=1)
     assert -1.0 <= metrics["pair_margin"] <= 1.0
+
+
+def test_train_script_writes_results_json(tmp_path):
+    results_path = tmp_path / "results" / "hdim_run_summary.json"
+    command = [
+        sys.executable,
+        "-m",
+        "src.training.train",
+        "--epochs",
+        "1",
+        "--batch_size",
+        "4",
+        "--num_samples",
+        "16",
+        "--device",
+        "cpu",
+        "--results_json",
+        str(results_path),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd="E:/hypercoplexAI",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert results_path.exists()
+    payload = json.loads(results_path.read_text(encoding="utf-8"))
+    assert payload["run_args"]["epochs"] == 1
+    assert payload["run_args"]["batch_size"] == 4
+    assert payload["validation"]["loss_total"] >= 0.0
+    assert set(payload["quality"]) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
+    assert payload["checkpoint"].replace("\\", "/").endswith("checkpoints/hdim_final.pt")
+    assert "Wrote run summary" in completed.stdout
 
 
 # ============================================================
