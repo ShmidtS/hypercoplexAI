@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from pathlib import Path
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.hdim_model import HDIMAuxState, HDIMModel
+from src.models.hdim_model import HDIMAuxState, HDIMModel, HDIMTextConfig
 
 
 @dataclass(frozen=True)
@@ -22,10 +23,30 @@ class TextPairScoreResult:
 
     def to_dict(self) -> dict[str, torch.Tensor | bool | str]:
         result: dict[str, torch.Tensor | bool | str] = {"scores": self.scores}
-        for prefix, state in (("source", self.source_state), ("target", self.target_state)):
+        for prefix, state in (
+            ("source", self.source_state),
+            ("target", self.target_state),
+        ):
             for key, value in state.to_dict().items():
                 result[f"{prefix}_{key}"] = value
         return result
+
+
+def _load_vocab(vocab_path: Optional[str]) -> Optional[dict[str, int]]:
+    if not vocab_path:
+        return None
+
+    path = Path(vocab_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Vocabulary path does not exist: {vocab_path}")
+
+    vocab: dict[str, int] = {}
+    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        token = line.strip()
+        if not token or token in vocab:
+            continue
+        vocab[token] = index
+    return vocab
 
 
 class SimpleTextEncoder(nn.Module):
@@ -40,6 +61,9 @@ class SimpleTextEncoder(nn.Module):
         embedding_dim: int | None = None,
         hidden_dim: int | None = None,
         dropout: float = 0.1,
+        vocab: Optional[dict[str, int]] = None,
+        tokenizer_name: Optional[str] = None,
+        vocab_path: Optional[str] = None,
     ) -> None:
         super().__init__()
         embedding_dim = output_dim if embedding_dim is None else embedding_dim
@@ -48,7 +72,15 @@ class SimpleTextEncoder(nn.Module):
         self.max_length = max_length
         self.padding_idx = 0
         self.output_dim = output_dim
-        self.token_embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=self.padding_idx)
+        self.vocab = vocab
+        self.tokenizer_name = tokenizer_name
+        self.vocab_path = vocab_path
+        self.unk_idx = vocab_size - 1
+        self.token_embedding = nn.Embedding(
+            vocab_size,
+            embedding_dim,
+            padding_idx=self.padding_idx,
+        )
         self.position_embedding = nn.Embedding(max_length, embedding_dim)
         self.norm = nn.LayerNorm(embedding_dim)
         self.mlp = nn.Sequential(
@@ -58,21 +90,70 @@ class SimpleTextEncoder(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
 
-    def tokenize(self, texts: Sequence[str], *, device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    @classmethod
+    def from_text_config(
+        cls,
+        output_dim: int,
+        text_config: HDIMTextConfig,
+        *,
+        fallback_dropout: float,
+    ) -> "SimpleTextEncoder":
+        vocab = _load_vocab(text_config.vocab_path)
+        resolved_vocab_size = text_config.vocab_size
+        if vocab is not None:
+            max_vocab_token = max(vocab.values(), default=0)
+            resolved_vocab_size = max(resolved_vocab_size, max_vocab_token + 2)
+
+        return cls(
+            output_dim=output_dim,
+            vocab_size=resolved_vocab_size,
+            max_length=text_config.max_length,
+            embedding_dim=text_config.embedding_dim,
+            hidden_dim=text_config.hidden_dim,
+            dropout=fallback_dropout
+            if text_config.dropout is None
+            else text_config.dropout,
+            vocab=vocab,
+            tokenizer_name=text_config.tokenizer_name,
+            vocab_path=text_config.vocab_path,
+        )
+
+    def _encode_text(self, text: str) -> list[int]:
+        if self.vocab is not None:
+            tokens = list(text) if self.tokenizer_name == "char" else text.split()
+            return [self.vocab.get(token, self.unk_idx) for token in tokens[: self.max_length]]
+        return [min(ord(ch), self.vocab_size - 2) + 1 for ch in text[: self.max_length]]
+
+    def tokenize(
+        self,
+        texts: Sequence[str],
+        *,
+        device: torch.device | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if len(texts) == 0:
-            empty_tokens = torch.empty(0, self.max_length, dtype=torch.long, device=device)
-            empty_mask = torch.empty(0, self.max_length, dtype=torch.bool, device=device)
+            empty_tokens = torch.empty(
+                0,
+                self.max_length,
+                dtype=torch.long,
+                device=device,
+            )
+            empty_mask = torch.empty(
+                0,
+                self.max_length,
+                dtype=torch.bool,
+                device=device,
+            )
             return empty_tokens, empty_mask
 
         token_ids = torch.zeros(len(texts), self.max_length, dtype=torch.long)
         attention_mask = torch.zeros(len(texts), self.max_length, dtype=torch.bool)
         for row, text in enumerate(texts):
-            truncated = text[: self.max_length]
-            encoded = [min(ord(ch), self.vocab_size - 2) + 1 for ch in truncated]
+            encoded = self._encode_text(str(text))
             if encoded:
-                length = len(encoded)
-                token_ids[row, :length] = torch.tensor(encoded, dtype=torch.long)
+                length = min(len(encoded), self.max_length)
+                token_ids[row, :length] = torch.tensor(encoded[:length], dtype=torch.long)
                 attention_mask[row, :length] = True
+
         if device is not None:
             token_ids = token_ids.to(device)
             attention_mask = attention_mask.to(device)
@@ -87,7 +168,12 @@ class SimpleTextEncoder(nn.Module):
     ) -> torch.Tensor:
         token_ids, attention_mask = self.tokenize(texts, device=device)
         if token_ids.numel() == 0:
-            return torch.empty(0, self.output_dim, device=device, dtype=dtype or torch.float32)
+            return torch.empty(
+                0,
+                self.output_dim,
+                device=device,
+                dtype=dtype or torch.float32,
+            )
 
         positions = torch.arange(self.max_length, device=token_ids.device).unsqueeze(0)
         embeddings = self.token_embedding(token_ids) + self.position_embedding(positions)
@@ -103,35 +189,68 @@ class SimpleTextEncoder(nn.Module):
 
 
 class TextHDIMModel(nn.Module):
-    """Trainable text-entry wrapper around HDIMModel.
-
-    Raw texts are tokenized with a compact trainable encoder and projected into
-    the HDIM hidden space. This wrapper targets retrieval/ranking and transfer
-    experiments, not generative language modeling.
-    """
+    """Trainable text-entry wrapper around HDIMModel."""
 
     def __init__(
         self,
         core_model: HDIMModel,
         *,
-        max_length: int = 128,
+        max_length: int | None = None,
         text_embedding_dim: int | None = None,
         text_hidden_dim: int | None = None,
         text_dropout: float | None = None,
     ) -> None:
         super().__init__()
         self.core_model = core_model
-        self.text_encoder = SimpleTextEncoder(
+        text_config = core_model.config.text
+        if any(
+            value is not None
+            for value in (max_length, text_embedding_dim, text_hidden_dim, text_dropout)
+        ):
+            text_config = HDIMTextConfig(
+                vocab_size=text_config.vocab_size,
+                max_length=text_config.max_length if max_length is None else max_length,
+                embedding_dim=text_config.embedding_dim
+                if text_embedding_dim is None
+                else text_embedding_dim,
+                hidden_dim=text_config.hidden_dim
+                if text_hidden_dim is None
+                else text_hidden_dim,
+                dropout=text_config.dropout if text_dropout is None else text_dropout,
+                vocab_path=text_config.vocab_path,
+                tokenizer_name=text_config.tokenizer_name,
+            )
+
+        self.text_config = text_config
+        self.text_encoder = SimpleTextEncoder.from_text_config(
             output_dim=core_model.config.hidden_dim,
-            max_length=max_length,
-            embedding_dim=text_embedding_dim,
-            hidden_dim=text_hidden_dim,
-            dropout=core_model.config.dropout if text_dropout is None else text_dropout,
+            text_config=text_config,
+            fallback_dropout=core_model.config.dropout,
         )
 
     @property
     def config(self):
         return self.core_model.config
+
+    @property
+    def pipeline(self):
+        return self.core_model.pipeline
+
+    @property
+    def training_inv_head(self):
+        return self.core_model.training_inv_head
+
+    def forward(self, *args, **kwargs):
+        return self.core_model(*args, **kwargs)
+
+    def transfer(self, *args, **kwargs):
+        return self.core_model.transfer(*args, **kwargs)
+
+    def transfer_pairs(self, *args, **kwargs):
+        return self.core_model.transfer_pairs(*args, **kwargs)
+
+    def reset_memory(self) -> None:
+        self.core_model.reset_memory()
 
     def encode_texts(
         self,
@@ -156,7 +275,8 @@ class TextHDIMModel(nn.Module):
         memory_mode: str = "update",
     ):
         encodings = self.encode_texts(texts, device=domain_id.device)
-        return self.core_model(
+        return HDIMModel.forward(
+            self.core_model,
             encodings,
             domain_id,
             return_state=return_state,
@@ -192,9 +312,10 @@ class TextHDIMModel(nn.Module):
         *,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
         encodings = self.encode_texts(source_texts, device=source_domain_id.device)
-        return self.core_model.transfer_pairs(
+        return HDIMModel.transfer_pairs(
+            self.core_model,
             encodings,
             source_domain_id,
             target_domain_id,

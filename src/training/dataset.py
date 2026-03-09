@@ -113,16 +113,24 @@ class DomainProblemDataset(Dataset):
                 relation_type = self.pair_relation_types[idx]
                 if relation_type not in {"positive", "negative"}:
                     raise ValueError("pair_relation_types must be either 'positive' or 'negative'")
-                if relation_type != self.pair_relation_types[pair_idx]:
-                    raise ValueError("pair_relation_types must match across paired samples")
-                if self.pair_weights[idx] <= 0 or self.pair_weights[pair_idx] <= 0:
+                if self.pair_weights[idx] <= 0:
                     raise ValueError("pair_weights must be positive for all paired samples")
+                paired_relation_type = self.pair_relation_types[pair_idx]
+                if paired_relation_type not in {"positive", "negative"}:
+                    raise ValueError("pair_relation_types must be either 'positive' or 'negative'")
+                if self.pair_weights[pair_idx] <= 0:
+                    raise ValueError("pair_weights must be positive for all paired samples")
+                is_reciprocal_pair = self.pair_indices[pair_idx] == idx
                 if relation_type == "positive":
-                    if self.pair_group_ids[pair_idx] != self.pair_group_ids[idx]:
+                    if is_reciprocal_pair and paired_relation_type != relation_type:
+                        raise ValueError("pair_relation_types must match across paired samples")
+                    if is_reciprocal_pair and self.pair_group_ids[pair_idx] != self.pair_group_ids[idx]:
                         raise ValueError("positive pair_indices must stay within the same cross-domain pair group")
                 else:
-                    if self.pair_group_ids[pair_idx] == self.pair_group_ids[idx]:
+                    if is_reciprocal_pair and self.pair_group_ids[pair_idx] == self.pair_group_ids[idx]:
                         raise ValueError("negative pairs must not reuse the same pair group")
+                    if is_reciprocal_pair and paired_relation_type != relation_type:
+                        raise ValueError("pair_relation_types must match across paired samples")
 
     def __len__(self) -> int:
         return len(self.samples)

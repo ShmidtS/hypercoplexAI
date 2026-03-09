@@ -7,7 +7,7 @@ batch training scenarios.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
@@ -64,6 +64,19 @@ class HDIMAuxState:
         }
 
 
+@dataclass(frozen=True)
+class HDIMTextConfig:
+    """Configuration for the minimal HDIM text encoder path."""
+
+    vocab_size: int = 257
+    max_length: int = 128
+    embedding_dim: Optional[int] = None
+    hidden_dim: Optional[int] = None
+    dropout: Optional[float] = None
+    vocab_path: Optional[str] = None
+    tokenizer_name: Optional[str] = None
+
+
 @dataclass
 class HDIMConfig:
     """Configuration dataclass for HDIMModel.
@@ -92,6 +105,7 @@ class HDIMConfig:
     top_k: int = 2
     memory_key_dim: int = 32
     domain_names: Optional[List[str]] = None
+    text: HDIMTextConfig = field(default_factory=HDIMTextConfig)
     def get_domain_names(self) -> List[str]:
         """Return the resolved list of domain names."""
         if self.domain_names is not None:

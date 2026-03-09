@@ -35,6 +35,7 @@ def model(cfg):
 def text_model(model):
     return TextHDIMModel(model)
 
+
 @pytest.fixture
 def trainer(model):
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -73,6 +74,7 @@ def test_model_forward_return_state(model, cfg):
     assert torch.allclose(inv, expected_inv, atol=1e-5)
     assert state.router_loss.ndim == 0
     assert state.memory_loss.ndim == 0
+
 
 def test_model_transfer(model, cfg):
     bsz = 2
@@ -351,6 +353,7 @@ def test_transfer_pairs_rejects_invalid_target_domain(model, cfg):
             memory_mode="retrieve",
         )
 
+
 def test_forward_and_transfer_pairs_expose_same_lifecycle_contract(model, cfg):
     x = torch.randn(4, cfg.hidden_dim)
     source_domain_id = torch.tensor([0, 0, 1, 1], dtype=torch.long)
@@ -458,6 +461,7 @@ def test_model_reset_memory_clears_memory_and_router_state(model, cfg):
         torch.full_like(model.pipeline.moe.train_scores, 1.0 / cfg.num_experts),
     )
 
+
 def test_text_model_scores_text_pairs_with_state(text_model, cfg):
     source_texts = [
         "Reduce cavitation damage in pump impellers.",
@@ -493,6 +497,118 @@ def test_text_model_encode_texts_is_trainable(text_model, cfg):
     encodings = text_model.encode_texts(texts)
     assert encodings.shape == (2, cfg.hidden_dim)
     assert encodings.requires_grad
+
+
+def test_trainer_uses_forward_texts_for_raw_text_batches(text_model):
+    trainer = HDIMTrainer(
+        text_model,
+        torch.optim.Adam(text_model.parameters(), lr=1e-3),
+        device="cpu",
+    )
+    calls = {"forward_texts": 0, "forward": 0}
+    original_forward_texts = text_model.forward_texts
+    original_forward = text_model.core_model.forward
+
+    def wrapped_forward_texts(*args, **kwargs):
+        calls["forward_texts"] += 1
+        return original_forward_texts(*args, **kwargs)
+
+    def wrapped_forward(*args, **kwargs):
+        calls["forward"] += 1
+        return original_forward(*args, **kwargs)
+
+    text_model.forward_texts = wrapped_forward_texts
+    text_model.core_model.forward = wrapped_forward
+    batch = {
+        "text": ["alpha transfer", "beta transfer"],
+        "domain_id": torch.tensor([0, 1], dtype=torch.long),
+    }
+
+    losses = trainer.evaluate_batch(batch)
+
+    assert losses["loss_total"].item() >= 0.0
+    assert calls["forward_texts"] == 1
+    assert calls["forward"] == 0
+
+
+def test_trainer_uses_text_pair_path_for_raw_pair_batches(text_model):
+    trainer = HDIMTrainer(
+        text_model,
+        torch.optim.Adam(text_model.parameters(), lr=1e-3),
+        device="cpu",
+    )
+    calls = {
+        "transfer_text_pairs": 0,
+        "forward_texts": 0,
+        "transfer_pairs": 0,
+        "forward": 0,
+    }
+    original_transfer_text_pairs = text_model.transfer_text_pairs
+    original_forward_texts = text_model.forward_texts
+    original_transfer_pairs = text_model.core_model.transfer_pairs
+    original_forward = text_model.core_model.forward
+
+    def wrapped_transfer_text_pairs(*args, **kwargs):
+        calls["transfer_text_pairs"] += 1
+        return original_transfer_text_pairs(*args, **kwargs)
+
+    def wrapped_forward_texts(*args, **kwargs):
+        calls["forward_texts"] += 1
+        return original_forward_texts(*args, **kwargs)
+
+    def wrapped_transfer_pairs(*args, **kwargs):
+        calls["transfer_pairs"] += 1
+        return original_transfer_pairs(*args, **kwargs)
+
+    def wrapped_forward(*args, **kwargs):
+        calls["forward"] += 1
+        return original_forward(*args, **kwargs)
+
+    text_model.transfer_text_pairs = wrapped_transfer_text_pairs
+    text_model.forward_texts = wrapped_forward_texts
+    text_model.core_model.transfer_pairs = wrapped_transfer_pairs
+    text_model.core_model.forward = wrapped_forward
+    batch = {
+        "text": ["source one", "source two"],
+        "pair_text": ["target one", "target two"],
+        "domain_id": torch.tensor([0, 1], dtype=torch.long),
+        "pair_domain_id": torch.tensor([1, 2], dtype=torch.long),
+        "pair_relation_label": torch.tensor([1.0, 0.0]),
+        "pair_weight": torch.tensor([1.0, 2.0]),
+    }
+
+    losses = trainer.evaluate_batch(batch)
+
+    assert losses["loss_total"].item() >= 0.0
+    assert calls["transfer_text_pairs"] == 1
+    assert calls["forward_texts"] == 1
+    assert calls["transfer_pairs"] == 0
+    assert calls["forward"] == 0
+
+
+def test_experiment_config_round_trips_text_mode_manifest_fields(tmp_path):
+    results_path = tmp_path / "results" / "text_mode_summary.json"
+    ledger_path = tmp_path / "results" / "text_mode_ledger.jsonl"
+    config_path = tmp_path / "text_mode_experiment.json"
+    config = ExperimentConfig(
+        description="text-mode manifest contract",
+        text_mode=True,
+        use_pairs=True,
+        negative_ratio=0.25,
+        results_json=str(results_path),
+        ledger_path=str(ledger_path),
+        metadata={"run_id": "text-mode-smoke"},
+    )
+    config_path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
+
+    loaded = ExperimentConfig.from_json(config_path)
+
+    assert loaded.text_mode is True
+    assert loaded.use_pairs is True
+    assert loaded.negative_ratio == pytest.approx(0.25)
+    assert loaded.results_json == str(results_path)
+    assert loaded.ledger_path == str(ledger_path)
+    assert loaded.metadata["run_id"] == "text-mode-smoke"
 
 
 def test_compute_all_metrics_runs_on_model_device(trainer):
@@ -544,6 +660,7 @@ def test_train_script_writes_results_json(tmp_path):
         "16",
         "--device",
         "cpu",
+        "--text_mode",
         "--results_json",
         str(results_path),
     ]
@@ -559,6 +676,7 @@ def test_train_script_writes_results_json(tmp_path):
     payload = json.loads(results_path.read_text(encoding="utf-8"))
     assert payload["run_args"]["epochs"] == 1
     assert payload["run_args"]["batch_size"] == 4
+    assert payload["run_args"]["text_mode"] is True
     assert payload["validation"]["loss_total"] >= 0.0
     assert set(payload["quality"]) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
     assert payload["checkpoint"].replace("\\", "/").endswith("checkpoints/hdim_final.pt")
@@ -577,6 +695,7 @@ def test_train_script_supports_manifest_and_ledger(tmp_path):
         num_samples=16,
         use_pairs=True,
         negative_ratio=0.25,
+        text_mode=True,
         results_json=str(results_path),
         ledger_path=str(ledger_path),
     )
@@ -594,6 +713,7 @@ def test_train_script_supports_manifest_and_ledger(tmp_path):
     ledger_rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert payload["run_args"]["use_pairs"] is True
     assert payload["run_args"]["negative_ratio"] == pytest.approx(0.25)
+    assert payload["run_args"]["text_mode"] is True
     assert payload["run_args"]["description"] == "manifest smoke"
     assert ledger_rows
     assert ledger_rows[-1]["status"] == "keep"
@@ -612,12 +732,15 @@ def test_experiment_runner_executes_manifest(tmp_path):
             num_samples=16,
             use_pairs=True,
             negative_ratio=0.25,
+            text_mode=True,
             results_json=str(results_path),
             ledger_path=str(ledger_path),
         )
     )
     assert payload["status"] == "keep"
+    assert payload["run_args"]["text_mode"] is True
     assert payload["runner"]["run_id"].startswith("hdim-")
+    assert "--text_mode" in payload["runner"]["command"]
     assert results_path.exists()
     assert ledger_path.exists()
 
@@ -625,6 +748,7 @@ def test_experiment_runner_executes_manifest(tmp_path):
 # ============================================================
 # Contract tests — algebraic correctness
 # ============================================================
+
 
 def test_identity_rotor_preserves_input():
     """Identity rotor (R[0]=1, rest=0) должен давать sandwich(R, x) ≈ x."""

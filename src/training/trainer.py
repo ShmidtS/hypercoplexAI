@@ -101,24 +101,28 @@ class HDIMTrainer:
     def _compute_pair_iso_targets(
         self, pair_encoding: torch.Tensor, pair_domain_id: torch.Tensor
     ) -> torch.Tensor:
-        _, aux_state = self.model(
+        _, _, _, aux_state = self._forward_batch(
             pair_encoding,
             pair_domain_id,
-            return_state=True,
-            update_memory=False,
-            memory_mode="retrieve",
+            TrainingRegime(
+                mode="reconstruction",
+                update_memory=False,
+                memory_mode="retrieve",
+            ),
         )
         return self._training_invariant(aux_state).detach()
 
     def _compute_pair_iso_targets_from_text(
         self, pair_texts: Sequence[str], pair_domain_id: torch.Tensor
     ) -> torch.Tensor:
-        _, aux_state = self.model.forward_texts(
+        _, _, _, aux_state = self._forward_text_batch(
             pair_texts,
             pair_domain_id,
-            return_state=True,
-            update_memory=False,
-            memory_mode="retrieve",
+            TrainingRegime(
+                mode="reconstruction",
+                update_memory=False,
+                memory_mode="retrieve",
+            ),
         )
         return self._training_invariant(aux_state).detach()
 

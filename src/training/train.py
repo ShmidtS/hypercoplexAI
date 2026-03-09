@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.metrics import compute_all_metrics
+from src.models.text_hdim_model import TextHDIMModel
 from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
@@ -60,6 +61,7 @@ def _apply_experiment_defaults(args: argparse.Namespace, experiment: ExperimentC
     args.negative_ratio = experiment.negative_ratio
     args.train_fraction = experiment.train_fraction
     args.seed = experiment.seed
+    args.text_mode = experiment.text_mode
     if experiment.results_json is not None:
         args.results_json = Path(experiment.results_json)
     if experiment.ledger_path is not None:
@@ -122,6 +124,7 @@ def _build_run_summary(
             "negative_ratio": args.negative_ratio,
             "train_fraction": args.train_fraction,
             "seed": args.seed,
+            "text_mode": args.text_mode,
             "description": args.description,
         },
         "validation": val_metrics,
@@ -144,6 +147,7 @@ def main():
     parser.add_argument("--negative_ratio", type=float, default=0.0)
     parser.add_argument("--train_fraction", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--text_mode", action="store_true", help="Train through TextHDIMModel wrapper")
     parser.add_argument("--description", default="baseline")
     parser.add_argument("--model_override", action="append", default=[], help="Model override in key=value format")
     parser.add_argument("--trainer_override", action="append", default=[], help="Trainer override in key=value format")
@@ -165,7 +169,8 @@ def main():
     args = _apply_experiment_defaults(args, experiment)
 
     cfg = _build_config(args)
-    model = HDIMModel(cfg)
+    core_model = HDIMModel(cfg)
+    model = TextHDIMModel(core_model) if args.text_mode else core_model
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     trainer = _build_trainer(model, optimizer, args)
 
