@@ -59,12 +59,16 @@ class DomainProblemDataset(Dataset):
         embed_dim: int = 64,
         pair_indices: Optional[List[int]] = None,
         pair_group_ids: Optional[List[int]] = None,
+        pair_relation_types: Optional[List[str]] = None,
+        pair_weights: Optional[List[float]] = None,
     ) -> None:
         assert embed_dim % 4 == 0, f"embed_dim must be divisible by 4, got {embed_dim}"
         self.samples = samples
         self.embed_dim = embed_dim
         self.pair_indices = pair_indices
         self.pair_group_ids = pair_group_ids
+        self.pair_relation_types = pair_relation_types
+        self.pair_weights = pair_weights
         self._encodings: List[torch.Tensor] = [
             _text_to_embedding(text, embed_dim) for text, _ in samples
         ]
@@ -77,6 +81,14 @@ class DomainProblemDataset(Dataset):
                 raise ValueError("pair_group_ids must be provided with pair_indices")
             if len(self.pair_group_ids) != len(self.samples):
                 raise ValueError("pair_group_ids must have the same length as samples")
+            if self.pair_relation_types is None:
+                raise ValueError("pair_relation_types must be provided with pair_indices")
+            if len(self.pair_relation_types) != len(self.samples):
+                raise ValueError("pair_relation_types must have the same length as samples")
+            if self.pair_weights is None:
+                raise ValueError("pair_weights must be provided with pair_indices")
+            if len(self.pair_weights) != len(self.samples):
+                raise ValueError("pair_weights must have the same length as samples")
             for idx, pair_idx in enumerate(self.pair_indices):
                 if pair_idx < 0 or pair_idx >= len(self.samples):
                     raise IndexError("pair_indices contains an out-of-range sample index")
@@ -86,6 +98,10 @@ class DomainProblemDataset(Dataset):
                     raise ValueError("pair_indices must point to a sample from a different domain")
                 if self.pair_group_ids[pair_idx] != self.pair_group_ids[idx]:
                     raise ValueError("pair_indices must stay within the same cross-domain pair group")
+                if self.pair_relation_types[idx] != self.pair_relation_types[pair_idx]:
+                    raise ValueError("pair_relation_types must match across paired samples")
+                if self.pair_weights[idx] <= 0 or self.pair_weights[pair_idx] <= 0:
+                    raise ValueError("pair_weights must be positive for all paired samples")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -102,10 +118,8 @@ class DomainProblemDataset(Dataset):
             item["pair_domain_id"] = torch.tensor(self._labels[pair_idx], dtype=torch.long)
             item["pair_index"] = torch.tensor(pair_idx, dtype=torch.long)
             item["pair_group_id"] = torch.tensor(self.pair_group_ids[idx], dtype=torch.long)
-            item["pair_same_template"] = torch.tensor(
-                self.pair_group_ids[pair_idx] == self.pair_group_ids[idx],
-                dtype=torch.bool,
-            )
+            item["pair_relation_type"] = self.pair_relation_types[idx]
+            item["pair_weight"] = torch.tensor(self.pair_weights[idx], dtype=torch.float32)
 
         return item
 
@@ -212,6 +226,8 @@ def create_paired_demo_dataset(
         pair_indices.append(random.choice(candidates))
 
     pair_group_ids = list(variant_ids)
+    pair_relation_types = ["cross_domain_analogy" for _ in samples]
+    pair_weights = [1.0 for _ in samples]
 
     order = list(range(len(samples)))
     random.shuffle(order)
@@ -220,9 +236,14 @@ def create_paired_demo_dataset(
     shuffled_pairs = [inverse_order[pair_indices[old_idx]] for old_idx in order]
     shuffled_pair_groups = [pair_group_ids[old_idx] for old_idx in order]
 
+    shuffled_pair_relations = [pair_relation_types[old_idx] for old_idx in order]
+    shuffled_pair_weights = [pair_weights[old_idx] for old_idx in order]
+
     return DomainProblemDataset(
         shuffled_samples,
         embed_dim=embed_dim,
         pair_indices=shuffled_pairs,
         pair_group_ids=shuffled_pair_groups,
+        pair_relation_types=shuffled_pair_relations,
+        pair_weights=shuffled_pair_weights,
     )

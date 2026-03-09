@@ -267,21 +267,71 @@ Cross-domain paired mode:
 
 ---
 
+## 6. Canonical invariant and memory lifecycle
+### 6.1 Frozen invariant naming
+Текущий код фиксирует четыре разные стадии invariant lifecycle:
+
+- `raw_invariant` — результат `InvariantExtractor` до памяти;
+- `memory_augmented_invariant` — invariant после `TitansMemoryModule`;
+- `exported_invariant` — canonical transfer object после router;
+- `training_invariant` — projection `exported_invariant` в `hidden_dim` для `L_iso` и training-facing diagnostics.
+
+Это означает, что прежний термин `processed invariant` больше не должен использоваться как универсальное имя для всех стадий сразу. В инженерном контракте MVP:
+
+- основной объект переноса = `exported_invariant`;
+- основной объект оптимизации = `training_invariant`.
+
+### 6.2 Memory protocol
+Memory lifecycle в MVP должен трактоваться как явный runtime contract с режимами:
+
+- `memory_mode="update"` — train-path, retrieval + update памяти;
+- `memory_mode="retrieve"` — eval/validation path без мутации памяти;
+- `memory_mode="none"` — stateless ablation path без memory augmentation.
+
+Флаг `update_memory` имеет смысл только вместе с `memory_mode="update"`; в остальных режимах мутация памяти отключается принудительно.
+
+Минимальная инженерная гарантия текущего кода: repeated eval в `retrieve` режиме не должен менять memory state и router replay state.
+
+### 6.3 Router observability contract
+Публичный runtime state теперь должен восприниматься как contract, а не debug payload. Минимальный набор полей router observability:
+
+- `routing_weights`
+- `topk_idx`
+- `topk_gate_weights`
+- `train_scores_snapshot`
+- `expert_usage`
+- `routing_entropy`
+- `router_loss`
+
+Именно эти поля используются в trainer/tests и должны сохранять согласованную семантику между `forward`, `transfer` и `transfer_pairs`.
+
+---
+
 ## 7. Evaluation contract
-## 7.1 STS — Structural Transfer Score
-В текущем проекте STS означает косинусное сходство между source и paired invariant representations.
+## 7.1 STS_exported — Structural Transfer Score in transfer space
+В текущем проекте `STS_exported` означает косинусное сходство между aligned source/target `exported_invariant`.
 
-Практически это **proxy for structure preservation**, а не финальное доказательство физической эквивалентности.
+Практически это **proxy for structure preservation in canonical transfer space**, а не финальное доказательство физической эквивалентности.
 
-## 7.2 DRS — Domain Routing Stability
+## 7.2 STS_training — Structural Transfer Score in optimization space
+`STS_training` измеряет косинусное сходство между aligned source/target `training_invariant`.
+
+Эта метрика нужна, чтобы evaluation surface не смешивал runtime transfer object и optimization projection.
+
+## 7.3 DRS — Domain Routing Stability
 DRS измеряет стабильность router weights при повторных вызовах.
 
 Это инженерная метрика устойчивости маршрутизации, а не формальная оценка корректности научного вывода.
 
-## 7.3 AFR — Analogy Feasibility Rate
-AFR в MVP — это threshold-based feasibility proxy, завязанный на STS/paired transfer signals.
+## 7.4 AFR — Analogy Feasibility Rate
+AFR в MVP теперь трактуется как **margin-aware feasibility proxy**: aligned pair считается успешной, если одновременно выполняются similarity threshold и pair-margin threshold.
 
-Следовательно, AFR пока следует трактовать как **internal consistency metric**, а не как верификацию аналогии законами физики.
+Следовательно, AFR остаётся **internal consistency metric**, но уже учитывает отличие aligned pair от mismatched negative pair.
+
+## 7.5 Pair margin
+`pair_margin` — это средний зазор между similarity aligned pairs и similarity mismatched pairs в пространстве `exported_invariant`.
+
+Эта метрика нужна как минимальный honesty check, что paired evaluation различает корректное и некорректное сопоставление.
 
 ---
 

@@ -188,6 +188,31 @@ class HDIMModel(nn.Module):
             update_memory=runtime.update_memory,
         )
 
+    def _build_aux_state_from_transfer_state(
+        self,
+        transfer_state: Dict[str, Union[torch.Tensor, bool, str, Dict[str, torch.Tensor]]],
+        *,
+        runtime: HDIMRuntimeConfig,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> HDIMAuxState:
+        router_state = transfer_state["router_state"]
+        return self._build_aux_state(
+            raw_invariant=transfer_state["raw_invariant"].to(device=device, dtype=dtype),
+            memory_augmented_invariant=transfer_state["memory_augmented_invariant"].to(device=device, dtype=dtype),
+            exported_invariant=transfer_state["exported_invariant"].to(device=device, dtype=dtype),
+            routing_weights=transfer_state["routing_weights"].to(device=device, dtype=dtype),
+            topk_idx=router_state["topk_idx"].to(device=device),
+            topk_gate_weights=router_state["topk_gate_weights"].to(device=device, dtype=dtype),
+            train_scores_snapshot=router_state["train_scores_snapshot"].to(device=device, dtype=dtype),
+            expert_usage=router_state["expert_usage"].to(device=device, dtype=dtype),
+            routing_entropy=router_state["routing_entropy"].to(device=device, dtype=dtype),
+            memory_loss=transfer_state["memory_loss"].to(device=device, dtype=dtype),
+            router_loss=router_state["router_loss"].to(device=device, dtype=dtype),
+            memory_updated=bool(transfer_state["memory_updated"]),
+            runtime=runtime,
+        )
+
     def _allocate_state_tensors(
         self,
         *,
@@ -348,7 +373,7 @@ class HDIMModel(nn.Module):
         return_state: bool = False,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]]:
+    ) -> torch.Tensor | Tuple[torch.Tensor, HDIMAuxState]:
         """Transfer a problem encoding from source to target domain."""
         runtime = self._resolve_runtime_config(
             update_memory=update_memory,
@@ -364,7 +389,13 @@ class HDIMModel(nn.Module):
             memory_mode=runtime.memory_mode,
         )
         if return_state:
-            return output, transfer_state
+            aux_state = self._build_aux_state_from_transfer_state(
+                transfer_state,
+                runtime=runtime,
+                dtype=problem_encoding.dtype,
+                device=problem_encoding.device,
+            )
+            return output, aux_state
         return output
 
     def reset_memory(self) -> None:

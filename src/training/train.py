@@ -46,9 +46,11 @@ def main():
     quality_metrics = compute_all_metrics(model, val_loader)
     print(
         'Quality metrics | '
-        f'STS={quality_metrics["STS"]:.4f} | '
+        f'STS_exported={quality_metrics["STS_exported"]:.4f} | '
+        f'STS_training={quality_metrics["STS_training"]:.4f} | '
         f'DRS={quality_metrics["DRS"]:.4f} | '
-        f'AFR={quality_metrics["AFR"]:.4f}'
+        f'AFR={quality_metrics["AFR"]:.4f} | '
+        f'pair_margin={quality_metrics["pair_margin"]:.4f}'
     )
 
     checkpoint_dir = Path(__file__).resolve().parents[2] / 'checkpoints'

@@ -1,12 +1,14 @@
 """
 HDIM Quality Metrics:
-- STS (Structural Transfer Score) — косинусное сходство инвариантов
+- STS_exported — косинусное сходство canonical transfer invariants
+- STS_training — косинусное сходство training-facing invariants
 - DRS (Domain Routing Stability) — стабильность роутера при повторных вызовах
-- AFR (Analogy Feasibility Rate) — процент корректных аналогий
+- AFR (Analogy Feasibility Rate) — доля aligned pairs, проходящих margin-aware проверку
 """
+from typing import Dict, List, Tuple
+
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple
 
 
 def _model_device(model) -> torch.device:
@@ -18,34 +20,50 @@ def structural_transfer_score(
     inv_source: torch.Tensor,
     inv_target: torch.Tensor,
 ) -> torch.Tensor:
-    """STS: косинусное сходство между инвариантами двух доменов.
-    Высокий STS = хорошее сохранение структуры при переносе.
-
-    Args:
-        inv_source: (B, D) инвариант исходного домена
-        inv_target: (B, D) инвариант целевого домена
-    Returns:
-        scalar: среднее косинусное сходство
-    """
+    """Косинусное сходство между двумя представлениями."""
     return F.cosine_similarity(inv_source, inv_target, dim=-1).mean()
 
 
 def domain_routing_stability(
     routing_weights_list: List[torch.Tensor],
 ) -> torch.Tensor:
-    """DRS: стабильность роутера — стандартное отклонение весов по нескольким прогонам.
-    Низкий DRS = стабильная маршрутизация.
-
-    Args:
-        routing_weights_list: список тензоров (B, E) из нескольких прогонов
-    Returns:
-        scalar: среднее std по экспертам
-    """
-    stacked = torch.stack(routing_weights_list, dim=0)  # (T, B, E)
+    """DRS: стабильность роутера — стандартное отклонение весов по нескольким прогонам."""
+    stacked = torch.stack(routing_weights_list, dim=0)
     return stacked.std(dim=0).mean()
 
 
-def _paired_batch_metrics(model, batch) -> Tuple[List[float], torch.Tensor]:
+def aligned_pair_margin(
+    aligned_scores: torch.Tensor,
+    mismatched_scores: torch.Tensor,
+) -> torch.Tensor:
+    """Средний зазор между aligned и mismatched similarity."""
+    return (aligned_scores - mismatched_scores).mean()
+
+
+def _compute_negative_pair_indices(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    pair_group_id = batch["pair_group_id"]
+    pair_domain_id = batch["pair_domain_id"]
+    source_domain_id = batch["domain_id"]
+    batch_size = pair_group_id.shape[0]
+    if batch_size < 2:
+        return torch.arange(batch_size, device=pair_group_id.device)
+
+    batch_indices = torch.arange(batch_size, device=pair_group_id.device)
+    negative_indices = torch.empty(batch_size, device=pair_group_id.device, dtype=torch.long)
+
+    for idx in range(batch_size):
+        valid_candidates = batch_indices[
+            (pair_group_id != pair_group_id[idx])
+            & (pair_domain_id != source_domain_id[idx])
+        ]
+        if valid_candidates.numel() == 0:
+            raise ValueError("Could not construct mismatched negative pairs for batch")
+        negative_indices[idx] = valid_candidates[0]
+
+    return negative_indices
+
+
+def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
     device = _model_device(model)
     enc: torch.Tensor = batch["encoding"].to(device)
     domain_ids: torch.Tensor = batch["domain_id"].to(device)
@@ -60,11 +78,22 @@ def _paired_batch_metrics(model, batch) -> Tuple[List[float], torch.Tensor]:
             update_memory=False,
             memory_mode="retrieve",
         )
-        sts_values = structural_transfer_score(
+        sts_exported = F.cosine_similarity(
             state.exported_invariant,
             state.memory_augmented_invariant,
-        ).repeat(len(enc))
-        return sts_values.tolist(), routing.cpu()
+            dim=-1,
+        )
+        sts_training = F.cosine_similarity(
+            state.training_invariant,
+            model.training_inv_head(state.memory_augmented_invariant),
+            dim=-1,
+        )
+        return {
+            "sts_exported": sts_exported,
+            "sts_training": sts_training,
+            "pair_margin": torch.zeros_like(sts_exported),
+            "routing": routing,
+        }
 
     pair_enc = pair_enc.to(device)
     pair_domain_ids = pair_domain_ids.to(device)
@@ -82,89 +111,104 @@ def _paired_batch_metrics(model, batch) -> Tuple[List[float], torch.Tensor]:
         update_memory=False,
         memory_mode="retrieve",
     )
-    sts_values = F.cosine_similarity(
+    negative_pair_indices = _compute_negative_pair_indices(batch)
+    mismatched_pair_enc = pair_enc[negative_pair_indices]
+    mismatched_pair_domain_ids = pair_domain_ids[negative_pair_indices]
+    _, _, _, mismatched_state = model(
+        mismatched_pair_enc,
+        domain_id=mismatched_pair_domain_ids,
+        return_state=True,
+        update_memory=False,
+        memory_mode="retrieve",
+    )
+
+    sts_exported = F.cosine_similarity(
         src_state.exported_invariant,
         tgt_state.exported_invariant,
         dim=-1,
     )
-    return sts_values.tolist(), routing.cpu()
+    sts_training = F.cosine_similarity(
+        src_state.training_invariant,
+        tgt_state.training_invariant,
+        dim=-1,
+    )
+    mismatched_scores = F.cosine_similarity(
+        src_state.exported_invariant,
+        mismatched_state.exported_invariant,
+        dim=-1,
+    )
+    return {
+        "sts_exported": sts_exported,
+        "sts_training": sts_training,
+        "pair_margin": sts_exported - mismatched_scores,
+        "routing": routing,
+    }
 
 
 def analogy_feasibility_rate(
-    model,
-    test_pairs: List[Tuple[torch.Tensor, int, int]],
-    threshold: float = 0.5,
+    aligned_scores: torch.Tensor,
+    pair_margins: torch.Tensor,
+    *,
+    similarity_threshold: float = 0.5,
+    margin_threshold: float = 0.0,
 ) -> float:
-    """AFR: процент пар где перенос даёт STS > threshold."""
-    if not test_pairs:
+    """AFR: доля aligned pairs, где similarity и pair margin проходят пороги."""
+    if aligned_scores.numel() == 0:
         return 0.0
-
-    model.eval()
-    device = _model_device(model)
-    correct = 0
-    with torch.no_grad():
-        for enc, src, tgt in test_pairs:
-            enc = enc.to(device)
-            if enc.dim() == 1:
-                enc = enc.unsqueeze(0)
-
-            src_domain_tensor = torch.tensor([src], dtype=torch.long, device=device)
-            tgt_domain_tensor = torch.tensor([tgt], dtype=torch.long, device=device)
-            _, _, inv_src = model(
-                enc,
-                domain_id=src_domain_tensor,
-                update_memory=False,
-                memory_mode="retrieve",
-            )
-            transferred = model.transfer(
-                enc,
-                source_domain=src,
-                target_domain=tgt,
-                update_memory=False,
-                memory_mode="retrieve",
-            )
-            _, _, inv_tgt = model(
-                transferred,
-                domain_id=tgt_domain_tensor,
-                update_memory=False,
-                memory_mode="retrieve",
-            )
-            sts = structural_transfer_score(inv_src, inv_tgt)
-            if sts.item() > threshold:
-                correct += 1
-
-    return correct / len(test_pairs)
+    feasible = (aligned_scores > similarity_threshold) & (pair_margins > margin_threshold)
+    return feasible.float().mean().item()
 
 
 def compute_all_metrics(
     model,
     dataloader,
     num_routing_runs: int = 3,
+    *,
+    afr_similarity_threshold: float = 0.3,
+    afr_margin_threshold: float = 0.0,
 ) -> dict:
-    """Compute STS, DRS, AFR metrics on a full dataloader."""
+    """Compute STS_exported, STS_training, DRS, AFR, and pair margin metrics."""
     model.eval()
-    sts_scores: List[float] = []
+    sts_exported_scores: List[torch.Tensor] = []
+    sts_training_scores: List[torch.Tensor] = []
+    pair_margin_scores: List[torch.Tensor] = []
     routing_runs: List[List[torch.Tensor]] = [[] for _ in range(num_routing_runs)]
 
     with torch.no_grad():
         for batch in dataloader:
             for run_idx in range(num_routing_runs):
-                _, routing = _paired_batch_metrics(model, batch)
-                routing_runs[run_idx].append(routing)
+                metrics = _paired_batch_metrics(model, batch)
+                routing_runs[run_idx].append(metrics["routing"].cpu())
 
-            batch_sts_scores, _ = _paired_batch_metrics(model, batch)
-            sts_scores.extend(batch_sts_scores)
+            batch_metrics = _paired_batch_metrics(model, batch)
+            sts_exported_scores.append(batch_metrics["sts_exported"].cpu())
+            sts_training_scores.append(batch_metrics["sts_training"].cpu())
+            pair_margin_scores.append(batch_metrics["pair_margin"].cpu())
 
     routing_weights_list = [torch.cat(run, dim=0) for run in routing_runs if run]
-    mean_sts = sum(sts_scores) / len(sts_scores) if sts_scores else 0.0
+    all_sts_exported = torch.cat(sts_exported_scores) if sts_exported_scores else torch.empty(0)
+    all_sts_training = torch.cat(sts_training_scores) if sts_training_scores else torch.empty(0)
+    all_pair_margin = torch.cat(pair_margin_scores) if pair_margin_scores else torch.empty(0)
+
+    mean_sts_exported = all_sts_exported.mean().item() if all_sts_exported.numel() else 0.0
+    mean_sts_training = all_sts_training.mean().item() if all_sts_training.numel() else 0.0
+    mean_pair_margin = all_pair_margin.mean().item() if all_pair_margin.numel() else 0.0
     if len(routing_weights_list) >= 2:
         drs = domain_routing_stability(routing_weights_list).item()
     else:
         drs = 0.0
-    afr = sum(1 for s in sts_scores if s > 0.3) / len(sts_scores) if sts_scores else 0.0
+    afr = analogy_feasibility_rate(
+        all_sts_exported,
+        all_pair_margin,
+        similarity_threshold=afr_similarity_threshold,
+        margin_threshold=afr_margin_threshold,
+    )
 
     return {
-        "STS": mean_sts,
+        "STS_exported": mean_sts_exported,
+        "STS_training": mean_sts_training,
         "DRS": drs,
         "AFR": afr,
+        "pair_margin": mean_pair_margin,
     }
+

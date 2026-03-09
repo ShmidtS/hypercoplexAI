@@ -111,21 +111,58 @@ def test_paired_dataset():
     assert sample["pair_encoding"].shape == (64,)
     assert sample["pair_domain_id"].dtype == torch.long
     assert sample["pair_group_id"].dtype == torch.long
-    assert sample["pair_same_template"].dtype == torch.bool
+    assert sample["pair_relation_type"] == "cross_domain_analogy"
+    assert sample["pair_weight"].dtype == torch.float32
+    assert sample["pair_weight"].item() > 0.0
     assert sample["pair_domain_id"].item() != sample["domain_id"].item()
-    assert sample["pair_same_template"].item() is True
 
 
 def test_dataset_rejects_same_domain_pairs():
     samples = [("a", 0), ("b", 0)]
     with pytest.raises(ValueError):
-        DomainProblemDataset(samples, pair_indices=[1, 0], pair_group_ids=[0, 0])
+        DomainProblemDataset(
+            samples,
+            pair_indices=[1, 0],
+            pair_group_ids=[0, 0],
+            pair_relation_types=["cross_domain_analogy", "cross_domain_analogy"],
+            pair_weights=[1.0, 1.0],
+        )
 
 
 def test_dataset_rejects_misaligned_pair_groups():
     samples = [("a", 0), ("b", 1), ("c", 2)]
     with pytest.raises(ValueError):
-        DomainProblemDataset(samples, pair_indices=[1, 0, 1], pair_group_ids=[0, 1, 2])
+        DomainProblemDataset(
+            samples,
+            pair_indices=[1, 0, 1],
+            pair_group_ids=[0, 1, 2],
+            pair_relation_types=["cross_domain_analogy", "cross_domain_analogy", "cross_domain_analogy"],
+            pair_weights=[1.0, 1.0, 1.0],
+        )
+
+
+def test_dataset_rejects_non_positive_pair_weights():
+    samples = [("a", 0), ("b", 1)]
+    with pytest.raises(ValueError):
+        DomainProblemDataset(
+            samples,
+            pair_indices=[1, 0],
+            pair_group_ids=[0, 0],
+            pair_relation_types=["cross_domain_analogy", "cross_domain_analogy"],
+            pair_weights=[0.0, 1.0],
+        )
+
+
+def test_dataset_rejects_mismatched_pair_relation_types():
+    samples = [("a", 0), ("b", 1)]
+    with pytest.raises(ValueError):
+        DomainProblemDataset(
+            samples,
+            pair_indices=[1, 0],
+            pair_group_ids=[0, 0],
+            pair_relation_types=["cross_domain_analogy", "other_relation"],
+            pair_weights=[1.0, 1.0],
+        )
 
 
 def test_iso_loss(trainer, cfg):
@@ -361,7 +398,7 @@ def test_compute_all_metrics_runs_on_model_device(trainer):
     ds = create_demo_dataset(n_samples=16)
     dl = DataLoader(ds, batch_size=4)
     metrics = compute_all_metrics(trainer.model, dl)
-    assert set(metrics) == {"STS", "DRS", "AFR"}
+    assert set(metrics) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
     assert all(isinstance(value, float) for value in metrics.values())
 
 
@@ -369,10 +406,18 @@ def test_compute_all_metrics_with_pairs(model):
     ds = create_paired_demo_dataset(n_samples=24)
     dl = DataLoader(ds, batch_size=8)
     metrics = compute_all_metrics(model, dl, num_routing_runs=2)
-    assert set(metrics) == {"STS", "DRS", "AFR"}
+    assert set(metrics) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
     assert 0.0 <= metrics["AFR"] <= 1.0
-    assert metrics["STS"] <= 1.0
+    assert metrics["STS_exported"] <= 1.0
+    assert metrics["STS_training"] <= 1.0
     assert metrics["DRS"] >= 0.0
+
+
+def test_aligned_pairs_have_non_extreme_margin(model):
+    ds = create_paired_demo_dataset(n_samples=24)
+    dl = DataLoader(ds, batch_size=8)
+    metrics = compute_all_metrics(model, dl, num_routing_runs=1)
+    assert -1.0 <= metrics["pair_margin"] <= 1.0
 
 
 # ============================================================
