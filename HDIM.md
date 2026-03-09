@@ -706,7 +706,108 @@ HDIM в текущем состоянии — это **MVP hypercomplex transfer
 - `hypercoplexAI/src/training/experiment_runner.py` — experiment/autoresearch orchestration, artifact materialization, and best-run selection by `quality.pair_margin`
 - `hypercoplexAI/src/training/results_logger.py` — JSON/JSONL helpers used by run summaries and ledgers
 - `hypercoplexAI/tests/test_hdim.py` — coverage for baseline and paired behavior
+- `hypercoplexAI/tests/test_new_components.py` — coverage for AdvancedTextEncoder, HierarchicalTitansMemory, SoftMoERouter, integration tests
+- `hypercoplexAI/src/models/model_factory.py` — factory API for constructing HDIM model variants from config
 ---
+
+## 15. Training Results (2026-03-09)
+
+Все запуски выполнялись на GPU (CUDA, AMP). Артефакты хранятся в `artifacts/`.
+
+---
+
+### 15.1 Лучший результат — `autoresearch_final` / `hdim-final-refine-002`
+
+| Метрика | Значение |
+|---------|----------|
+| **Score** | **0.2895** |
+| STS_exported | 0.9376 |
+| STS_training | 0.9789 |
+| pair_margin | 0.0082 |
+| AFR | 1.0 |
+| DRS | ~2.6e-9 |
+| Эпох | 40 |
+| Время обучения | 164 с |
+
+**Конфигурация:**
+```json
+{ "hidden_dim": 64, "num_experts": 4, "advanced_encoder": true,
+  "hierarchical_memory": false, "soft_router": true,
+  "lambda_iso": 0.0733, "lambda_pair": 0.1723,
+  "lambda_routing": 0.012, "lambda_memory": 0.013 }
+```
+
+Чекпоинт: `artifacts/autoresearch_final/hdim-final-refine-002/checkpoints/best.pt`
+
+---
+
+### 15.2 Результаты autoresearch_final (10 прогонов, 0 падений)
+
+#### Фаза explore (6 прогонов)
+| Run | Score | STS_exp | pair_margin | Вердикт |
+|-----|-------|---------|-------------|--------|
+| explore-001 | 0.060 | 0.201 | 0.0 | discard |
+| explore-002 | 0.284 | 0.945 | 0.0 | keep |
+| explore-003 | 0.049 | 0.163 | 0.0 | discard |
+| explore-004 | 0.186 | 0.621 | 0.0 | discard |
+| explore-005 | 0.070 | 0.233 | 0.0 | discard |
+| explore-006 | 0.192 | 0.640 | 0.0 | discard |
+
+**Вывод:** compact конфиг (hidden_dim=64, soft_router=true, advanced_encoder=true) стабильно превосходит wide (hidden_dim=256+) и hard-router варианты.
+
+#### Фаза refine (4 прогона)
+| Run | Score | STS_exp | pair_margin | Вердикт |
+|-----|-------|---------|-------------|--------|
+| refine-001 | 0.287 | 0.936 | 0.0062 | keep |
+| **refine-002** | **0.2895** | **0.938** | **0.0082** | **keep** |
+| refine-003 | 0.237 | 0.782 | 0.0028 | discard |
+| refine-004 | 0.069 | 0.260 | −0.0085 | discard |
+
+**Вывод:** hierarchical_memory=true ухудшает результат на этом масштабе данных. Отключение soft_router обрушивает STS_exported с 0.94 до 0.26.
+
+---
+
+### 15.3 Результаты autoresearch_phase3 (17 прогонов)
+
+Лучший прогон: `hdim-phase3-refine-004` — score **0.229**, pair_margin **0.035**, STS_exp **0.646**.
+
+| Параметр | Значение |
+|----------|----------|
+| hidden_dim | 256 |
+| num_experts | 4 |
+| advanced_encoder | false |
+| soft_router | true |
+| lambda_pair | 0.3587 |
+| ranking_margin | 0.2368 |
+
+Phase3 проверял ranking_margin как отдельный гиперпараметр. AFR=0.89, pair_margin=0.035 — лучший pair_margin среди всех autoresearch прогонов, но STS_exported ниже из-за отсутствия advanced_encoder.
+
+---
+
+### 15.4 Ручные GPU-прогоны
+
+| Run | Эпох | best_score | best_STS_exp | pair_margin (финал) | Время |
+|-----|------|-----------|-------------|---------------------|-------|
+| gpu_training | 50 | — | — | — | — |
+| gpu_run_001 | 30 | — | — | — | — |
+| gpu_run_002 | 50 | — | — | — | — |
+| gpu_run_003 | — | — | — | — | — |
+| **gpu_run_best** | 80 | **0.333** | **0.914** | 0.035 | 447 с |
+| gpu_run_final | 100 | 0.261 | 0.870 | 0.0 | 709 с |
+
+`gpu_run_best` — исторически лучший единственный прогон по best_score=0.333 (epoch 10). Финальное качество упало из-за переобучения (epoch 10 vs epoch 80).
+
+---
+
+### 15.5 Ключевые выводы
+
+1. **Лучший стабильный конфиг:** hidden_dim=64, num_experts=4, advanced_encoder=true, soft_router=true, hierarchical_memory=false.
+2. **STS_exported ~0.94** достигается автоматически при правильной комбинации; без soft_router падает до 0.2–0.3.
+3. **pair_margin** слабо коррелирует с STS_exported — оба нужны для надёжной оценки transfer quality.
+4. **hierarchical_memory** на текущем масштабе данных (<2000 сэмплов) не помогает и стабильно снижает score.
+5. **Переобучение по эпохам:** лучший checkpoint часто на epoch 5–15, финальный хуже. Рекомендуется early stopping или более строгий eval_every.
+6. **0 крэшей** (crash_nan, crash_oom, crash_runtime) во всех autoresearch прогонах.
+
 
 ## 14. Final position
 HDIM следует развивать как **implementable-first research system**:
