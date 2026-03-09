@@ -1,5 +1,7 @@
 """Training package for HypercoplexAI — trainers, datasets, and utilities."""
 
+from src.training.experiment_config import ExperimentConfig
+from src.training.experiment_runner import ExperimentRunner
 from src.training.trainer import HDIMTrainer
 from src.training.dataset import (
     DomainProblemDataset,
@@ -10,6 +12,8 @@ from src.training.dataset import (
 )
 
 __all__ = [
+    "ExperimentConfig",
+    "ExperimentRunner",
     "HDIMTrainer",
     "DomainProblemDataset",
     "create_demo_dataset",
