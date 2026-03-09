@@ -66,6 +66,11 @@ class TitansMemoryModule(nn.Module):
         loss_memory = F.mse_loss(retrieved, v.detach())
         return MemoryState(retrieved=retrieved, loss=loss_memory, updated=False)
 
+    # Максимальная норма весов памяти — предотвращает TTT взрыв
+    _MEMORY_MAX_NORM: float = 10.0
+    # Масштаб шага TTT — уменьшен для стабильности
+    _TTT_LR_SCALE: float = 0.01
+
     def update(
         self,
         k: torch.Tensor,
@@ -80,10 +85,15 @@ class TitansMemoryModule(nn.Module):
             retain_graph=False,
             create_graph=False,
         )[0]
-        self.momentum_S = eta * self.momentum_S.detach() - theta * grad.detach()
-        self.memory.weight.data.copy_(
-            (1 - alpha) * self.memory.weight.data + self.momentum_S.data
-        )
+        # Clamp gradient to prevent explosive TTT update
+        grad_clamped = torch.clamp(grad.detach(), min=-1.0, max=1.0)
+        self.momentum_S = eta * self.momentum_S.detach() - self._TTT_LR_SCALE * theta * grad_clamped
+        new_weight = (1 - alpha) * self.memory.weight.data + self.momentum_S.data
+        # Max-norm constraint: prevent memory weight from exploding
+        weight_norm = new_weight.norm()
+        if weight_norm > self._MEMORY_MAX_NORM:
+            new_weight = new_weight * (self._MEMORY_MAX_NORM / (weight_norm + 1e-8))
+        self.memory.weight.data.copy_(new_weight)
         return alpha.detach(), eta.detach(), theta.detach()
 
     def retrieve_and_update(

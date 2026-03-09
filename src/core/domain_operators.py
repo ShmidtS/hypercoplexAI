@@ -32,13 +32,20 @@ class DomainRotationOperator(nn.Module):
         if init_identity:
             self.R.data[0] = 1.0
 
+    def _normalized_R(self) -> torch.Tensor:
+        """Возвращает нормализованный ротор ||R||=1 для стабильного сэндвича."""
+        norm = self.algebra.norm(self.R) + 1e-8
+        return self.R / norm
+
     def get_inverse(self) -> torch.Tensor:
-        R_rev = self.algebra.reverse(self.R)
-        norm_sq = self.algebra.norm(self.R) ** 2 + 1e-8
+        R_n = self._normalized_R()
+        R_rev = self.algebra.reverse(R_n)
+        # Для нормализованного верзора norm_sq ≈ 1, но держим safe eps
+        norm_sq = self.algebra.norm(R_n) ** 2 + 1e-8
         return R_rev / norm_sq
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.algebra.sandwich(self.R, x)
+        return self.algebra.sandwich(self._normalized_R(), x)
 
     def apply_inverse(self, x: torch.Tensor) -> torch.Tensor:
         return self.algebra.sandwich(self.get_inverse(), x)

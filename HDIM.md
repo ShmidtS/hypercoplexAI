@@ -177,6 +177,25 @@ x
 - `hypercoplexAI/tests/test_hdim.py`
  - baseline and paired-contract tests
  - text-wrapper scoring coverage with retrieve-only memory semantics
+- `hypercoplexAI/src/models/advanced_text_encoder.py`
+ - `AdvancedTextEncoder` — продвинутый текстовый энкодер с multi-head self-attention (RoPE), N-layer Transformer и attention pooling; backward-compatible замена SimpleTextEncoder
+ - `RotaryEmbedding` — реализация RoPE для позиционного кодирования
+ - `MultiHeadSelfAttention` — self-attention с RoPE и NaN-safe softmax
+ - `TransformerBlock` — pre-norm Transformer block с FFN
+ - `AttentionPooling` — learned query attention pooling вместо mean pooling
+- `hypercoplexAI/src/core/hierarchical_memory.py`
+ - `HierarchicalTitansMemory` — двухуровневая память (working + long-term) с surprise-based обновлением
+ - Level 1 (working): обновляется на каждом шаге через TTT gradient step
+ - Level 2 (long-term): обновляется только при высоком surprise (ошибка предсказания)
+ - `blend_proj` — learned mix между working и long-term retrieval
+- `hypercoplexAI/src/core/soft_moe_router.py`
+ - `SoftMoERouter` — Soft Mixture of Experts (Puigcerver et al., ICLR 2024)
+ - Dispatch/combine матрицы вместо hard top-k routing
+ - Нет token dropping, стабильные градиенты, равномерная нагрузка экспертов
+ - API-совместим с R3MoERouter
+- `hypercoplexAI/scripts/gpu_train.py` — GPU training script с AMP, cosine LR, monitoring
+- `hypercoplexAI/scripts/autoresearch_loop.py` — AutoResearch Loop для hyperparameter search
+- `hypercoplexAI/tests/test_new_components.py` — тесты для новых компонентов
 ### 4.4 What the MVP can honestly claim
 Текущая архитектура уже поддерживает:
 
@@ -277,6 +296,39 @@ MVP не должен описываться как уже имеющий:
 - retrieve-only scoring contract (`memory_mode="retrieve"`, `update_memory=False`) для text-pair comparison без мутации памяти во время scoring.
 
 Важно: этот слой предназначен для retrieval/ranking/transfer experiments и orchestration-friendly inspection, но не превращает HDIM в генеративную текстовую модель.
+
+### G. Advanced Text Encoder (Phase 2)
+Реализовано:
+- `AdvancedTextEncoder` с multi-head self-attention (4 heads), RoPE, attention pooling;
+- N-layer Transformer backbone (pre-norm, GELU FFN, residual);
+- NaN-safe softmax с nan_to_num recovery;
+- Xavier/zero init для стабильного обучения;
+- Backward compatible с `SimpleTextEncoder` через единый интерфейс.
+
+### H. Hierarchical Memory (Phase 2)
+Реализовано:
+- `HierarchicalTitansMemory` — двухуровневая ассоциативная память;
+- Working memory: быстрое обновление через TTT на каждом шаге;
+- Long-term memory: обновление через surprise gate (learned gate на основе ошибки предсказания);
+- Learned blend коэффициент для смешивания working/long-term retrieval;
+- API-совместима с `TitansMemoryModule` через `retrieve_and_update → MemoryState`.
+
+### I. Soft MoE Router (Phase 2)
+Реализовано:
+- `SoftMoERouter` — мягкая маршрутизация экспертов без token dropping;
+- Dispatch/combine матрицы: каждый токен получает взвешенный mix всех экспертов;
+- Entropy load balance loss;
+- EMA train_scores для R3 совместимости;
+- API-совместим с `R3MoERouter`.
+
+### J. GPU Training Infrastructure (Phase 2)
+Реализовано:
+- `scripts/gpu_train.py` — полноценный GPU training loop;
+- AMP (Automatic Mixed Precision) для GPU;
+- Cosine LR scheduler с linear warmup;
+- Live monitoring (JSONL log каждой эпохи);
+- Checkpoint по лучшей val pair_margin;
+- `scripts/autoresearch_loop.py` — iterative hyperparameter search (grid/random/refinement).
 
 ## 5.2 Next-phase engineering components
 Следующая фаза должна улучшать текущий код, а не подменять его новой абстрактной архитектурой.
@@ -516,6 +568,11 @@ raw texts
 | Training CLI run summary | implemented | `hypercoplexAI/src/training/train.py` | optional JSON summary для orchestration/reporting, не external evidence engine |
 | STS / DRS / AFR metrics | implemented | `hypercoplexAI/src/models/metrics.py` | это proxy-метрики, не scientific proof layer |
 | Regression tests | implemented | `hypercoplexAI/tests/test_hdim.py` | покрывают forward, pairs, validate, metrics и text-wrapper scoring contract |
+| AdvancedTextEncoder | implemented (Phase 2) | `hypercoplexAI/src/models/advanced_text_encoder.py` | Transformer+RoPE+AttentionPooling замена SimpleTextEncoder |
+| HierarchicalTitansMemory | implemented (Phase 2) | `hypercoplexAI/src/core/hierarchical_memory.py` | two-level memory с surprise-based routing |
+| SoftMoERouter | implemented (Phase 2) | `hypercoplexAI/src/core/soft_moe_router.py` | Soft MoE без token dropping |
+| GPU training script | implemented (Phase 2) | `hypercoplexAI/scripts/gpu_train.py` | AMP, cosine LR, live monitoring |
+| AutoResearch Loop | implemented (Phase 2) | `hypercoplexAI/scripts/autoresearch_loop.py` | grid/random/refinement hyperparameter search |
 | Q-Attention | research only | not present in runtime code | оставить как post-MVP extension |
 | TRIZ parser / avatars / Scholar ingestion | research only | not present in runtime code | внешний workflow, не ядро Python MVP |
 

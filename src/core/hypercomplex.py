@@ -130,7 +130,9 @@ class CliffordAlgebra(nn.Module):
         flat_weighted = weighted.reshape(*a.shape[:-1], D * D)
         flat_indices = indices.reshape(D * D)
         result.scatter_add_(-1, flat_indices.expand(*a.shape[:-1], D * D), flat_weighted)
-        return result
+        # nan_to_num prevents NaN propagation; clamp prevents gradient explosion
+        result = torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
+        return torch.clamp(result, min=-1e3, max=1e3)
 
     def involute(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -170,13 +172,15 @@ class CliffordAlgebra(nn.Module):
         """
         Сэндвич-произведение: R x R^{-1}, где R^{-1} = reverse(R) / ||R||².
         Корректно для произвольных (ненормализованных) верзоров.
+        Добавлен clamp промежуточных значений для предотвращения NaN.
         """
         R_rev = self.reverse(R)
         # norm возвращает (...) без последнего dim, нужно unsqueeze
         norm_sq = (self.norm(R) ** 2 + 1e-8).unsqueeze(-1)  # (..., 1)
         R_inv = R_rev / norm_sq  # broadcast по последнему dim
         Rx = self.geometric_product(R, x)
-        return self.geometric_product(Rx, R_inv)
+        result = self.geometric_product(Rx, R_inv)
+        return result
 
 
 # ============================================================

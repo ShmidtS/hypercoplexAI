@@ -158,6 +158,8 @@ class HDIMPipeline(nn.Module):
             for name in domain_names
         })
         self.invariant_extractor = InvariantExtractor(self.algebra)
+        # LayerNorm после инварианта — критично для стабильности geometric_product цепочки
+        self.invariant_norm = nn.LayerNorm(clifford_dim)
         self.memory = TitansMemoryModule(
             key_dim=memory_key_dim,
             val_dim=clifford_dim,
@@ -182,6 +184,8 @@ class HDIMPipeline(nn.Module):
         g_source = self.encoder(x)
         rotor = self.domain_rotors[domain_name]
         u_inv = self.invariant_extractor(g_source, rotor)
+        # Normalize invariant to prevent geometric product cascade explosion
+        u_inv = self.invariant_norm(u_inv)
         return g_source, u_inv
 
     def _apply_memory(

@@ -27,6 +27,7 @@ class HDIMTrainer:
         lambda_iso: float = 0.1,
         lambda_routing: float = 0.05,
         lambda_pair: float = 0.1,
+        lambda_memory: float = 0.05,
         negative_margin: float = 1.0,
         ranking_margin: float = 0.2,
     ) -> None:
@@ -36,6 +37,7 @@ class HDIMTrainer:
         self.lambda_iso = lambda_iso
         self.lambda_routing = lambda_routing
         self.lambda_pair = lambda_pair
+        self.lambda_memory = lambda_memory
         self.negative_margin = negative_margin
         self.ranking_margin = ranking_margin
         self._step: int = 0
@@ -417,7 +419,7 @@ class HDIMTrainer:
             + self.lambda_iso * loss_iso
             + self.lambda_pair * loss_pair
             + self.lambda_routing * loss_routing
-            + loss_memory
+            + self.lambda_memory * loss_memory
         )
         batch_losses = {
             "loss_total": loss_total,

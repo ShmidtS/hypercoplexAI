@@ -174,11 +174,22 @@ def compute_all_metrics(
     afr_similarity_threshold: float = 0.3,
     afr_margin_threshold: float = 0.0,
 ) -> dict:
-    """Compute STS_exported, STS_training, DRS, AFR, and pair margin metrics."""
+    """Compute STS_exported, STS_training, DRS, AFR, and pair margin metrics.
+
+    pair_margin вычисляется глобально по всему датасету, чтобы избежать
+    проблемы однородных батчей (все образцы одной группы).
+    """
     model.eval()
+    device = _model_device(model)
+
+    # Собираем глобальные инварианты для pair_margin
+    all_src_inv: List[torch.Tensor] = []
+    all_tgt_inv: List[torch.Tensor] = []
+    all_group_ids: List[torch.Tensor] = []
+    all_domain_ids: List[torch.Tensor] = []
+    all_pair_domain_ids: List[torch.Tensor] = []
     sts_exported_scores: List[torch.Tensor] = []
     sts_training_scores: List[torch.Tensor] = []
-    pair_margin_scores: List[torch.Tensor] = []
     routing_runs: List[List[torch.Tensor]] = [[] for _ in range(num_routing_runs)]
 
     with torch.no_grad():
@@ -190,23 +201,68 @@ def compute_all_metrics(
             batch_metrics = _paired_batch_metrics(model, batch)
             sts_exported_scores.append(batch_metrics["sts_exported"].cpu())
             sts_training_scores.append(batch_metrics["sts_training"].cpu())
-            pair_margin_scores.append(batch_metrics["pair_margin"].cpu())
+
+            # Собираем данные для глобального pair_margin
+            enc = batch.get("encoding")
+            pair_enc = batch.get("pair_encoding")
+            if enc is not None and pair_enc is not None:
+                enc = enc.to(device)
+                pair_enc = pair_enc.to(device)
+                d_ids = batch["domain_id"].to(device)
+                pd_ids = batch["pair_domain_id"].to(device)
+                _, _, _, src_state = model.transfer_pairs(
+                    enc, d_ids, pd_ids, update_memory=False, memory_mode="retrieve"
+                )
+                _, _, _, tgt_state = model(
+                    pair_enc, domain_id=pd_ids, return_state=True, update_memory=False, memory_mode="retrieve"
+                )
+                all_src_inv.append(src_state.exported_invariant.cpu())
+                all_tgt_inv.append(tgt_state.exported_invariant.cpu())
+                if "pair_group_id" in batch:
+                    all_group_ids.append(batch["pair_group_id"].cpu())
+                all_domain_ids.append(d_ids.cpu())
+                all_pair_domain_ids.append(pd_ids.cpu())
 
     routing_weights_list = [torch.cat(run, dim=0) for run in routing_runs if run]
     all_sts_exported = torch.cat(sts_exported_scores) if sts_exported_scores else torch.empty(0)
     all_sts_training = torch.cat(sts_training_scores) if sts_training_scores else torch.empty(0)
-    all_pair_margin = torch.cat(pair_margin_scores) if pair_margin_scores else torch.empty(0)
+
+    # Глобальный pair_margin
+    mean_pair_margin = 0.0
+    if all_src_inv and all_tgt_inv and all_group_ids:
+        src = F.normalize(torch.cat(all_src_inv), dim=-1)
+        tgt = F.normalize(torch.cat(all_tgt_inv), dim=-1)
+        groups = torch.cat(all_group_ids)
+        domain_ids_all = torch.cat(all_domain_ids)
+        pair_domain_ids_all = torch.cat(all_pair_domain_ids)
+        N = src.shape[0]
+        # Positive scores: диагональные элементы
+        pos_scores = (src * tgt).sum(dim=-1)  # (N,)
+        # Negative scores: для каждого образца найти негатив из другой группы
+        neg_scores = torch.zeros(N)
+        for i in range(N):
+            neg_mask = (groups != groups[i]) & (pair_domain_ids_all != domain_ids_all[i])
+            if not neg_mask.any():
+                neg_mask = groups != groups[i]
+            if neg_mask.any():
+                neg_sim = (src[i:i+1] * tgt[neg_mask]).sum(dim=-1)
+                neg_scores[i] = neg_sim.max().item()
+            else:
+                neg_scores[i] = 0.0
+        pair_margins = pos_scores - neg_scores
+        mean_pair_margin = pair_margins.mean().item()
+    elif all_sts_exported.numel() > 0:
+        mean_pair_margin = 0.0
 
     mean_sts_exported = all_sts_exported.mean().item() if all_sts_exported.numel() else 0.0
     mean_sts_training = all_sts_training.mean().item() if all_sts_training.numel() else 0.0
-    mean_pair_margin = all_pair_margin.mean().item() if all_pair_margin.numel() else 0.0
     if len(routing_weights_list) >= 2:
         drs = domain_routing_stability(routing_weights_list).item()
     else:
         drs = 0.0
     afr = analogy_feasibility_rate(
         all_sts_exported,
-        all_pair_margin,
+        torch.full_like(all_sts_exported, mean_pair_margin),
         similarity_threshold=afr_similarity_threshold,
         margin_threshold=afr_margin_threshold,
     )
