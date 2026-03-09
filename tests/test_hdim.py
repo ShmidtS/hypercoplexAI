@@ -9,6 +9,7 @@ from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
     create_paired_demo_dataset,
+    texts_to_tensor,
 )
 from src.training.trainer import HDIMTrainer
 
@@ -202,6 +203,32 @@ def test_routing_loss(trainer, cfg):
     weights = torch.softmax(torch.randn(4, cfg.num_experts), dim=-1)
     loss = trainer.compute_routing_loss(weights)
     assert isinstance(loss.item(), float)
+
+
+def test_pair_iso_loss_uses_pair_weights(trainer, cfg):
+    training_invariant = torch.tensor([[0.0] * cfg.hidden_dim, [1.0] * cfg.hidden_dim])
+    iso_target = torch.tensor([[1.0] * cfg.hidden_dim, [1.0] * cfg.hidden_dim])
+    batch = {
+        "pair_encoding": torch.randn(2, cfg.hidden_dim),
+        "pair_domain_id": torch.tensor([0, 1], dtype=torch.long),
+        "pair_relation_label": torch.tensor([1.0, 1.0]),
+        "pair_weight": torch.tensor([3.0, 1.0]),
+    }
+    loss = trainer._compute_pair_iso_loss(training_invariant, iso_target, batch)
+    assert loss.item() == pytest.approx(0.75)
+
+
+def test_pair_iso_loss_uses_negative_margin(trainer, cfg):
+    training_invariant = torch.zeros(2, cfg.hidden_dim)
+    iso_target = torch.zeros(2, cfg.hidden_dim)
+    batch = {
+        "pair_encoding": torch.randn(2, cfg.hidden_dim),
+        "pair_domain_id": torch.tensor([0, 1], dtype=torch.long),
+        "pair_relation_label": torch.tensor([0.0, 0.0]),
+        "pair_weight": torch.tensor([1.0, 3.0]),
+    }
+    loss = trainer._compute_pair_iso_loss(training_invariant, iso_target, batch)
+    assert loss.item() == pytest.approx(trainer.negative_margin)
 
 
 def test_train_step(trainer, cfg):
@@ -420,6 +447,14 @@ def test_model_reset_memory_clears_memory_and_router_state(model, cfg):
         torch.full_like(model.pipeline.moe.train_scores, 1.0 / cfg.num_experts),
     )
 
+def test_compute_all_metrics_handles_small_validation_batches(model):
+    ds = create_paired_demo_dataset(n_samples=12)
+    dl = DataLoader(ds, batch_size=1)
+    metrics = compute_all_metrics(model, dl, num_routing_runs=1)
+    assert set(metrics) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
+    assert all(isinstance(value, float) for value in metrics.values())
+
+
 def test_compute_all_metrics_runs_on_model_device(trainer):
     ds = create_demo_dataset(n_samples=16)
     dl = DataLoader(ds, batch_size=4)
@@ -437,6 +472,15 @@ def test_compute_all_metrics_with_pairs(model):
     assert metrics["STS_exported"] <= 1.0
     assert metrics["STS_training"] <= 1.0
     assert metrics["DRS"] >= 0.0
+
+
+def test_compute_all_metrics_handles_positive_only_paired_validation(model):
+    ds = create_paired_demo_dataset(n_samples=100, negative_ratio=0.0)
+    _, val_ds = create_group_aware_split(ds, train_fraction=0.8, seed=42)
+    dl = DataLoader(val_ds, batch_size=8)
+    metrics = compute_all_metrics(model, dl, num_routing_runs=1)
+    assert set(metrics) == {"STS_exported", "STS_training", "DRS", "AFR", "pair_margin"}
+    assert all(isinstance(value, float) for value in metrics.values())
 
 
 def test_aligned_pairs_have_non_extreme_margin(model):

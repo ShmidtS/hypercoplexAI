@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--device', default='cpu')
+    parser.add_argument('--num_samples', type=int, default=100)
     parser.add_argument('--use_pairs', action='store_true', help='Use paired cross-domain supervision dataset')
     args = parser.parse_args()
 
@@ -30,7 +31,7 @@ def main():
     trainer = HDIMTrainer(model, optimizer, device=args.device)
 
     dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
-    dataset = dataset_factory()
+    dataset = dataset_factory(n_samples=args.num_samples, embed_dim=cfg.hidden_dim)
     train_ds, val_ds = create_group_aware_split(dataset, train_fraction=0.8, seed=42)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)

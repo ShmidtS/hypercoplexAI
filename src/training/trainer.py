@@ -40,6 +40,7 @@ class HDIMTrainer:
         self.device = torch.device(device)
         self.lambda_iso = lambda_iso
         self.lambda_routing = lambda_routing
+        self.negative_margin = negative_margin
         self._step: int = 0
 
     def _resolve_training_regime(
@@ -98,6 +99,37 @@ class HDIMTrainer:
     ) -> torch.Tensor:
         return nn.functional.mse_loss(output, target)
 
+    def _compute_pair_iso_loss(
+        self,
+        training_invariant: torch.Tensor,
+        iso_target: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if not self._has_pairs(batch):
+            return self.compute_iso_loss(training_invariant, iso_target)
+
+        pair_relation_label = batch.get("pair_relation_label")
+        pair_weight = batch.get("pair_weight")
+        if pair_relation_label is None or pair_weight is None:
+            return self.compute_iso_loss(training_invariant, iso_target)
+
+        pair_relation_label = pair_relation_label.to(self.device, dtype=training_invariant.dtype)
+        pair_weight = pair_weight.to(self.device, dtype=training_invariant.dtype)
+        per_sample_mse = F.mse_loss(training_invariant, iso_target, reduction="none").mean(dim=-1)
+        positive_mask = pair_relation_label > 0.5
+        negative_mask = ~positive_mask
+        losses = []
+        if positive_mask.any():
+            positive_loss = (per_sample_mse[positive_mask] * pair_weight[positive_mask]).sum() / pair_weight[positive_mask].sum()
+            losses.append(positive_loss)
+        if negative_mask.any():
+            negative_penalty = F.relu(self.negative_margin - per_sample_mse[negative_mask])
+            weighted_negative = (negative_penalty * pair_weight[negative_mask]).sum() / pair_weight[negative_mask].sum()
+            losses.append(weighted_negative)
+        if not losses:
+            return per_sample_mse.mean()
+        return torch.stack(losses).mean()
+
     def _compute_router_diagnostics(
         self,
         aux_state: HDIMAuxState,
@@ -140,8 +172,10 @@ class HDIMTrainer:
         training_invariant = self._training_invariant(aux_state)
         iso_target = self._extract_iso_targets(batch, aux_state)
         loss_recon = self._compute_reconstruction_loss(output, recon_target)
-        loss_iso = self.compute_iso_loss(training_invariant, iso_target)
+        loss_iso = self._compute_pair_iso_loss(training_invariant, iso_target, batch)
         loss_routing = aux_state.router_loss
+        pair_relation_label = batch.get("pair_relation_label")
+        pair_weight = batch.get("pair_weight")
         loss_memory = aux_state.memory_loss
         loss_total = (
             loss_recon
@@ -164,6 +198,12 @@ class HDIMTrainer:
             "training_invariant": training_invariant,
             "training_mode": regime.mode,
         }
+        if pair_relation_label is not None:
+            batch_losses["pair_relation_label"] = pair_relation_label.to(self.device, dtype=training_invariant.dtype)
+        if pair_weight is not None:
+            batch_losses["pair_weight"] = pair_weight.to(self.device, dtype=training_invariant.dtype)
+        if self._has_pairs(batch):
+            batch_losses["iso_target"] = iso_target
         batch_losses.update(self._compute_router_diagnostics(aux_state))
         return batch_losses
 

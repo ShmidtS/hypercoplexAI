@@ -381,9 +381,10 @@ External scientific retrieval остаётся долгосрочной инте
 
 1. входом служит уже готовый `encoding`, а не raw scientific corpus;
 2. `HDIMModel` выполняет either same-domain reconstruction, либо explicit paired transfer;
-3. `HDIMTrainer` оптимизирует наблюдаемые objective-компоненты `loss_recon`, `loss_iso`, `loss_routing`, `loss_memory`;
-4. качество оценивается через `validate()` и `compute_all_metrics()`;
-5. корректность MVP подтверждается тестами на forward / transfer / paired dataset / metrics.
+3. optional `TextHDIMModel` добавляет только deterministic text-to-embedding entry layer для retrieval / ranking / transfer experiments поверх того же HDIM core;
+4. `HDIMTrainer` оптимизирует наблюдаемые objective-компоненты `loss_recon`, `loss_iso`, `loss_routing`, `loss_memory`;
+5. качество оценивается через `validate()` и `compute_all_metrics()`;
+6. корректность MVP подтверждается тестами на forward / transfer / paired dataset / metrics и minimal text-wrapper surface.
 
 ### 8.5.2 Training loop tied to current code
 Реалистичный цикл обучения для текущего MVP выглядит так:

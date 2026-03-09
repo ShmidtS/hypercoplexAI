@@ -6,6 +6,7 @@ from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
     create_paired_demo_dataset,
+    texts_to_tensor,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "create_demo_dataset",
     "create_group_aware_split",
     "create_paired_demo_dataset",
+    "texts_to_tensor",
 ]

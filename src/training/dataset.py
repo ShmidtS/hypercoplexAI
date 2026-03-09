@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import random
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -41,6 +41,18 @@ def _text_to_embedding(text: str, dim: int, seed: Optional[int] = None) -> torch
         embedding = embedding / norm
 
     return embedding
+
+
+def texts_to_tensor(
+    texts: Sequence[str],
+    dim: int,
+    *,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """Encode raw texts into a batch tensor for the minimal text-mode scaffold."""
+    if len(texts) == 0:
+        return torch.empty(0, dim)
+    return torch.stack([_text_to_embedding(text, dim, seed=seed) for text in texts], dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +325,25 @@ def create_group_aware_split(
     train_indices: List[int] = []
     val_indices: List[int] = []
 
-    for group_id in group_ids:
-        destination = train_indices if len(train_indices) < target_train_size else val_indices
-        destination.extend(groups[group_id])
+    for position, group_id in enumerate(group_ids):
+        group_indices = groups[group_id]
+        remaining_groups = len(group_ids) - position - 1
+        train_needed = target_train_size - len(train_indices)
+
+        if not train_indices:
+            destination = train_indices
+        elif not val_indices and remaining_groups == 0:
+            destination = val_indices
+        elif len(train_indices) >= target_train_size:
+            destination = val_indices
+        elif train_needed <= 0:
+            destination = val_indices
+        elif not val_indices and len(group_indices) > train_needed and remaining_groups > 0:
+            destination = val_indices
+        else:
+            destination = train_indices
+
+        destination.extend(group_indices)
 
     if not train_indices or not val_indices:
         raise ValueError("group-aware split requires both train and validation groups")

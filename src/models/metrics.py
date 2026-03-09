@@ -5,7 +5,7 @@ HDIM Quality Metrics:
 - DRS (Domain Routing Stability) — стабильность роутера при повторных вызовах
 - AFR (Analogy Feasibility Rate) — доля aligned pairs, проходящих margin-aware проверку
 """
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -40,24 +40,26 @@ def aligned_pair_margin(
     return (aligned_scores - mismatched_scores).mean()
 
 
-def _compute_negative_pair_indices(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+def _compute_negative_pair_indices(batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
     pair_group_id = batch["pair_group_id"]
     pair_domain_id = batch["pair_domain_id"]
     source_domain_id = batch["domain_id"]
     batch_size = pair_group_id.shape[0]
     if batch_size < 2:
-        return torch.arange(batch_size, device=pair_group_id.device)
-
+        return None
     batch_indices = torch.arange(batch_size, device=pair_group_id.device)
     negative_indices = torch.empty(batch_size, device=pair_group_id.device, dtype=torch.long)
 
     for idx in range(batch_size):
-        valid_candidates = batch_indices[
-            (pair_group_id != pair_group_id[idx])
-            & (pair_domain_id != source_domain_id[idx])
+        valid_candidates = batch_indices[pair_group_id != pair_group_id[idx]]
+        cross_domain_candidates = valid_candidates[
+            pair_domain_id[valid_candidates] != source_domain_id[idx]
         ]
+        if cross_domain_candidates.numel() > 0:
+            negative_indices[idx] = cross_domain_candidates[0]
+            continue
         if valid_candidates.numel() == 0:
-            raise ValueError("Could not construct mismatched negative pairs for batch")
+            return None
         negative_indices[idx] = valid_candidates[0]
 
     return negative_indices
@@ -112,15 +114,6 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
         memory_mode="retrieve",
     )
     negative_pair_indices = _compute_negative_pair_indices(batch)
-    mismatched_pair_enc = pair_enc[negative_pair_indices]
-    mismatched_pair_domain_ids = pair_domain_ids[negative_pair_indices]
-    _, _, _, mismatched_state = model(
-        mismatched_pair_enc,
-        domain_id=mismatched_pair_domain_ids,
-        return_state=True,
-        update_memory=False,
-        memory_mode="retrieve",
-    )
 
     sts_exported = F.cosine_similarity(
         src_state.exported_invariant,
@@ -132,15 +125,29 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
         tgt_state.training_invariant,
         dim=-1,
     )
-    mismatched_scores = F.cosine_similarity(
-        src_state.exported_invariant,
-        mismatched_state.exported_invariant,
-        dim=-1,
-    )
+
+    if negative_pair_indices is None:
+        pair_margin = torch.zeros_like(sts_exported)
+    else:
+        mismatched_pair_enc = pair_enc[negative_pair_indices]
+        mismatched_pair_domain_ids = pair_domain_ids[negative_pair_indices]
+        _, _, _, mismatched_state = model(
+            mismatched_pair_enc,
+            domain_id=mismatched_pair_domain_ids,
+            return_state=True,
+            update_memory=False,
+            memory_mode="retrieve",
+        )
+        mismatched_scores = F.cosine_similarity(
+            src_state.exported_invariant,
+            mismatched_state.exported_invariant,
+            dim=-1,
+        )
+        pair_margin = sts_exported - mismatched_scores
     return {
         "sts_exported": sts_exported,
         "sts_training": sts_training,
-        "pair_margin": sts_exported - mismatched_scores,
+        "pair_margin": pair_margin,
         "routing": routing,
     }
 
