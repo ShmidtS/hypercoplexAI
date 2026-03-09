@@ -129,6 +129,7 @@ class DomainProblemDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         item = {
+            "text": self.samples[idx][0],
             "encoding": self._encodings[idx].float(),
             "domain_id": torch.tensor(self._labels[idx], dtype=torch.long),
         }
@@ -136,6 +137,7 @@ class DomainProblemDataset(Dataset):
         if self.pair_indices is not None:
             pair_idx = self.pair_indices[idx]
             pair_relation_type = self.pair_relation_types[idx]
+            item["pair_text"] = self.samples[pair_idx][0]
             item["pair_encoding"] = self._encodings[pair_idx].float()
             item["pair_domain_id"] = torch.tensor(self._labels[pair_idx], dtype=torch.long)
             item["pair_index"] = torch.tensor(pair_idx, dtype=torch.long)

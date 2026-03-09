@@ -19,6 +19,7 @@ class ExperimentConfig:
     negative_ratio: float = 0.0
     train_fraction: float = 0.8
     seed: int = 42
+    text_mode: bool = False
     output_dir: str | None = None
     results_json: str | None = None
     ledger_path: str | None = None
