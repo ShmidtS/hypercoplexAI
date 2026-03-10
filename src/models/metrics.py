@@ -65,12 +65,40 @@ def _compute_negative_pair_indices(batch: Dict[str, torch.Tensor]) -> Optional[t
     return negative_indices
 
 
-def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
-    device = _model_device(model)
-    enc: torch.Tensor = batch["encoding"].to(device)
-    domain_ids: torch.Tensor = batch["domain_id"].to(device)
+def _get_encodings(model, batch, device):
+    """Extract or compute encodings from batch, supporting text-only batches."""
+    enc = batch.get("encoding")
     pair_enc = batch.get("pair_encoding")
     pair_domain_ids = batch.get("pair_domain_id")
+    domain_ids = batch["domain_id"].to(device)
+
+    # Text-only batch (RealPairsDataset / TextHDIMModel)
+    if enc is None and hasattr(model, 'encode_texts'):
+        texts = batch.get("text")
+        pair_texts = batch.get("pair_text")
+        if texts is not None:
+            enc = model.encode_texts(list(texts), device=device).detach()
+        if pair_texts is not None:
+            pair_enc = model.encode_texts(list(pair_texts), device=device).detach()
+    elif enc is not None:
+        enc = enc.to(device)
+        if pair_enc is not None:
+            pair_enc = pair_enc.to(device)
+
+    if pair_domain_ids is not None:
+        pair_domain_ids = pair_domain_ids.to(device)
+
+    return enc, pair_enc, domain_ids, pair_domain_ids
+
+
+def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
+    device = _model_device(model)
+    enc, pair_enc, domain_ids, pair_domain_ids = _get_encodings(model, batch, device)
+
+    if enc is None:
+        # Cannot compute metrics without encodings
+        dummy = torch.zeros(1, device=device)
+        return {"sts_exported": dummy, "sts_training": dummy, "pair_margin": dummy, "routing": dummy}
 
     if pair_enc is None or pair_domain_ids is None:
         _, routing, _, state = model(
@@ -97,8 +125,6 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
             "routing": routing,
         }
 
-    pair_enc = pair_enc.to(device)
-    pair_domain_ids = pair_domain_ids.to(device)
     _, routing, _, src_state = model.transfer_pairs(
         enc,
         domain_ids,
@@ -204,18 +230,13 @@ def compute_all_metrics(
             sts_training_scores.append(batch_metrics["sts_training"].cpu())
 
             # Собираем данные для глобального pair_margin
-            enc = batch.get("encoding")
-            pair_enc = batch.get("pair_encoding")
-            if enc is not None and pair_enc is not None:
-                enc = enc.to(device)
-                pair_enc = pair_enc.to(device)
-                d_ids = batch["domain_id"].to(device)
-                pd_ids = batch["pair_domain_id"].to(device)
+            enc_m, pair_enc_m, d_ids, pd_ids = _get_encodings(model, batch, device)
+            if enc_m is not None and pair_enc_m is not None and pd_ids is not None:
                 _, _, _, src_state = model.transfer_pairs(
-                    enc, d_ids, pd_ids, update_memory=False, memory_mode="retrieve"
+                    enc_m, d_ids, pd_ids, update_memory=False, memory_mode="retrieve"
                 )
                 _, _, _, tgt_state = model(
-                    pair_enc, domain_id=pd_ids, return_state=True, update_memory=False, memory_mode="retrieve"
+                    pair_enc_m, domain_id=pd_ids, return_state=True, update_memory=False, memory_mode="retrieve"
                 )
                 all_src_inv.append(src_state.exported_invariant.cpu())
                 all_tgt_inv.append(tgt_state.exported_invariant.cpu())

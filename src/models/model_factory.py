@@ -8,6 +8,7 @@ Public API
 ----------
 build_hdim_model(cfg)                    -> HDIMModel
 build_text_hdim_model(cfg, ...)          -> TextHDIMModel
+build_sbert_hdim_model(cfg, ...)         -> TextHDIMModel (with frozen SBERT encoder)
 model_from_experiment_config(exp)        -> TextHDIMModel | HDIMModel
 """
 from __future__ import annotations
@@ -81,6 +82,26 @@ def _patch_advanced_encoder(text_model: TextHDIMModel) -> None:
     text_model.text_encoder = new_encoder  # type: ignore[assignment]
 
 
+def _patch_sbert_encoder(
+    text_model: TextHDIMModel,
+    *,
+    model_name: str = "paraphrase-multilingual-mpnet-base-v2",
+    freeze: bool = True,
+    dropout: float = 0.1,
+) -> None:
+    """Replace text_model.text_encoder with frozen SBERTEncoder in-place."""
+    from src.models.sbert_encoder import SBERTEncoder
+
+    core_cfg = text_model.core_model.config
+    new_encoder = SBERTEncoder(
+        output_dim=core_cfg.hidden_dim,
+        model_name=model_name,
+        freeze=freeze,
+        dropout=dropout,
+    )
+    text_model.text_encoder = new_encoder  # type: ignore[assignment]
+
+
 # ---------------------------------------------------------------------------
 # Public factory functions
 # ---------------------------------------------------------------------------
@@ -124,6 +145,49 @@ def build_text_hdim_model(
     return text_model
 
 
+def build_sbert_hdim_model(
+    cfg: HDIMConfig,
+    *,
+    hierarchical_memory: bool = False,
+    soft_router: bool = False,
+    sbert_model_name: str = "paraphrase-multilingual-mpnet-base-v2",
+    freeze_sbert: bool = True,
+    sbert_dropout: float = 0.1,
+) -> TextHDIMModel:
+    """Build a TextHDIMModel with frozen SBERT encoder (Phase 4 modernization).
+
+    Assembly order
+    --------------
+    1. Build HDIMModel(cfg).
+    2. If hierarchical_memory: swap pipeline.memory -> HierarchicalTitansMemory.
+    3. If soft_router:         swap pipeline.moe    -> SoftMoERouter.
+    4. Wrap in TextHDIMModel.
+    5. Swap text_encoder -> frozen SBERTEncoder.
+    6. Return assembled TextHDIMModel.
+
+    Note: cfg.hidden_dim should match SBERT projection target (e.g. 256 or 512).
+    The SBERT encoder projects from 768 → cfg.hidden_dim via trainable MLP.
+    """
+    core_model = HDIMModel(cfg)
+
+    if hierarchical_memory:
+        _patch_hierarchical_memory(core_model)
+
+    if soft_router:
+        _patch_soft_router(core_model)
+
+    text_model = TextHDIMModel(core_model)
+
+    _patch_sbert_encoder(
+        text_model,
+        model_name=sbert_model_name,
+        freeze=freeze_sbert,
+        dropout=sbert_dropout,
+    )
+
+    return text_model
+
+
 def model_from_experiment_config(
     exp: ExperimentConfig,
 ) -> Union[TextHDIMModel, HDIMModel]:
@@ -145,9 +209,16 @@ def model_from_experiment_config(
         or exp.advanced_encoder
         or exp.hierarchical_memory
         or exp.soft_router
+        or getattr(exp, "pretrained_encoder", False)
     )
 
     if needs_text:
+        if getattr(exp, "pretrained_encoder", False):
+            return build_sbert_hdim_model(
+                cfg,
+                hierarchical_memory=exp.hierarchical_memory,
+                soft_router=exp.soft_router,
+            )
         return build_text_hdim_model(
             cfg,
             advanced_encoder=exp.advanced_encoder,

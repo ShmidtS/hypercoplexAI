@@ -140,3 +140,4 @@ AGENTS.md
 context_portal/
 *.pdf
 artifacts/
+data/

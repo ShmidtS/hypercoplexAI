@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.hdim_model import HDIMConfig
 from src.models.metrics import compute_all_metrics
-from src.models.model_factory import build_hdim_model, build_text_hdim_model
+from src.models.model_factory import build_hdim_model, build_text_hdim_model, build_sbert_hdim_model
 from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
@@ -113,6 +113,19 @@ def detect_device(requested: str) -> torch.device:
 
 def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
     """Собирает модель через model_factory — единственный источник истины."""
+    if getattr(args, 'pretrained_encoder', False):
+        model = build_sbert_hdim_model(
+            cfg,
+            hierarchical_memory=args.hierarchical_memory,
+            soft_router=args.soft_router,
+        )
+        print("Components: FrozenSBERT(paraphrase-multilingual-mpnet-base-v2) + projection")
+        if args.hierarchical_memory:
+            print("  + HierarchicalTitansMemory")
+        if args.soft_router:
+            print("  + SoftMoERouter")
+        return model
+
     needs_text = args.text_mode or args.advanced_encoder or args.hierarchical_memory or args.soft_router
     if needs_text:
         model = build_text_hdim_model(
@@ -234,15 +247,12 @@ def run_gpu_training(
         betas=(0.9, 0.999),
     )
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    # CosineAnnealingWarmRestarts: периодически перезапускает LR, помогает выбраться из плохих минимумов
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        max_lr=args.lr,
-        epochs=args.epochs,
-        steps_per_epoch=1,
-        pct_start=min(args.warmup_epochs / max(args.epochs, 1), 0.3),
-        anneal_strategy="cos",
-        div_factor=1e3,
-        final_div_factor=1e2,
+        T_0=max(args.warmup_epochs * 3, 20),  # первый цикл
+        T_mult=2,                              # удваивать цикл каждый раз
+        eta_min=args.lr * 1e-3,               # минимальный LR
     )
 
     use_amp = (device.type == "cuda") and args.amp
@@ -258,34 +268,71 @@ def run_gpu_training(
         lambda_routing=args.lambda_routing,
         lambda_memory=args.lambda_memory,
         ranking_margin=args.ranking_margin,
+        use_infonce=getattr(args, 'use_infonce', True),
+        infonce_temperature=getattr(args, 'infonce_temperature', 0.07),
     )
 
-    dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
-    dataset_kwargs: dict = {
-        "n_samples": args.num_samples,
-        "embed_dim": cfg.hidden_dim,
-        "seed": args.seed,
-    }
-    if args.use_pairs:
-        dataset_kwargs["negative_ratio"] = args.negative_ratio
+    real_pairs_path = getattr(args, 'real_pairs', None)
+    if real_pairs_path:
+        from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
+        augment = getattr(args, 'augment_factor', 8)
+        dataset = load_real_pairs_dataset(real_pairs_path, augment_factor=augment, seed=args.seed)
+        train_ds, val_ds = split_real_pairs(dataset, train_fraction=args.train_fraction, seed=args.seed)
+        metrics_ds = dataset  # use full dataset for metrics
+        print(f"Real pairs dataset: {len(dataset)} total (augment x{augment})")
+    else:
+        dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
+        dataset_kwargs: dict = {
+            "n_samples": args.num_samples,
+            "embed_dim": cfg.hidden_dim,
+            "seed": args.seed,
+        }
+        if args.use_pairs:
+            dataset_kwargs["negative_ratio"] = args.negative_ratio
 
-    dataset = dataset_factory(**dataset_kwargs)
-    train_ds, val_ds = create_group_aware_split(dataset, train_fraction=args.train_fraction, seed=args.seed)
+        dataset = dataset_factory(**dataset_kwargs)
+        train_ds, val_ds = create_group_aware_split(dataset, train_fraction=args.train_fraction, seed=args.seed)
+        metrics_dataset = dataset_factory(**dataset_kwargs)
+        metrics_n = max(64, int(len(metrics_dataset) * (1 - args.train_fraction)))
+        metrics_ds, _ = torch.utils.data.random_split(
+            metrics_dataset,
+            [metrics_n, len(metrics_dataset) - metrics_n],
+            generator=torch.Generator().manual_seed(args.seed + 99),
+        )
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=(device.type == "cuda"))
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"))
-
-    # Metrics loader: random split to ensure both pos/neg pairs in val for pair_margin
-    # Group-aware split may put all negatives in val; random split ensures mixed labels.
-    metrics_dataset = dataset_factory(**dataset_kwargs)
-    metrics_n = max(64, int(len(metrics_dataset) * (1 - args.train_fraction)))
-    metrics_ds, _ = torch.utils.data.random_split(
-        metrics_dataset,
-        [metrics_n, len(metrics_dataset) - metrics_n],
-        generator=torch.Generator().manual_seed(args.seed + 99),
-    )
     metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"))
 
-    print(f"Dataset: {len(train_ds)} train / {len(val_ds)} val / {metrics_n} metrics samples")
+    print(f"Dataset: {len(train_ds)} train / {len(val_ds)} val")
+
+    # Precompute SBERT embeddings cache for frozen encoder (huge speedup)
+    if getattr(args, 'pretrained_encoder', False):
+        import sys as _sys
+        encoder = getattr(model, 'text_encoder', None)
+        if encoder is not None and hasattr(encoder, 'precompute_cache'):
+            print("Precomputing SBERT embeddings cache...", flush=True)
+            all_texts = []
+            # For real dataset, extract from raw pairs JSON
+            real_pairs_path = getattr(args, 'real_pairs', None)
+            if real_pairs_path:
+                import json as _json
+                pairs = _json.loads(open(real_pairs_path).read())
+                for p in pairs:
+                    all_texts.append(p['source_text'])
+                    all_texts.append(p['target_text'])
+            else:
+                for ds_item in [train_ds, val_ds]:
+                    for idx in range(min(len(ds_item), 500)):
+                        try:
+                            item = ds_item[idx]
+                            if 'text' in item and isinstance(item['text'], str):
+                                all_texts.append(item['text'])
+                            if 'pair_text' in item and isinstance(item['pair_text'], str):
+                                all_texts.append(item['pair_text'])
+                        except Exception:
+                            pass
+            encoder.precompute_cache(all_texts)
 
     monitor = GPUTrainingMonitor(
         device,
@@ -293,6 +340,7 @@ def run_gpu_training(
     )
 
     best_score = float("-inf")
+    best_score_epoch = 1
     best_checkpoint = output_dir / "checkpoints" / "best.pt"
     final_checkpoint = output_dir / "checkpoints" / "hdim_final.pt"
     (output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -350,7 +398,16 @@ def run_gpu_training(
 
             if score > best_score:
                 best_score = score
+                best_score_epoch = epoch
                 trainer.save_checkpoint(str(best_checkpoint))
+
+            # Early stopping
+            early_stop_patience = getattr(args, 'early_stopping_patience', 0)
+            if early_stop_patience > 0:
+                evals_since_best = (epoch - best_score_epoch) // args.eval_every
+                if evals_since_best >= early_stop_patience:
+                    print(f"Early stopping: no improvement for {evals_since_best} evals (patience={early_stop_patience})")
+                    break
         else:
             monitor.log_epoch(
                 epoch, args.epochs, train_loss, val_metrics, quality_metrics,
@@ -430,6 +487,22 @@ def main() -> None:
     parser.add_argument("--advanced_encoder", action="store_true")
     parser.add_argument("--hierarchical_memory", action="store_true")
     parser.add_argument("--soft_router", action="store_true")
+    parser.add_argument("--pretrained_encoder", action="store_true",
+                        help="Use frozen SBERT encoder (paraphrase-multilingual-mpnet-base-v2)")
+    # Loss
+    parser.add_argument("--use_infonce", action="store_true", default=True,
+                        help="Use InfoNCE loss instead of ranking margin (default: True)")
+    parser.add_argument("--no_infonce", dest="use_infonce", action="store_false")
+    parser.add_argument("--infonce_temperature", type=float, default=0.07,
+                        help="InfoNCE temperature (default: 0.07)")
+    # Real data
+    parser.add_argument("--real_pairs", type=str, default=None,
+                        help="Path to real_pairs.json for training on real cross-domain pairs")
+    parser.add_argument("--augment_factor", type=int, default=8,
+                        help="Augmentation factor for real pairs dataset")
+    # Early stopping
+    parser.add_argument("--early_stopping_patience", type=int, default=0,
+                        help="Stop if best score not improved for N evals (0=disabled)")
     # Monitoring
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_every", type=int, default=10)

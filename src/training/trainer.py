@@ -30,6 +30,8 @@ class HDIMTrainer:
         lambda_memory: float = 0.05,
         negative_margin: float = 1.0,
         ranking_margin: float = 0.2,
+        use_infonce: bool = True,
+        infonce_temperature: float = 0.07,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -40,6 +42,8 @@ class HDIMTrainer:
         self.lambda_memory = lambda_memory
         self.negative_margin = negative_margin
         self.ranking_margin = ranking_margin
+        self.use_infonce = use_infonce
+        self.infonce_temperature = infonce_temperature
         self._step: int = 0
     def _resolve_training_regime(self, batch: Dict[str, Any]) -> TrainingRegime:
         is_pair_batch = self._has_pairs(batch)
@@ -245,6 +249,54 @@ class HDIMTrainer:
                 else valid_candidates[0]
             )
         return negative_indices
+    def _compute_infonce_loss(
+        self,
+        source_inv: torch.Tensor,
+        target_inv: torch.Tensor,
+        pair_relation_label: torch.Tensor,
+        pair_weight: torch.Tensor,
+        temperature: float = 0.07,
+    ) -> torch.Tensor:
+        """InfoNCE loss (NT-Xent) for positive/negative pair discrimination.
+
+        Использует все негативы в батче одновременно (in-batch negatives),
+        что значительно эффективнее чем pairwise ranking margin.
+        Проверено в SimCLR, CLIP, sentence-transformers.
+
+        Args:
+            source_inv: (B, D) source exported_invariant, L2-normalized
+            target_inv: (B, D) target exported_invariant, L2-normalized
+            pair_relation_label: (B,) 1.0=positive, 0.0=negative
+            pair_weight: (B,) per-sample weights
+            temperature: softmax temperature (меньше = резче границы)
+        Returns:
+            scalar InfoNCE loss
+        """
+        B = source_inv.shape[0]
+        if B < 2:
+            return self._zero_loss(source_inv)
+
+        positive_mask = pair_relation_label > 0.5
+        if not positive_mask.any():
+            return self._zero_loss(source_inv)
+
+        src = F.normalize(source_inv, dim=-1)  # (B, D)
+        tgt = F.normalize(target_inv, dim=-1)  # (B, D)
+
+        # Similarity matrix: (B, B)
+        sim_matrix = src @ tgt.T / temperature
+
+        # InfoNCE: for each positive pair (i,i), treat all other j≠i as negatives
+        # Только для положительных пар считаем loss
+        pos_indices = positive_mask.nonzero(as_tuple=True)[0]
+
+        # Labels: diagonal = self-match for positives
+        labels = torch.arange(B, device=self.device)
+        loss_per_sample = F.cross_entropy(sim_matrix[pos_indices], labels[pos_indices], reduction='none')
+
+        weights = pair_weight[pos_indices]
+        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
+
     def _compute_pair_ranking_loss(
         self,
         exported_invariant: torch.Tensor,
@@ -257,13 +309,28 @@ class HDIMTrainer:
         pair_relation_label = batch.get("pair_relation_label")
         pair_weight = batch.get("pair_weight")
         pair_group_id = self._resolve_pair_group_id(batch)
-        if pair_relation_label is None or pair_weight is None or pair_group_id is None:
+        if pair_relation_label is None or pair_weight is None:
             return self._zero_loss(exported_invariant)
 
         pair_relation_label = pair_relation_label.to(
             self.device, dtype=exported_invariant.dtype
         )
         pair_weight = pair_weight.to(self.device, dtype=exported_invariant.dtype)
+
+        # InfoNCE path (use_infonce=True by default via ranking_margin <= 0)
+        if getattr(self, 'use_infonce', True):
+            return self._compute_infonce_loss(
+                exported_invariant,
+                pair_exported_target,
+                pair_relation_label,
+                pair_weight,
+                temperature=getattr(self, 'infonce_temperature', 0.07),
+            )
+
+        # Legacy ranking margin fallback
+        if pair_group_id is None:
+            return self._zero_loss(exported_invariant)
+
         pair_domain_id = batch["pair_domain_id"].to(self.device)
         domain_id = batch["domain_id"].to(self.device)
 
