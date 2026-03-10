@@ -102,6 +102,35 @@ def _patch_sbert_encoder(
     text_model.text_encoder = new_encoder  # type: ignore[assignment]
 
 
+
+
+def _patch_modular_moe(
+    core_model: HDIMModel,
+    *,
+    routing_type: str = 'soft',
+    expert_hidden_multiplier: int = 2,
+) -> None:
+    """Replace pipeline.moe with ModularMoERouter in-place.
+
+    ModularMoERouter поддерживает динамическое add_expert/remove_expert.
+    Совместим с SoftMoERouter/R3MoERouter по API router_state.
+    """
+    from src.core.modular_moe import build_modular_moe
+
+    pipeline = core_model.pipeline
+    cfg = core_model.config
+    input_dim: int = pipeline.clifford_dim
+    expert_hidden = input_dim * expert_hidden_multiplier
+
+    new_moe = build_modular_moe(
+        input_dim=input_dim,
+        num_experts=cfg.num_experts,
+        top_k=cfg.top_k,
+        routing_type=routing_type,
+        expert_hidden_dim=expert_hidden,
+    )
+    pipeline.moe = new_moe  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Public factory functions
 # ---------------------------------------------------------------------------
@@ -150,6 +179,8 @@ def build_sbert_hdim_model(
     *,
     hierarchical_memory: bool = False,
     soft_router: bool = False,
+    modular_moe: bool = False,
+    modular_moe_routing_type: str = 'soft',
     sbert_model_name: str = "paraphrase-multilingual-mpnet-base-v2",
     freeze_sbert: bool = True,
     sbert_dropout: float = 0.1,
@@ -175,6 +206,9 @@ def build_sbert_hdim_model(
 
     if soft_router:
         _patch_soft_router(core_model)
+
+    if modular_moe:
+        _patch_modular_moe(core_model, routing_type=modular_moe_routing_type)
 
     text_model = TextHDIMModel(core_model)
 

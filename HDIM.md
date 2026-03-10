@@ -1,6 +1,6 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
 ## Архитектурная спецификация — реализуемое прежде всего
-*Версия документа: 6.0 | Дата обновления: 2026-03-11 | Статус: Фаза 6 — активна — рекорд score 0.9745*
+*Версия документа: 7.0 | Дата обновления: 2026-03-11 | Статус: Фаза 7 — активна — рекорд score 0.9745 (Phase 6e)*
 
 ---
 
@@ -1144,3 +1144,93 @@ HDIM следует развивать как **implementable-first research sys
 - **Пессимистичный**: 0.967-0.975 (plateau — текущий лучший Phase5a/6e)
 
 Для прорыва выше 0.985 нужен либо расширенный датасет (300+ пар), либо архитектурное изменение (partial SBERT unfreeze или semantic domain IDs).
+
+---
+
+## 17. Phase 7 — Модульная архитектура + SupCon (2026-03-11)
+
+### 17.1 Реализованные изменения
+
+#### Новые модули
+
+**`src/core/modular_moe.py`** — `ModularMoERouter` с динамическим управлением экспертами:
+- `ExpertConfig(dataclass)` — конфигурация одного эксперта: hidden_dim, dropout, activation, layer_count
+- `ExpertModule(nn.Module)` — конфигурируемый эксперт с 1-3 слоями
+- `ModularMoERouter(nn.Module)` — модульный роутер:
+  - `add_expert(config)` — добавляет эксперта в runtime без перестройки модели
+  - `remove_expert(id)` — удаляет эксперта с переиндексацией
+  - `routing_type='soft'` — SoftMoE (дифференцируемый, без token dropping)
+  - `routing_type='hard'` — Hard top-k с R3 EMA stabilization
+  - Полностью совместим с R3MoERouter/SoftMoERouter (одинаковые router_state ключи)
+  - EMA train_scores buffer пересоздаётся при add/remove
+- `build_modular_moe(input_dim, num_experts, top_k, routing_type)` — быстрая сборка
+
+#### Обновления trainer.py
+- `lambda_supcon: float = 0.0` — новый параметр SupCon loss weight
+- `_compute_supcon_loss(source_inv, target_inv, pair_relation_label, pair_weight, pair_group_id)` — Supervised Contrastive Loss (Khosla et al., NeurIPS 2020):
+  - Для каждого anchor i: P(i) = все j из того же family с label>0.5
+  - L_i = -1/|P(i)| * Σ_{p∈P(i)} log[ exp(sim(i,p)/T) / Σ_{a≠i} exp(sim(i,a)/T) ]
+  - Использует ВСЕ позитивы из семейства, а не только диагональный → более эффективно при аугментации
+
+#### Обновления gpu_train.py
+- `--lambda_supcon` — SupCon loss weight
+- `--scheduler_type {cosine_restarts, cosine_decay, plateau, onecycle}` — выбор scheduler
+- `--modular_moe` — использовать ModularMoERouter вместо SoftMoERouter/R3MoERouter
+- `_build_scheduler(optimizer, args, total_steps)` — фабрика schedulers
+
+#### Датасет v5
+- `data/real_pairs_v5.json`: 175 пар (139 pos + 36 neg, neg ratio 20.6%)
+- +21 новых positive семейств: fractal_branching, percolation_contagion_2, entropy_aging_threshold, topological_barrier_protection, memory_consolidation_eviction, cascade_network_failure, feedback_windup_oscillation, mechanical_electrical_synchronization, adaptive_background_minimization, critical_slowing_warning, hydrodynamic_biological_lubrication, diffusion_limited_branching, winner_takes_all_suppression, hub_essentiality, damage_triggered_repair, countercurrent_exchange_2, oscillator_entrainment, cascade_signal_amplification, elastic_energy_storage_release, turing_pattern_formation, self_organized_criticality_2
+- +13 hard negatives: семантически похожие пары (soliton vs action potential, Kalman vs glomerular filtration, magnetic hysteresis vs LTP, etc.)
+
+#### Интеграция model_factory.py
+- `_patch_modular_moe(core_model, routing_type)` — замена pipeline.moe на ModularMoERouter
+- `build_sbert_hdim_model(..., modular_moe=True, modular_moe_routing_type='soft')` — поддержка флага
+
+### 17.2 Конфигурация Phase 7 (текущий запуск)
+
+```bash
+python scripts/gpu_train.py \
+  --epochs 200 --batch_size 64 --lr 0.0005 \
+  --hidden_dim 256 --num_experts 4 --num_domains 4 \
+  --pretrained_encoder --modular_moe --modular_moe_routing_type soft \
+  --real_pairs data/real_pairs_v5.json --augment_factor 30 \
+  --lambda_iso 0.1 --lambda_pair 0.4 --lambda_sts 0.2 \
+  --lambda_angle 0.3 --lambda_supcon 0.2 \
+  --learnable_temperature --scheduler_type cosine_decay \
+  --eval_every 5 --early_stopping_patience 20 --seed 42
+```
+
+Ключевые отличия от Phase 6e:
+- `ModularMoERouter` вместо `SoftMoERouter` — динамическое управление экспертами
+- `lambda_supcon=0.2` — SupCon loss с family labels
+- `cosine_decay` вместо `cosine_restarts` — монотонное снижение LR, устраняет score-дёрганье
+- `data/real_pairs_v5.json` — 175 пар vs 140 (v4) с hard negatives
+- `batch_size=64` — больше in-batch negatives для InfoNCE/SupCon
+
+### 17.3 Ожидаемый эффект SupCon на dateset с family labels
+
+SupCon преимущество: при батче из 64 семплов модель видит все позитивы из того же семейства одновременно. Для семейства bubble_collapse_destruction (3 пары × aug30 = 90 сэмплов) каждый anchor получает ~2-5 позитивов в одном батче, а не только 1 диагональный.
+
+Математически это эквивалентно InfoNCE с увеличенным effective batch size: если семейство имеет k членов, SupCon использует k-1 позитивов, InfoNCE — только 1. Ожидаемый прирост: +0.01-0.03 на pair_margin.
+
+### 17.4 Модульность экспертов — применение
+
+```python
+from src.core.modular_moe import ModularMoERouter, ExpertConfig, build_modular_moe
+
+# Базовая сборка
+router = build_modular_moe(input_dim=64, num_experts=4, top_k=2, routing_type='soft')
+
+# Добавить специализированного эксперта
+spec_cfg = ExpertConfig(hidden_dim=512, activation='silu', layer_count=3)
+new_id = router.add_expert(spec_cfg)
+
+# Удалить слабого эксперта после анализа usage
+router.remove_expert(worst_id)
+
+# Динамическое масштабирование без переобучения:
+# - Добавить эксперта для нового домена
+# - Удалить неиспользуемых (expert_usage < 0.05)
+# - Всё без перестройки остальных весов
+```

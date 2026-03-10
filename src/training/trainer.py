@@ -34,6 +34,7 @@ class HDIMTrainer:
         infonce_temperature: float = 0.07,
         lambda_sts: float = 0.0,
         lambda_angle: float = 0.0,
+        lambda_supcon: float = 0.0,
         learnable_temperature: bool = False,
     ) -> None:
         self.model = model.to(device)
@@ -49,6 +50,7 @@ class HDIMTrainer:
         self.infonce_temperature = infonce_temperature
         self.lambda_sts = lambda_sts
         self.lambda_angle = lambda_angle
+        self.lambda_supcon = lambda_supcon
         self._step: int = 0
         # Learnable temperature (log-scale for numerical stability)
         import math
@@ -348,6 +350,69 @@ class HDIMTrainer:
         weights = pair_weight[pos_indices]
         return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
 
+
+    def _compute_supcon_loss(
+        self,
+        source_inv: torch.Tensor,
+        target_inv: torch.Tensor,
+        pair_relation_label: torch.Tensor,
+        pair_weight: torch.Tensor,
+        pair_group_id: torch.Tensor,
+    ) -> torch.Tensor:
+        """Supervised Contrastive Loss (Khosla et al., NeurIPS 2020).
+
+        Для каждого anchor i множество позитивов P(i) = все j из того же
+        family (pair_group_id[i]==pair_group_id[j]) с label>0.5.
+        L_SupCon_i = -1/|P(i)| * Σ_{p∈P(i)} log[ exp(sim(i,p)/T) / Σ_{a≠i} exp(sim(i,a)/T) ]
+
+        Преимущества перед InfoNCE: использует ВСЕ позитивы из семейства,
+        не только диагональный, что эффективнее при аугментации.
+        """
+        B = source_inv.shape[0]
+        if B < 2:
+            return self._zero_loss(source_inv)
+
+        positive_mask = pair_relation_label > 0.5
+        if not positive_mask.any():
+            return self._zero_loss(source_inv)
+
+        temp = self._effective_temperature()
+        src = F.normalize(source_inv, dim=-1)   # (B, D)
+        tgt = F.normalize(target_inv, dim=-1)   # (B, D)
+        sim_matrix = src @ tgt.T / temp          # (B, B)
+
+        # Маска позитивов: same group AND positive label
+        group_match = (pair_group_id.unsqueeze(0) == pair_group_id.unsqueeze(1))  # (B, B)
+        label_pos   = positive_mask.unsqueeze(1).expand(B, B)                     # (B, B)
+        pos_mask    = group_match & label_pos                                       # (B, B)
+        # Исключаем диагональ (anchor = себя)
+        pos_mask.fill_diagonal_(False)
+
+        # Знаменатель: все a ≠ i
+        eye = torch.eye(B, dtype=torch.bool, device=self.device)
+        denom_mask = ~eye  # (B, B)
+
+        log_denom = torch.logsumexp(sim_matrix.masked_fill(eye, -3e4), dim=-1)  # safe for fp16
+
+        losses = []
+        weights = []
+        for i in range(B):
+            p_idx = pos_mask[i].nonzero(as_tuple=True)[0]  # индексы позитивов
+            if p_idx.numel() == 0:
+                continue
+            # -1/|P(i)| * Σ_p [sim(i,p)/T - log_denom]
+            pos_sims = sim_matrix[i, p_idx]  # (|P(i)|,)
+            loss_i = -(pos_sims - log_denom[i]).mean()
+            losses.append(loss_i)
+            weights.append(pair_weight[i])
+
+        if not losses:
+            return self._zero_loss(source_inv)
+
+        loss_tensor = torch.stack(losses)       # (N,)
+        weight_tensor = torch.stack(weights).to(source_inv.dtype)  # (N,)
+        return (loss_tensor * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-8)
+
     def _compute_pair_ranking_loss(
         self,
         exported_invariant: torch.Tensor,
@@ -379,6 +444,8 @@ class HDIMTrainer:
                 temperature=temp,
             )
             # AnglE loss поверх InfoNCE (если включён)
+            # AnglE loss
+            total_loss = infonce
             if getattr(self, 'lambda_angle', 0.0) > 0:
                 angle = self._compute_angle_loss(
                     exported_invariant,
@@ -386,8 +453,18 @@ class HDIMTrainer:
                     pair_relation_label,
                     pair_weight,
                 )
-                return infonce + self.lambda_angle * angle
-            return infonce
+                total_loss = total_loss + self.lambda_angle * angle
+            # SupCon loss (Supervised Contrastive, если group_id доступен)
+            if getattr(self, 'lambda_supcon', 0.0) > 0 and pair_group_id is not None:
+                supcon = self._compute_supcon_loss(
+                    exported_invariant,
+                    pair_exported_target,
+                    pair_relation_label,
+                    pair_weight,
+                    pair_group_id,
+                )
+                total_loss = total_loss + self.lambda_supcon * supcon
+            return total_loss
 
         # Legacy ranking margin fallback
         if pair_group_id is None:

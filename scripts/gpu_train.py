@@ -118,6 +118,8 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             cfg,
             hierarchical_memory=args.hierarchical_memory,
             soft_router=args.soft_router,
+            modular_moe=getattr(args, 'modular_moe', False),
+            modular_moe_routing_type=getattr(args, 'modular_moe_routing_type', 'soft'),
         )
         print("Components: FrozenSBERT(paraphrase-multilingual-mpnet-base-v2) + projection")
         if args.hierarchical_memory:
@@ -226,6 +228,56 @@ class GPUTrainingMonitor:
         }
 
 
+
+def _build_scheduler(optimizer, args, total_steps: int):
+    """Выбирает LR scheduler по args.scheduler_type.
+
+    - cosine_restarts: CosineAnnealingWarmRestarts — периодические рестарты LR
+      (хорошо для многомодальных loss landscapes, риск дёрганья метрик)
+    - cosine_decay: CosineAnnealingLR — монотонное снижение до eta_min
+      (стабильнее, лучше если есть early stopping)
+    - plateau: ReduceLROnPlateau — снижение при стагнации val_score
+      (адаптивный, вызывать scheduler.step(score) вместо scheduler.step())
+    - onecycle: OneCycleLR — warmup + decay за один цикл
+      (быстрая сходимость, хорошо для малого числа эпох)
+    """
+    stype = getattr(args, "scheduler_type", "cosine_restarts")
+    lr = args.lr
+    epochs = args.epochs
+
+    if stype == "cosine_restarts":
+        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=max(getattr(args, "warmup_epochs", 3) * 3, 20),
+            T_mult=2,
+            eta_min=lr * 1e-3,
+        ), False  # (scheduler, needs_score)
+    elif stype == "cosine_decay":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs,
+            eta_min=lr * 1e-3,
+        ), False
+    elif stype == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=10,
+            min_lr=lr * 1e-3,
+        ), True  # needs_score=True: вызывать step(score)
+    elif stype == "onecycle":
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr * 3,
+            total_steps=total_steps,
+            pct_start=0.1,
+            anneal_strategy="cos",
+        ), False
+    else:
+        raise ValueError(f"Unknown scheduler_type: {stype}")
+
+
 def run_gpu_training(
     cfg: HDIMConfig,
     args: argparse.Namespace,
@@ -247,13 +299,9 @@ def run_gpu_training(
         betas=(0.9, 0.999),
     )
 
-    # CosineAnnealingWarmRestarts: периодически перезапускает LR, помогает выбраться из плохих минимумов
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=max(args.warmup_epochs * 3, 20),  # первый цикл
-        T_mult=2,                              # удваивать цикл каждый раз
-        eta_min=args.lr * 1e-3,               # минимальный LR
-    )
+    total_steps = args.epochs * max(1, getattr(args, 'num_samples', 500) // args.batch_size)
+    scheduler, scheduler_needs_score = _build_scheduler(optimizer, args, total_steps)
+    print(f"Scheduler: {getattr(args, 'scheduler_type', 'cosine_restarts')}")
 
     use_amp = (device.type == "cuda") and args.amp
     scaler = GradScaler("cuda") if use_amp else None
@@ -272,6 +320,7 @@ def run_gpu_training(
         infonce_temperature=getattr(args, 'infonce_temperature', 0.07),
         lambda_sts=getattr(args, 'lambda_sts', 0.0),
         lambda_angle=getattr(args, 'lambda_angle', 0.0),
+        lambda_supcon=getattr(args, 'lambda_supcon', 0.0),
         learnable_temperature=getattr(args, 'learnable_temperature', False),
     )
     # Add learnable temperature to optimizer if enabled
@@ -389,8 +438,17 @@ def run_gpu_training(
                     raise
 
         train_loss = epoch_loss / max(n_batches, 1)
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+        if scheduler_needs_score:
+            # ReduceLROnPlateau: нужен score (лучше вызывать после eval)
+            _sched_score = compute_primary_score(quality_metrics) if quality_metrics.get("pair_margin", 0) > 0 else 0.0
+            scheduler.step(_sched_score)
+            current_lr = optimizer.param_groups[0]["lr"]
+        else:
+            scheduler.step()
+            try:
+                current_lr = scheduler.get_last_lr()[0]
+            except Exception:
+                current_lr = optimizer.param_groups[0]["lr"]
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val_metrics = trainer.validate(val_loader)
@@ -494,6 +552,11 @@ def main() -> None:
     parser.add_argument("--advanced_encoder", action="store_true")
     parser.add_argument("--hierarchical_memory", action="store_true")
     parser.add_argument("--soft_router", action="store_true")
+    parser.add_argument("--modular_moe", action="store_true", default=False,
+                        help="Use ModularMoERouter (динамическое добавление экспертов)")
+    parser.add_argument("--modular_moe_routing_type", default="soft",
+                        choices=["soft", "hard"],
+                        help="ModularMoERouter routing type (default: soft)")
     parser.add_argument("--pretrained_encoder", action="store_true",
                         help="Use frozen SBERT encoder (paraphrase-multilingual-mpnet-base-v2)")
     # Loss
@@ -515,6 +578,11 @@ def main() -> None:
     # Phase 5 additions
     parser.add_argument("--lambda_angle", type=float, default=0.0,
                         help="AnglE loss weight (0=off, try 0.3-0.5)")
+    parser.add_argument("--lambda_supcon", type=float, default=0.0,
+                        help="SupCon loss weight (Supervised Contrastive, нужен pair_group_id, try 0.1-0.5)")
+    parser.add_argument("--scheduler_type", default="cosine_restarts",
+                        choices=["cosine_restarts", "cosine_decay", "plateau", "onecycle"],
+                        help="LR scheduler type (default: cosine_restarts)")
     parser.add_argument("--learnable_temperature", action="store_true", default=False,
                         help="Use learnable InfoNCE temperature (log-parameterized)")
     # Monitoring
