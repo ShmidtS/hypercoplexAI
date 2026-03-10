@@ -32,6 +32,7 @@ class HDIMTrainer:
         ranking_margin: float = 0.2,
         use_infonce: bool = True,
         infonce_temperature: float = 0.07,
+        lambda_sts: float = 0.0,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -44,6 +45,7 @@ class HDIMTrainer:
         self.ranking_margin = ranking_margin
         self.use_infonce = use_infonce
         self.infonce_temperature = infonce_temperature
+        self.lambda_sts = lambda_sts
         self._step: int = 0
     def _resolve_training_regime(self, batch: Dict[str, Any]) -> TrainingRegime:
         is_pair_batch = self._has_pairs(batch)
@@ -496,12 +498,27 @@ class HDIMTrainer:
         pair_relation_label = batch.get("pair_relation_label")
         pair_weight = batch.get("pair_weight")
         loss_memory = aux_state.memory_loss
+        # STS regularization: поддерживаем косинусное сходство позитивных пар
+        # iso_target содержит training_invariant пары — используем как proxy
+        loss_sts = self._zero_loss(training_invariant)
+        if self.lambda_sts > 0 and self._has_pairs(batch):
+            _prl = batch.get("pair_relation_label")
+            if _prl is not None:
+                _pos_mask = (_prl.to(self.device) > 0.5)
+                if _pos_mask.any():
+                    # training_invariant и iso_target — одинаковая размерность
+                    src_norm = F.normalize(training_invariant[_pos_mask], dim=-1)
+                    tgt_norm = F.normalize(iso_target[_pos_mask], dim=-1)
+                    cos_sim = (src_norm * tgt_norm).sum(dim=-1)
+                    loss_sts = (1.0 - cos_sim).mean()
+
         loss_total = (
             loss_recon
             + self.lambda_iso * loss_iso
             + self.lambda_pair * loss_pair
             + self.lambda_routing * loss_routing
             + self.lambda_memory * loss_memory
+            + self.lambda_sts * loss_sts
         )
         batch_losses = {
             "loss_total": loss_total,

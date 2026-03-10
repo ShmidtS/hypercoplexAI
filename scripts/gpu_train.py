@@ -270,6 +270,7 @@ def run_gpu_training(
         ranking_margin=args.ranking_margin,
         use_infonce=getattr(args, 'use_infonce', True),
         infonce_temperature=getattr(args, 'infonce_temperature', 0.07),
+        lambda_sts=getattr(args, 'lambda_sts', 0.0),
     )
 
     real_pairs_path = getattr(args, 'real_pairs', None)
@@ -490,6 +491,8 @@ def main() -> None:
     parser.add_argument("--pretrained_encoder", action="store_true",
                         help="Use frozen SBERT encoder (paraphrase-multilingual-mpnet-base-v2)")
     # Loss
+    parser.add_argument("--lambda_sts", type=float, default=0.0,
+                        help="STS regularization weight (cosine similarity preservation, default 0=off)")
     parser.add_argument("--use_infonce", action="store_true", default=True,
                         help="Use InfoNCE loss instead of ranking margin (default: True)")
     parser.add_argument("--no_infonce", dest="use_infonce", action="store_false")
