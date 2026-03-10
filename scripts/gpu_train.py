@@ -402,12 +402,12 @@ def run_gpu_training(
                 best_score_epoch = epoch
                 trainer.save_checkpoint(str(best_checkpoint))
 
-            # Early stopping
+            # Early stopping — вне блока if score > best_score
             early_stop_patience = getattr(args, 'early_stopping_patience', 0)
-            if early_stop_patience > 0:
+            if early_stop_patience > 0 and best_score_epoch > 0:
                 evals_since_best = (epoch - best_score_epoch) // args.eval_every
                 if evals_since_best >= early_stop_patience:
-                    print(f"Early stopping: no improvement for {evals_since_best} evals (patience={early_stop_patience})")
+                    print(f"Early stopping: no improvement for {evals_since_best} evals (best ep={best_score_epoch}, patience={early_stop_patience})")
                     break
         else:
             monitor.log_epoch(
