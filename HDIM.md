@@ -1,6 +1,6 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
 ## Архитектурная спецификация — реализуемое прежде всего
-*Версия документа: 7.0 | Дата обновления: 2026-03-11 | Статус: Фаза 7 — активна — рекорд score 0.9745 (Phase 6e)*
+*Версия документа: 8.0 | Дата обновления: 2026-03-11 | Статус: Фаза 8 — активна — рекорд score 0.9745 (Phase 6e) | Phase 8 = ModularMoE + SBERT + критические баги исправлены*
 
 ---
 
@@ -1234,3 +1234,106 @@ router.remove_expert(worst_id)
 # - Удалить неиспользуемых (expert_usage < 0.05)
 # - Всё без перестройки остальных весов
 ```
+
+## 18. Phase 8 — Исправления ModularMoE + SBERT + Полная модульность (2026-03-11)
+
+### 18.1 Критические баги, исправленные в Phase 8
+
+#### БАГ 1: Хардкод `config.num_experts` в `_allocate_state_tensors`
+```python
+# БЫЛО (сломано с ModularMoERouter):
+routing_weights = torch.empty(batch_size, self.config.num_experts, ...)
+topk_idx = torch.empty(batch_size, self.config.top_k, ...)
+
+# СТАЛО (динамически читает из роутера):
+_num_experts = self.pipeline.moe.num_experts
+_top_k = self.pipeline.moe.top_k
+routing_weights = torch.empty(batch_size, _num_experts, ...)
+topk_idx = torch.empty(batch_size, _top_k, ...)
+```
+Файл: `src/models/hdim_model.py` — методы `_allocate_state_tensors`, `forward`, `transfer_pairs`
+
+#### БАГ 2: `reset_memory` хардкодил R3MoERouter API
+```python
+# БЫЛО:
+self.pipeline.moe.train_scores.fill_(1.0 / self.config.num_experts)  # AttributeError!
+
+# СТАЛО:
+if hasattr(self.pipeline.moe, 'train_scores'):
+    n = self.pipeline.moe.num_experts
+    self.pipeline.moe.train_scores.fill_(1.0 / n)
+```
+
+#### БАГ 3: `build_text_hdim_model` не поддерживал `modular_moe`
+```python
+# СТАЛО:
+def build_text_hdim_model(cfg, *, advanced_encoder=False, hierarchical_memory=False,
+                          soft_router=False, modular_moe=False, modular_moe_routing_type='soft'):
+    ...
+    if modular_moe:
+        _patch_modular_moe(core_model, routing_type=modular_moe_routing_type)
+```
+Файл: `src/models/model_factory.py`
+
+#### БАГ 4: `_build_model` в `gpu_train.py` не передавал `modular_moe` в text path
+```python
+# СТАЛО:
+needs_text = args.text_mode or ... or getattr(args, 'modular_moe', False)
+if needs_text:
+    model = build_text_hdim_model(
+        cfg, ...,
+        modular_moe=getattr(args, 'modular_moe', False),
+        modular_moe_routing_type=getattr(args, 'modular_moe_routing_type', 'soft'),
+    )
+```
+
+**Причина регрессии Phase 7→6e**: BAG 3 означал что `--modular_moe` при использовании с SBERT путём не применялся к text path, а Phase 7 скорее всего запускался без `--pretrained_encoder` или с несовместимой конфигурацией.
+
+### 18.2 Конфигурация Phase 8 (текущий запуск)
+
+```bash
+python scripts/gpu_train.py \
+  --epochs 150 --batch_size 64 --lr 0.0005 --seed 77 \
+  --hidden_dim 256 --num_experts 4 --num_domains 4 \
+  --pretrained_encoder \
+  --modular_moe --modular_moe_routing_type soft \
+  --real_pairs data/real_pairs_v5.json --augment_factor 30 \
+  --lambda_iso 0.1 --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3 \
+  --lambda_routing 0.05 --lambda_memory 0.01 \
+  --use_infonce --infonce_temperature 0.1 \
+  --learnable_temperature \
+  --early_stopping_patience 20 \
+  --scheduler_type cosine_decay \
+  --eval_every 5 --save_every 25 \
+  --output_dir artifacts/phase8_modular_sbert
+```
+
+Ключевые отличия от Phase 6e:
+- `ModularMoERouter` вместо SoftMoERouter/R3MoERouter (баги исправлены)
+- `data/real_pairs_v5.json` — 175 пар (139 pos + 36 neg) vs v4: 140 пар
+- `cosine_decay` (монотонное снижение, устраняет score-дёрганье второго цикла)
+- `seed=77` (такой же как Phase 6e рекорд)
+
+### 18.3 Возможности модульности экспертов (Phase 8+)
+
+Phase 8 открывает новые режимы работы:
+
+```python
+from src.core.modular_moe import ModularMoERouter, ExpertConfig
+
+# Добавить специализированного эксперта для нового домена
+spec_cfg = ExpertConfig(hidden_dim=512, activation='silu', layer_count=3, use_residual=True)
+new_id = model.core_model.pipeline.moe.add_expert(spec_cfg)
+
+# Удалить неиспользуемых экспертов (expert_usage < 5%)
+usage = model.core_model.pipeline.moe._ema_scores
+for idx in range(model.core_model.pipeline.moe.num_experts - 1, -1, -1):
+    if usage[idx] < 0.05 and model.core_model.pipeline.moe.num_experts > 2:
+        model.core_model.pipeline.moe.remove_expert(idx)
+
+# Можно добавлять любое количество экспертов без перестройки модели
+# Роутер автоматически пересоздаётся с сохранением весов существующих экспертов
+```
+
+EOF
+echo 'Phase 8 section added'

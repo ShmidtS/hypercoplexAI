@@ -252,21 +252,23 @@ class HDIMModel(nn.Module):
             device=device,
             dtype=dtype,
         )
+        _num_experts = self.pipeline.moe.num_experts
+        _top_k = self.pipeline.moe.top_k
         routing_weights = torch.empty(
             batch_size,
-            self.config.num_experts,
+            _num_experts,
             device=device,
             dtype=dtype,
         )
         topk_idx = torch.empty(
             batch_size,
-            self.config.top_k,
+            _top_k,
             device=device,
             dtype=torch.long,
         )
         topk_gate_weights = torch.empty(
             batch_size,
-            self.config.top_k,
+            _top_k,
             device=device,
             dtype=dtype,
         )
@@ -315,13 +317,14 @@ class HDIMModel(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
+        _num_experts_fwd = self.pipeline.moe.num_experts
         train_scores_snapshot = torch.empty(
-            self.config.num_experts,
+            _num_experts_fwd,
             device=x.device,
             dtype=x.dtype,
         )
         expert_usage = torch.empty(
-            self.config.num_experts,
+            _num_experts_fwd,
             device=x.device,
             dtype=x.dtype,
         )
@@ -412,11 +415,38 @@ class HDIMModel(nn.Module):
             return output, aux_state
         return output
 
+    def add_domain(self, domain_name: str) -> None:
+        """Add a new domain rotor to the pipeline in runtime.
+
+        pipeline.add_domain appends to pipeline.domain_names which is the
+        same list object as self._domain_names (shared reference from __init__).
+
+        Args:
+            domain_name: unique name for the new domain.
+        """
+        self.pipeline.add_domain(domain_name)
+        # _domain_names is the same list object as pipeline.domain_names
+        # so no separate append needed
+
+    def remove_domain(self, domain_name: str) -> None:
+        """Remove a domain from the pipeline.
+
+        Args:
+            domain_name: name of the domain to remove.
+        """
+        if domain_name not in self._domain_names:
+            raise KeyError(f"Domain '{domain_name}' not found.")
+        self.pipeline.remove_domain(domain_name)
+        # pipeline.remove_domain already removes from pipeline.domain_names
+        # which is the same list as self._domain_names
+
     def reset_memory(self) -> None:
         """Reset stateful HDIM memory and router replay state."""
         self.pipeline.reset_memory()
         with torch.no_grad():
-            self.pipeline.moe.train_scores.fill_(1.0 / self.config.num_experts)
+            if hasattr(self.pipeline.moe, 'train_scores'):
+                n = self.pipeline.moe.num_experts
+                self.pipeline.moe.train_scores.fill_(1.0 / n)
 
     def transfer_pairs(
         self,
@@ -448,13 +478,14 @@ class HDIMModel(nn.Module):
             device=source_encoding.device,
             dtype=source_encoding.dtype,
         )
+        _num_experts_tp = self.pipeline.moe.num_experts
         train_scores_snapshot = torch.empty(
-            self.config.num_experts,
+            _num_experts_tp,
             device=source_encoding.device,
             dtype=source_encoding.dtype,
         )
         expert_usage = torch.empty(
-            self.config.num_experts,
+            _num_experts_tp,
             device=source_encoding.device,
             dtype=source_encoding.dtype,
         )

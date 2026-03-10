@@ -146,6 +146,8 @@ def build_text_hdim_model(
     advanced_encoder: bool = False,
     hierarchical_memory: bool = False,
     soft_router: bool = False,
+    modular_moe: bool = False,
+    modular_moe_routing_type: str = 'soft',
 ) -> TextHDIMModel:
     """Build a TextHDIMModel, optionally with Phase-2 advanced components.
 
@@ -154,9 +156,10 @@ def build_text_hdim_model(
     1. Build HDIMModel(cfg).
     2. If hierarchical_memory: swap pipeline.memory -> HierarchicalTitansMemory.
     3. If soft_router:         swap pipeline.moe    -> SoftMoERouter.
-    4. Wrap in TextHDIMModel.
-    5. If advanced_encoder:    swap text_encoder    -> AdvancedTextEncoder.
-    6. Return the assembled TextHDIMModel.
+    4. If modular_moe:         swap pipeline.moe    -> ModularMoERouter.
+    5. Wrap in TextHDIMModel.
+    6. If advanced_encoder:    swap text_encoder    -> AdvancedTextEncoder.
+    7. Return the assembled TextHDIMModel.
     """
     core_model = HDIMModel(cfg)
 
@@ -165,6 +168,9 @@ def build_text_hdim_model(
 
     if soft_router:
         _patch_soft_router(core_model)
+
+    if modular_moe:
+        _patch_modular_moe(core_model, routing_type=modular_moe_routing_type)
 
     text_model = TextHDIMModel(core_model)
 

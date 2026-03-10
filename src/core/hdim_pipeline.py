@@ -282,6 +282,34 @@ class HDIMPipeline(nn.Module):
         """Алиас для transfer()."""
         return self.transfer(x, source_domain, target_domain, **kwargs)
 
+    def add_domain(self, domain_name: str) -> None:
+        """Добавляет новый домен в pipeline в runtime.
+
+        Args:
+            domain_name: уникальное имя нового домена.
+        """
+        if domain_name in self.domain_rotors:
+            raise ValueError(f"Domain '{domain_name}' already exists.")
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        new_rotor = DomainRotationOperator(self.algebra, domain_name=domain_name)
+        new_rotor = new_rotor.to(device=device, dtype=dtype)
+        self.domain_rotors[domain_name] = new_rotor
+        self.domain_names.append(domain_name)
+
+    def remove_domain(self, domain_name: str) -> None:
+        """Удаляет домен из pipeline.
+
+        Args:
+            domain_name: имя домена для удаления.
+        """
+        if domain_name not in self.domain_rotors:
+            raise KeyError(f"Domain '{domain_name}' not found.")
+        if len(self.domain_names) <= 2:
+            raise RuntimeError("Cannot remove domain: at least 2 domains required.")
+        del self.domain_rotors[domain_name]
+        self.domain_names.remove(domain_name)
+
     def reset_memory(self) -> None:
         """Сбрасывает stateful память перед новым экспериментом."""
         self.memory.reset_memory()

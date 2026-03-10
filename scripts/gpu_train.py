@@ -128,13 +128,15 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             print("  + SoftMoERouter")
         return model
 
-    needs_text = args.text_mode or args.advanced_encoder or args.hierarchical_memory or args.soft_router
+    needs_text = args.text_mode or args.advanced_encoder or args.hierarchical_memory or args.soft_router or getattr(args, 'modular_moe', False)
     if needs_text:
         model = build_text_hdim_model(
             cfg,
             advanced_encoder=args.advanced_encoder,
             hierarchical_memory=args.hierarchical_memory,
             soft_router=args.soft_router,
+            modular_moe=getattr(args, 'modular_moe', False),
+            modular_moe_routing_type=getattr(args, 'modular_moe_routing_type', 'soft'),
         )
         components = []
         if args.advanced_encoder:
@@ -143,6 +145,8 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             components.append("HierarchicalTitansMemory")
         if args.soft_router:
             components.append("SoftMoERouter")
+        if getattr(args, 'modular_moe', False):
+            components.append(f"ModularMoERouter({getattr(args, 'modular_moe_routing_type', 'soft')})")
         if components:
             print(f"Components: {', '.join(components)}")
         return model
