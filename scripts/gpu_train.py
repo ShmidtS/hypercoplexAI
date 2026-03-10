@@ -271,7 +271,13 @@ def run_gpu_training(
         use_infonce=getattr(args, 'use_infonce', True),
         infonce_temperature=getattr(args, 'infonce_temperature', 0.07),
         lambda_sts=getattr(args, 'lambda_sts', 0.0),
+        lambda_angle=getattr(args, 'lambda_angle', 0.0),
+        learnable_temperature=getattr(args, 'learnable_temperature', False),
     )
+    # Add learnable temperature to optimizer if enabled
+    if getattr(args, 'learnable_temperature', False) and trainer._log_temp is not None:
+        optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * 0.1})
+        print(f"Learnable temperature enabled (init={trainer._log_temp.exp().item():.4f})")
 
     real_pairs_path = getattr(args, 'real_pairs', None)
     if real_pairs_path:
@@ -506,6 +512,11 @@ def main() -> None:
     # Early stopping
     parser.add_argument("--early_stopping_patience", type=int, default=0,
                         help="Stop if best score not improved for N evals (0=disabled)")
+    # Phase 5 additions
+    parser.add_argument("--lambda_angle", type=float, default=0.0,
+                        help="AnglE loss weight (0=off, try 0.3-0.5)")
+    parser.add_argument("--learnable_temperature", action="store_true", default=False,
+                        help="Use learnable InfoNCE temperature (log-parameterized)")
     # Monitoring
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_every", type=int, default=10)

@@ -33,6 +33,8 @@ class HDIMTrainer:
         use_infonce: bool = True,
         infonce_temperature: float = 0.07,
         lambda_sts: float = 0.0,
+        lambda_angle: float = 0.0,
+        learnable_temperature: bool = False,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -46,7 +48,16 @@ class HDIMTrainer:
         self.use_infonce = use_infonce
         self.infonce_temperature = infonce_temperature
         self.lambda_sts = lambda_sts
+        self.lambda_angle = lambda_angle
         self._step: int = 0
+        # Learnable temperature (log-scale for numerical stability)
+        import math
+        if learnable_temperature:
+            self._log_temp = nn.Parameter(
+                torch.tensor(math.log(infonce_temperature), device=torch.device(device))
+            )
+        else:
+            self._log_temp = None
     def _resolve_training_regime(self, batch: Dict[str, Any]) -> TrainingRegime:
         is_pair_batch = self._has_pairs(batch)
         return TrainingRegime(
@@ -251,6 +262,44 @@ class HDIMTrainer:
                 else valid_candidates[0]
             )
         return negative_indices
+    def _effective_temperature(self) -> float:
+        """Возвращает эффективную температуру (обучаемую или фиксированную)."""
+        if self._log_temp is not None:
+            return float(self._log_temp.exp().clamp(0.01, 0.5).item())
+        return self.infonce_temperature
+
+    def _compute_angle_loss(
+        self,
+        source_inv: torch.Tensor,
+        target_inv: torch.Tensor,
+        pair_relation_label: torch.Tensor,
+        pair_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """AnglE Loss: работает в угловом пространстве, избегает насыщения косинуса.
+
+        Li & Li (2023) — AnglE-optimized Text Embeddings.
+        Для позитивных пар: angle → 0 (cos → 1).
+        Для негативных пар: angle → π/2 (cos → 0).
+        """
+        import math
+        B = source_inv.shape[0]
+        if B < 2:
+            return self._zero_loss(source_inv)
+
+        src = F.normalize(source_inv, dim=-1)
+        tgt = F.normalize(target_inv, dim=-1)
+        cos_sim = (src * tgt).sum(dim=-1).clamp(-1 + 1e-6, 1 - 1e-6)  # [B]
+
+        # Угол в [0, 1]: 0=идентичные, 1=ортогональные
+        angle = torch.acos(cos_sim) * 2 / math.pi  # [B]
+
+        # Позитивные: angle → 0, негативные: angle → 1
+        target_angle = 1.0 - pair_relation_label  # [B]
+
+        loss_per_sample = (angle - target_angle).pow(2)
+        weights = pair_weight.to(source_inv.device, dtype=source_inv.dtype)
+        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
+
     def _compute_infonce_loss(
         self,
         source_inv: torch.Tensor,
@@ -321,13 +370,24 @@ class HDIMTrainer:
 
         # InfoNCE path (use_infonce=True by default via ranking_margin <= 0)
         if getattr(self, 'use_infonce', True):
-            return self._compute_infonce_loss(
+            temp = self._effective_temperature()
+            infonce = self._compute_infonce_loss(
                 exported_invariant,
                 pair_exported_target,
                 pair_relation_label,
                 pair_weight,
-                temperature=getattr(self, 'infonce_temperature', 0.07),
+                temperature=temp,
             )
+            # AnglE loss поверх InfoNCE (если включён)
+            if getattr(self, 'lambda_angle', 0.0) > 0:
+                angle = self._compute_angle_loss(
+                    exported_invariant,
+                    pair_exported_target,
+                    pair_relation_label,
+                    pair_weight,
+                )
+                return infonce + self.lambda_angle * angle
+            return infonce
 
         # Legacy ranking margin fallback
         if pair_group_id is None:
