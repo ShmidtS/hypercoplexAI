@@ -114,14 +114,22 @@ def detect_device(requested: str) -> torch.device:
 def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
     """Собирает модель через model_factory — единственный источник истины."""
     if getattr(args, 'pretrained_encoder', False):
+        unfreeze_layers = None
+        _unfreeze_str = getattr(args, 'unfreeze_sbert_layers', None)
+        if _unfreeze_str:
+            unfreeze_layers = [s.strip() for s in _unfreeze_str.split(',') if s.strip()]
         model = build_sbert_hdim_model(
             cfg,
             hierarchical_memory=args.hierarchical_memory,
             soft_router=args.soft_router,
             modular_moe=getattr(args, 'modular_moe', False),
             modular_moe_routing_type=getattr(args, 'modular_moe_routing_type', 'soft'),
+            unfreeze_layers=unfreeze_layers,
+            projection_hidden=getattr(args, 'sbert_projection_hidden', None),
         )
-        print("Components: FrozenSBERT(paraphrase-multilingual-mpnet-base-v2) + projection")
+        print("Components: SBERT(paraphrase-multilingual-mpnet-base-v2) + GatedProjection")
+        if unfreeze_layers:
+            print(f"  + Partial SBERT unfreeze: {unfreeze_layers}")
         if args.hierarchical_memory:
             print("  + HierarchicalTitansMemory")
         if args.soft_router:
@@ -296,8 +304,30 @@ def run_gpu_training(
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
+    # Build param groups: separate LR for unfrozen SBERT layers
+    _unfreeze_str = getattr(args, 'unfreeze_sbert_layers', None)
+    _sbert_lr = getattr(args, 'sbert_lr', 1e-5)
+    if _unfreeze_str and hasattr(model, 'text_encoder') and hasattr(model.text_encoder, '_sbert'):
+        sbert_params = []
+        other_params = []
+        sbert_encoder = model.text_encoder
+        unfreeze_layers = [s.strip() for s in _unfreeze_str.split(',') if s.strip()]
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'text_encoder._sbert' in name and any(layer in name for layer in unfreeze_layers):
+                sbert_params.append(param)
+            else:
+                other_params.append(param)
+        param_groups = [
+            {'params': other_params, 'lr': args.lr, 'weight_decay': 1e-4},
+            {'params': sbert_params, 'lr': _sbert_lr, 'weight_decay': 1e-2},
+        ]
+        print(f"Optimizer: {len(other_params)} HDIM params (lr={args.lr}), {len(sbert_params)} SBERT params (lr={_sbert_lr})")
+    else:
+        param_groups = model.parameters()
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=args.lr,
         weight_decay=1e-4,
         betas=(0.9, 0.999),
@@ -327,6 +357,10 @@ def run_gpu_training(
         lambda_supcon=getattr(args, 'lambda_supcon', 0.0),
         learnable_temperature=getattr(args, 'learnable_temperature', False),
     )
+    # Attach hard negative mining flag
+    trainer.use_hard_negatives = getattr(args, 'use_hard_negatives', False)
+    if trainer.use_hard_negatives:
+        print("Hard Negative Mining: ENABLED")
     # Add learnable temperature to optimizer if enabled
     if getattr(args, 'learnable_temperature', False) and trainer._log_temp is not None:
         optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * 0.1})
@@ -563,6 +597,14 @@ def main() -> None:
                         help="ModularMoERouter routing type (default: soft)")
     parser.add_argument("--pretrained_encoder", action="store_true",
                         help="Use frozen SBERT encoder (paraphrase-multilingual-mpnet-base-v2)")
+    parser.add_argument("--unfreeze_sbert_layers", type=str, default=None,
+                        help="Comma-separated SBERT layer names to unfreeze (e.g. '10,11,pooling')")
+    parser.add_argument("--sbert_projection_hidden", type=int, default=None,
+                        help="Hidden dim for SBERT projection MLP (default: max(hidden_dim, 384))")
+    parser.add_argument("--use_hard_negatives", action="store_true", default=False,
+                        help="Enable online hard negative mining in InfoNCE loss")
+    parser.add_argument("--sbert_lr", type=float, default=1e-5,
+                        help="LR for unfrozen SBERT layers (default: 1e-5)")
     # Loss
     parser.add_argument("--lambda_sts", type=float, default=0.0,
                         help="STS regularization weight (cosine similarity preservation, default 0=off)")

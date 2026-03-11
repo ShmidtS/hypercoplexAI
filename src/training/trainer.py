@@ -302,6 +302,39 @@ class HDIMTrainer:
         weights = pair_weight.to(source_inv.device, dtype=source_inv.dtype)
         return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
 
+    def _mine_hard_negatives(
+        self,
+        source_inv: torch.Tensor,
+        target_inv: torch.Tensor,
+        pair_relation_label: torch.Tensor,
+        top_k: int = 4,
+    ) -> torch.Tensor:
+        """Online hard negative mining: find hardest negatives in-batch.
+
+        Returns indices (B,) — for each anchor, index of hardest negative.
+        -1 means no hard negative found.
+        """
+        B = source_inv.shape[0]
+        src = F.normalize(source_inv.detach(), dim=-1)
+        tgt = F.normalize(target_inv.detach(), dim=-1)
+        sim = src @ tgt.T  # (B, B)
+
+        # Mask diagonal and true positives
+        eye = torch.eye(B, dtype=torch.bool, device=self.device)
+        pos_mask = pair_relation_label > 0.5
+        # Use -1e4 instead of -1e9 to avoid fp16 overflow (max fp16 ~65504)
+        _NEG_INF = -1e4
+        sim = sim.masked_fill(eye, _NEG_INF)
+        # Mask same-positive pairs
+        for i in range(B):
+            if pos_mask[i]:
+                sim[i] = sim[i].masked_fill(pos_mask, _NEG_INF)
+                sim[i, i] = _NEG_INF
+
+        # Hardest negative = highest similarity among non-positives
+        hard_neg_idx = sim.argmax(dim=-1)  # (B,)
+        return hard_neg_idx
+
     def _compute_infonce_loss(
         self,
         source_inv: torch.Tensor,
@@ -436,15 +469,30 @@ class HDIMTrainer:
         # InfoNCE path (use_infonce=True by default via ranking_margin <= 0)
         if getattr(self, 'use_infonce', True):
             temp = self._effective_temperature()
-            infonce = self._compute_infonce_loss(
-                exported_invariant,
-                pair_exported_target,
-                pair_relation_label,
-                pair_weight,
-                temperature=temp,
-            )
+            # Hard negative mining: используем hardest negatives в batche
+            use_hard_neg = getattr(self, 'use_hard_negatives', False)
+            if use_hard_neg and exported_invariant.shape[0] >= 4:
+                hard_neg_idx = self._mine_hard_negatives(
+                    exported_invariant, pair_exported_target, pair_relation_label
+                )
+                # Аугментируем батч hardest negatives
+                hard_pair_target = pair_exported_target[hard_neg_idx]
+                hard_labels = torch.zeros_like(pair_relation_label)
+                hard_weights = pair_weight * 0.5  # меньший вес для mined negatives
+                aug_src = torch.cat([exported_invariant, exported_invariant[pair_relation_label > 0.5]], dim=0)
+                aug_tgt = torch.cat([pair_exported_target, hard_pair_target[pair_relation_label > 0.5]], dim=0)
+                aug_lbl = torch.cat([pair_relation_label, hard_labels[pair_relation_label > 0.5]], dim=0)
+                aug_w   = torch.cat([pair_weight, hard_weights[pair_relation_label > 0.5]], dim=0)
+                infonce = self._compute_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp)
+            else:
+                infonce = self._compute_infonce_loss(
+                    exported_invariant,
+                    pair_exported_target,
+                    pair_relation_label,
+                    pair_weight,
+                    temperature=temp,
+                )
             # AnglE loss поверх InfoNCE (если включён)
-            # AnglE loss
             total_loss = infonce
             if getattr(self, 'lambda_angle', 0.0) > 0:
                 angle = self._compute_angle_loss(

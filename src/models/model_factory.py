@@ -88,8 +88,10 @@ def _patch_sbert_encoder(
     model_name: str = "paraphrase-multilingual-mpnet-base-v2",
     freeze: bool = True,
     dropout: float = 0.1,
+    unfreeze_layers: list | None = None,
+    projection_hidden: int | None = None,
 ) -> None:
-    """Replace text_model.text_encoder with frozen SBERTEncoder in-place."""
+    """Replace text_model.text_encoder with SBERTEncoder in-place."""
     from src.models.sbert_encoder import SBERTEncoder
 
     core_cfg = text_model.core_model.config
@@ -98,6 +100,8 @@ def _patch_sbert_encoder(
         model_name=model_name,
         freeze=freeze,
         dropout=dropout,
+        unfreeze_layers=unfreeze_layers,
+        projection_hidden=projection_hidden,
     )
     text_model.text_encoder = new_encoder  # type: ignore[assignment]
 
@@ -190,6 +194,8 @@ def build_sbert_hdim_model(
     sbert_model_name: str = "paraphrase-multilingual-mpnet-base-v2",
     freeze_sbert: bool = True,
     sbert_dropout: float = 0.1,
+    unfreeze_layers: list | None = None,
+    projection_hidden: int | None = None,
 ) -> TextHDIMModel:
     """Build a TextHDIMModel with frozen SBERT encoder (Phase 4 modernization).
 
@@ -223,6 +229,8 @@ def build_sbert_hdim_model(
         model_name=sbert_model_name,
         freeze=freeze_sbert,
         dropout=sbert_dropout,
+        unfreeze_layers=unfreeze_layers,
+        projection_hidden=projection_hidden,
     )
 
     return text_model

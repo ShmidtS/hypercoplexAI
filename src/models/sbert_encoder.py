@@ -38,6 +38,7 @@ class SBERTEncoder(nn.Module):
         projection_hidden: Optional[int] = None,
         dropout: float = 0.1,
         freeze: bool = True,
+        unfreeze_layers: Optional[list] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -52,35 +53,44 @@ class SBERTEncoder(nn.Module):
         _sbert_model = SentenceTransformer(model_name, device="cpu")
         self._sbert_dim = _sbert_model.get_sentence_embedding_dimension()
 
+        # unfreeze_layers: e.g. ['10', '11', 'pooling'] for partial fine-tuning
+        self.unfreeze_layers = unfreeze_layers or []
+
         if freeze:
             for param in _sbert_model.parameters():
                 param.requires_grad = False
-            # Store SBERT outside nn.Module registry so .to(device) does NOT move it
-            # This keeps 278M params on CPU, freeing GPU VRAM for HDIM core
-            object.__setattr__(self, '_sbert', _sbert_model)
-            self._sbert_on_cpu = True
-            # Embedding cache for frozen SBERT (avoids repeated CPU inference)
-            object.__setattr__(self, '_embedding_cache', {})
+            # Partial unfreezing: re-enable specific layers
+            if self.unfreeze_layers:
+                for name, param in _sbert_model.named_parameters():
+                    if any(layer in name for layer in self.unfreeze_layers):
+                        param.requires_grad = True
+                # Register as full module so optimizer can reach unfrozen params
+                self._sbert = _sbert_model
+                self._sbert_on_cpu = False
+                object.__setattr__(self, '_embedding_cache', None)
+            else:
+                # Fully frozen: store outside registry to keep on CPU
+                object.__setattr__(self, '_sbert', _sbert_model)
+                self._sbert_on_cpu = True
+                object.__setattr__(self, '_embedding_cache', {})
         else:
             # Trainable SBERT: register normally so it participates in .to()
             self._sbert = _sbert_model
             self._sbert_on_cpu = False
             object.__setattr__(self, '_embedding_cache', None)
 
-        # Trainable projection SBERT_DIM → output_dim
+        # Trainable projection SBERT_DIM → output_dim (Gated MLP)
         phidden = projection_hidden or max(output_dim, self._sbert_dim // 2)
-        self.projection = nn.Sequential(
-            nn.Linear(self._sbert_dim, phidden),
-            nn.LayerNorm(phidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(phidden, output_dim),
-        )
+        self.proj_down = nn.Linear(self._sbert_dim, phidden)
+        self.proj_norm = nn.LayerNorm(phidden)
+        self.proj_up = nn.Linear(phidden, output_dim)
+        self.proj_gate = nn.Linear(phidden, output_dim)  # gating branch
+        self.proj_out_norm = nn.LayerNorm(output_dim)
+        self.proj_dropout = nn.Dropout(dropout)
         # Small init for stable start
-        nn.init.normal_(self.projection[0].weight, std=0.02)
-        nn.init.zeros_(self.projection[0].bias)
-        nn.init.normal_(self.projection[4].weight, std=0.02)
-        nn.init.zeros_(self.projection[4].bias)
+        for lin in (self.proj_down, self.proj_up, self.proj_gate):
+            nn.init.normal_(lin.weight, std=0.02)
+            nn.init.zeros_(lin.bias)
 
     def _encode_with_sbert(
         self, texts: Sequence[str], device: Optional[torch.device] = None
@@ -90,8 +100,8 @@ class SBERTEncoder(nn.Module):
         Frozen SBERT always encodes on CPU to save GPU VRAM (278M params).
         Result is moved to target_device after encoding.
         """
-        target_device = device or next(self.projection.parameters()).device
-        proj_dtype = next(self.projection.parameters()).dtype
+        target_device = device or next(self.proj_down.parameters()).device
+        proj_dtype = next(self.proj_down.parameters()).dtype
 
         # Frozen SBERT: CPU to conserve GPU VRAM
         sbert_device = "cpu" if self.freeze else str(target_device)
@@ -131,13 +141,13 @@ class SBERTEncoder(nn.Module):
             (batch, output_dim) projected SBERT representations
         """
         if len(texts) == 0:
-            target_device = device or next(self.projection.parameters()).device
+            target_device = device or next(self.proj_down.parameters()).device
             return torch.empty(0, self.output_dim, device=target_device)
 
         # Use cache for frozen SBERT (avoid repeated CPU inference)
         if self._sbert_on_cpu and self._embedding_cache is not None:
-            target_device = device or next(self.projection.parameters()).device
-            proj_dtype = next(self.projection.parameters()).dtype
+            target_device = device or next(self.proj_down.parameters()).device
+            proj_dtype = next(self.proj_down.parameters()).dtype
             cached = []
             missing_indices = []
             missing_texts = []
@@ -161,7 +171,8 @@ class SBERTEncoder(nn.Module):
         else:
             sbert_emb = self._encode_with_sbert(texts, device=device)  # (B, SBERT_DIM)
 
-        projected = self.projection(sbert_emb)  # (B, output_dim)
+        h = self.proj_dropout(torch.nn.functional.gelu(self.proj_norm(self.proj_down(sbert_emb))))
+        projected = self.proj_out_norm(self.proj_up(h) * torch.sigmoid(self.proj_gate(h)))  # (B, output_dim)
 
         if dtype is not None:
             projected = projected.to(dtype=dtype)
