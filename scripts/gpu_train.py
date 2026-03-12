@@ -183,24 +183,27 @@ class GPUTrainingMonitor:
         epoch: int,
         total_epochs: int,
         train_loss: float,
-        val_metrics: dict,
-        quality_metrics: dict,
+        val_metrics: Optional[dict],
+        quality_metrics: Optional[dict],
         lr: float,
         nan_batches_epoch: int = 0,
         nan_batches_total: int = 0,
     ) -> None:
+        # A6 FIX: accept None for val_metrics/quality_metrics on non-eval epochs
+        val_metrics = val_metrics or {}
+        quality_metrics = quality_metrics or {}
         elapsed = time.time() - self.start_time
         gpu_stats = self.gpu_stats()
         score = compute_primary_score(quality_metrics)
         row = {
             "epoch": epoch,
             "train_loss": round(train_loss, 6),
-            "val_loss": round(val_metrics.get("loss_total", 0.0), 6),
-            "loss_memory": round(val_metrics.get("loss_memory", 0.0), 6),
-            "loss_routing": round(val_metrics.get("loss_routing", 0.0), 6),
-            "pair_margin": round(quality_metrics.get("pair_margin", 0.0), 6),
-            "STS_exported": round(quality_metrics.get("STS_exported", 0.0), 6),
-            "score": round(score, 6),
+            "val_loss": round(val_metrics.get("loss_total", float("nan")), 6) if val_metrics else None,
+            "loss_memory": round(val_metrics.get("loss_memory", float("nan")), 6) if val_metrics else None,
+            "loss_routing": round(val_metrics.get("loss_routing", float("nan")), 6) if val_metrics else None,
+            "pair_margin": round(quality_metrics.get("pair_margin", float("nan")), 6) if quality_metrics else None,
+            "STS_exported": round(quality_metrics.get("STS_exported", float("nan")), 6) if quality_metrics else None,
+            "score": round(score, 6) if quality_metrics else None,
             "lr": lr,
             "elapsed_s": round(elapsed, 1),
             "nan_batches_epoch": nan_batches_epoch,
@@ -209,14 +212,21 @@ class GPUTrainingMonitor:
         }
         self.history.append(row)
 
-        msg = (
-            f"Epoch {epoch:3d}/{total_epochs} "
-            f"| train={train_loss:.4f} "
-            f"| val={val_metrics.get('loss_total', 0):.4f} "
-            f"| margin={quality_metrics.get('pair_margin', 0):.4f} "
-            f"| STS={quality_metrics.get('STS_exported', 0):.4f} "
-            f"| score={score:.4f}"
-        )
+        if val_metrics and quality_metrics:
+            msg = (
+                f"Epoch {epoch:3d}/{total_epochs} "
+                f"| train={train_loss:.4f} "
+                f"| val={val_metrics.get('loss_total', 0):.4f} "
+                f"| margin={quality_metrics.get('pair_margin', 0):.4f} "
+                f"| STS={quality_metrics.get('STS_exported', 0):.4f} "
+                f"| score={score:.4f}"
+            )
+        else:
+            msg = (
+                f"Epoch {epoch:3d}/{total_epochs} "
+                f"| train={train_loss:.4f} "
+                f"| lr={lr:.6f}"
+            )
         if nan_batches_epoch > 0:
             msg += f" | NaN={nan_batches_epoch}"
         if gpu_stats:
@@ -225,7 +235,7 @@ class GPUTrainingMonitor:
 
         if self.log_path:
             with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row) + "\n")
+                f.write(json.dumps(row, default=str) + "\n")
 
     def summary(self) -> dict:
         if not self.history:
@@ -352,13 +362,25 @@ def run_gpu_training(
         lambda_memory=args.lambda_memory,
         ranking_margin=args.ranking_margin,
         use_infonce=getattr(args, 'use_infonce', True),
-        infonce_temperature=getattr(args, 'infonce_temperature', 0.07),
+        infonce_temperature=getattr(args, 'infonce_temperature', 0.15),
         lambda_sts=getattr(args, 'lambda_sts', 0.0),
         lambda_angle=getattr(args, 'lambda_angle', 0.0),
         lambda_supcon=getattr(args, 'lambda_supcon', 0.0),
         lambda_z=getattr(args, 'lambda_z', 0.0),
         learnable_temperature=getattr(args, 'learnable_temperature', False),
     )
+    # Focal-InfoNCE
+    _focal_gamma = getattr(args, 'focal_gamma', 1.0)
+    if _focal_gamma < 1.0:
+        trainer._focal_gamma = _focal_gamma
+        print(f"Focal-InfoNCE: gamma={_focal_gamma}")
+    # Temperature scheduling
+    _temp_schedule = getattr(args, 'temp_schedule', 'none')
+    if _temp_schedule != 'none':
+        trainer._temp_schedule = _temp_schedule
+        trainer._tau_max = getattr(args, 'tau_max', 0.1)
+        trainer._tau_min = getattr(args, 'tau_min', 0.01)
+        print(f"Temperature schedule: {_temp_schedule} (tau_max={trainer._tau_max}, tau_min={trainer._tau_min})")
     # Attach hard negative mining flag
     trainer.use_hard_negatives = getattr(args, 'use_hard_negatives', False)
     if trainer.use_hard_negatives:
@@ -413,7 +435,7 @@ def run_gpu_training(
             real_pairs_path = getattr(args, 'real_pairs', None)
             if real_pairs_path:
                 import json as _json
-                pairs = _json.loads(open(real_pairs_path).read())
+                pairs = _json.loads(open(real_pairs_path, encoding="utf-8").read())
                 for p in pairs:
                     all_texts.append(p['source_text'])
                     all_texts.append(p['target_text'])
@@ -446,6 +468,7 @@ def run_gpu_training(
     nan_batches_total: int = 0
 
     for epoch in range(1, args.epochs + 1):
+        trainer.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -480,11 +503,17 @@ def run_gpu_training(
             scheduler.step(_sched_score)
             current_lr = optimizer.param_groups[0]["lr"]
         else:
+            prev_lr = optimizer.param_groups[0]["lr"]
             scheduler.step()
             try:
                 current_lr = scheduler.get_last_lr()[0]
             except Exception:
                 current_lr = optimizer.param_groups[0]["lr"]
+            # A2 FIX: detect LR restart (CosineWarmRestarts) and reset memory
+            # A restart occurs when LR jumps back up significantly
+            if current_lr > prev_lr * 1.5 and hasattr(model, 'reset_memory'):
+                model.reset_memory()
+                print(f"[LR restart detected at epoch {epoch}] Memory reset. LR: {prev_lr:.6f} → {current_lr:.6f}")
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val_metrics = trainer.validate(val_loader)
@@ -509,10 +538,11 @@ def run_gpu_training(
                     print(f"Early stopping: no improvement for {evals_since_best} evals (best ep={best_score_epoch}, patience={early_stop_patience})")
                     break
         else:
+            # A6 FIX: log only real train-time metrics — no fake zeros for score/margin/STS
             monitor.log_epoch(
                 epoch, args.epochs, train_loss,
-                {"loss_total": train_loss, "loss_recon": 0, "loss_iso": 0, "loss_pair": 0, "loss_routing": 0, "loss_memory": 0},
-                {"STS_exported": 0, "pair_margin": 0},
+                None,   # val_metrics not available on non-eval epochs
+                None,   # quality_metrics not available on non-eval epochs
                 current_lr, nan_batches_epoch, nan_batches_total
             )
 
@@ -612,8 +642,8 @@ def main() -> None:
     parser.add_argument("--use_infonce", action="store_true", default=True,
                         help="Use InfoNCE loss instead of ranking margin (default: True)")
     parser.add_argument("--no_infonce", dest="use_infonce", action="store_false")
-    parser.add_argument("--infonce_temperature", type=float, default=0.07,
-                        help="InfoNCE temperature (default: 0.07)")
+    parser.add_argument("--infonce_temperature", type=float, default=0.15,
+                        help="InfoNCE temperature (default: 0.15)")
     # Real data
     parser.add_argument("--real_pairs", type=str, default=None,
                         help="Path to real_pairs.json for training on real cross-domain pairs")
@@ -634,6 +664,17 @@ def main() -> None:
                         help="T_mult for cosine_restarts scheduler (default: 2, use 1 for stable LR)")
     parser.add_argument("--learnable_temperature", action="store_true", default=False,
                         help="Use learnable InfoNCE temperature (log-parameterized)")
+    # Focal-InfoNCE (Hou & Li, EMNLP 2023)
+    parser.add_argument("--focal_gamma", type=float, default=1.0,
+                        help="Focal-InfoNCE gamma (1.0=standard, 0.5=moderate, <1=focus on hard negatives)")
+    # Temperature scheduling
+    parser.add_argument("--temp_schedule", type=str, default="none",
+                        choices=["none", "warm_restart"],
+                        help="Temperature scheduling strategy (default: none)")
+    parser.add_argument("--tau_max", type=float, default=0.1,
+                        help="Max temperature for warm_restart schedule")
+    parser.add_argument("--tau_min", type=float, default=0.01,
+                        help="Min temperature for warm_restart schedule")
     # Monitoring
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_every", type=int, default=10)

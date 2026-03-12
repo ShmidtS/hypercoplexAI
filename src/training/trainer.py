@@ -31,7 +31,7 @@ class HDIMTrainer:
         negative_margin: float = 1.0,
         ranking_margin: float = 0.2,
         use_infonce: bool = True,
-        infonce_temperature: float = 0.07,
+        infonce_temperature: float = 0.15,
         lambda_sts: float = 0.0,
         lambda_angle: float = 0.0,
         lambda_supcon: float = 0.0,
@@ -54,6 +54,14 @@ class HDIMTrainer:
         self.lambda_supcon = lambda_supcon
         self.lambda_z = lambda_z
         self._step: int = 0
+        # Focal-InfoNCE gamma (Hou & Li, EMNLP 2023)
+        self._focal_gamma: float = 1.0  # 1.0 = standard InfoNCE, <1 = focal
+        # Temperature scheduling
+        self._current_epoch: int = 0
+        self._temp_schedule: str = "none"  # "none" | "warm_restart"
+        self._tau_max: float = 0.1
+        self._tau_min: float = 0.01
+        self._temp_schedule_T_0: int = 20  # matches scheduler T_0
         # Learnable temperature (log-scale for numerical stability)
         import math
         if learnable_temperature:
@@ -266,10 +274,25 @@ class HDIMTrainer:
                 else valid_candidates[0]
             )
         return negative_indices
+    def set_epoch(self, epoch: int) -> None:
+        """Set current epoch for temperature scheduling.
+        C5 FIX: reset memory at the start of each epoch to prevent
+        monotonic loss_memory growth across epochs.
+        """
+        self._current_epoch = epoch
+        if epoch > 0 and hasattr(self.model, 'reset_memory'):
+            self.model.reset_memory()
+
     def _effective_temperature(self) -> float:
-        """Возвращает эффективную температуру (обучаемую или фиксированную)."""
+        """Возвращает эффективную температуру (обучаемую, scheduled, или фиксированную)."""
         if self._log_temp is not None:
             return float(self._log_temp.exp().clamp(0.01, 0.5).item())
+        if self._temp_schedule == "warm_restart":
+            # Linear decay within current LR restart cycle
+            T_0 = self._temp_schedule_T_0
+            epoch_in_cycle = self._current_epoch % T_0
+            fraction = epoch_in_cycle / max(T_0, 1)
+            return self._tau_max - (self._tau_max - self._tau_min) * fraction
         return self.infonce_temperature
 
     def _compute_angle_loss(
@@ -386,6 +409,69 @@ class HDIMTrainer:
         return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
+    def _compute_focal_infonce_loss(
+        self,
+        source_inv: torch.Tensor,
+        target_inv: torch.Tensor,
+        pair_relation_label: torch.Tensor,
+        pair_weight: torch.Tensor,
+        temperature: float = 0.07,
+        gamma: float = 0.5,
+    ) -> torch.Tensor:
+        """Focal-InfoNCE loss (Hou & Li, EMNLP 2023).
+
+        Downweights easy negatives by applying gamma scaling to the denominator.
+        When gamma=1.0, this reduces to standard InfoNCE.
+        When gamma<1.0, easy negatives (low similarity) contribute less.
+
+        Args:
+            source_inv: (B, D) source exported_invariant
+            target_inv: (B, D) target exported_invariant
+            pair_relation_label: (B,) 1.0=positive, 0.0=negative
+            pair_weight: (B,) per-sample weights
+            temperature: softmax temperature
+            gamma: focal parameter (1.0 = standard InfoNCE, 0.5 = moderate focus)
+        Returns:
+            scalar Focal-InfoNCE loss
+        """
+        B = source_inv.shape[0]
+        if B < 2:
+            return self._zero_loss(source_inv)
+
+        positive_mask = pair_relation_label > 0.5
+        if not positive_mask.any():
+            return self._zero_loss(source_inv)
+
+        src = F.normalize(source_inv, dim=-1)
+        tgt = F.normalize(target_inv, dim=-1)
+
+        # Similarity matrix: (B, B)
+        sim_matrix = src @ tgt.T / temperature
+
+        # Focal scaling: apply gamma to denominator (all negatives)
+        # Numerator uses unscaled diagonal (positives)
+        # Focal: exp(s_j/τ * γ) for j ≠ i in denominator
+        focal_sim = torch.exp(sim_matrix * gamma)
+
+        # Denominator: logsumexp of focal-scaled similarities
+        # Mask diagonal to exclude self-match
+        eye = torch.eye(B, dtype=torch.bool, device=self.device)
+        focal_sim_masked = focal_sim.masked_fill(eye, 0.0)
+        log_denom = torch.log(focal_sim_masked.sum(dim=-1) + 1e-8)
+
+        # C6 FIX: Numerator must use RAW logit (not focal-scaled).
+        # gamma applies only to denominator (easy negative downweighting).
+        # focal_sim.diagonal() would wrongly apply exp(s_ii*gamma/τ);
+        # correct: exp(s_ii/τ) — use sim_matrix diagonal directly.
+        pos_indices = positive_mask.nonzero(as_tuple=True)[0]
+        log_num = sim_matrix.diagonal()[pos_indices]  # already s_ii/τ, no gamma
+
+        # Focal-InfoNCE: -log(exp(s_pos/τ) / Σ_focal_neg)
+        loss_per_sample = -(log_num - log_denom[pos_indices])
+
+        weights = pair_weight[pos_indices]
+        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
+
     def _compute_supcon_loss(
         self,
         source_inv: torch.Tensor,
@@ -471,29 +557,37 @@ class HDIMTrainer:
         # InfoNCE path (use_infonce=True by default via ranking_margin <= 0)
         if getattr(self, 'use_infonce', True):
             temp = self._effective_temperature()
+            use_focal = self._focal_gamma < 1.0
             # Hard negative mining: используем hardest negatives в batche
             use_hard_neg = getattr(self, 'use_hard_negatives', False)
             if use_hard_neg and exported_invariant.shape[0] >= 4:
                 hard_neg_idx = self._mine_hard_negatives(
                     exported_invariant, pair_exported_target, pair_relation_label
                 )
-                # Аугментируем батч hardest negatives
                 hard_pair_target = pair_exported_target[hard_neg_idx]
                 hard_labels = torch.zeros_like(pair_relation_label)
-                hard_weights = pair_weight * 0.5  # меньший вес для mined negatives
+                hard_weights = pair_weight * 0.5
                 aug_src = torch.cat([exported_invariant, exported_invariant[pair_relation_label > 0.5]], dim=0)
                 aug_tgt = torch.cat([pair_exported_target, hard_pair_target[pair_relation_label > 0.5]], dim=0)
                 aug_lbl = torch.cat([pair_relation_label, hard_labels[pair_relation_label > 0.5]], dim=0)
                 aug_w   = torch.cat([pair_weight, hard_weights[pair_relation_label > 0.5]], dim=0)
-                infonce = self._compute_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp)
+                if use_focal:
+                    infonce = self._compute_focal_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp, gamma=self._focal_gamma)
+                else:
+                    infonce = self._compute_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp)
             else:
-                infonce = self._compute_infonce_loss(
-                    exported_invariant,
-                    pair_exported_target,
-                    pair_relation_label,
-                    pair_weight,
-                    temperature=temp,
-                )
+                if use_focal:
+                    infonce = self._compute_focal_infonce_loss(
+                        exported_invariant, pair_exported_target,
+                        pair_relation_label, pair_weight,
+                        temperature=temp, gamma=self._focal_gamma,
+                    )
+                else:
+                    infonce = self._compute_infonce_loss(
+                        exported_invariant, pair_exported_target,
+                        pair_relation_label, pair_weight,
+                        temperature=temp,
+                    )
             # AnglE loss поверх InfoNCE (если включён)
             total_loss = infonce
             if getattr(self, 'lambda_angle', 0.0) > 0:

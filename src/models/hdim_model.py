@@ -367,6 +367,13 @@ class HDIMModel(nn.Module):
             expert_usage.copy_(transfer_state["router_state"]["expert_usage"].to(dtype=x.dtype))
             memory_updated = memory_updated or bool(transfer_state["memory_updated"])
 
+        # A1 FIX: normalize accumulated losses by number of unique domains
+        # prevents loss scale from growing linearly with domain count
+        n_unique_domains = max(int(domain_id.unique().numel()), 1)
+        memory_loss = memory_loss / n_unique_domains
+        router_loss = router_loss / n_unique_domains
+        z_loss = z_loss / n_unique_domains
+
         invariant = self.training_inv_head(exported_invariant).to(dtype=x.dtype)
 
         if return_state:
@@ -533,6 +540,12 @@ class HDIMModel(nn.Module):
             train_scores_snapshot.copy_(transfer_state["router_state"]["train_scores_snapshot"].to(dtype=source_encoding.dtype))
             expert_usage.copy_(transfer_state["router_state"]["expert_usage"].to(dtype=source_encoding.dtype))
             memory_updated = memory_updated or bool(transfer_state["memory_updated"])
+
+        # A1 FIX: normalize accumulated losses by number of unique domain pairs
+        n_unique_pairs = max(int(unique_pairs.shape[0]), 1)
+        memory_loss = memory_loss / n_unique_pairs
+        router_loss = router_loss / n_unique_pairs
+        z_loss = z_loss / n_unique_pairs
 
         invariant = self.training_inv_head(exported_invariant).to(dtype=source_encoding.dtype)
         aux_state = self._build_aux_state(

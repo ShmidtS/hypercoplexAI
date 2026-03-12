@@ -76,24 +76,40 @@ class TitansMemoryModule(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        loss_ttt = F.mse_loss(self.memory(k.detach()), v.detach())
-        gates = torch.sigmoid(self.gate_proj(k.detach().mean(0) if k.dim() > 1 else k.detach()))
-        alpha, eta, theta = gates[..., 0], gates[..., 1], gates[..., 2]
-        grad = torch.autograd.grad(
+        # C4+A7 FIX: explicit fp32 TTT path — avoids AMP fp16 overflow
+        # Use detached fp32 leaf tensor so grad does NOT flow into main graph
+        k32 = k.detach().float()
+        v32 = v.detach().float()
+        # Create fp32 leaf copy of memory weights (detached from main param)
+        mem_w = self.memory.weight.detach().float().requires_grad_(True)
+        k_agg = k32.mean(0) if k32.dim() > 1 else k32
+        gates = torch.sigmoid(self.gate_proj(k_agg.to(self.gate_proj.weight.dtype)))
+        alpha = gates[..., 0].float()
+        eta   = gates[..., 1].float()
+        theta = gates[..., 2].float()
+        pred = k32 @ mem_w.T
+        loss_ttt = F.mse_loss(pred, v32)
+        (grad,) = torch.autograd.grad(
             loss_ttt,
-            self.memory.weight,
+            mem_w,
             retain_graph=False,
             create_graph=False,
-        )[0]
+        )
         # Clamp gradient to prevent explosive TTT update
-        grad_clamped = torch.clamp(grad.detach(), min=-1.0, max=1.0)
-        self.momentum_S = eta * self.momentum_S.detach() - self._TTT_LR_SCALE * theta * grad_clamped
-        new_weight = (1 - alpha) * self.memory.weight.data + self.momentum_S.data
+        grad_clamped = grad.detach().clamp(-1.0, 1.0)
+        mom_fp32 = self.momentum_S.detach().float()
+        new_momentum = eta * mom_fp32 - self._TTT_LR_SCALE * theta * grad_clamped
+        # Clamp momentum norm
+        momentum_norm = new_momentum.norm()
+        if momentum_norm > self._MEMORY_MAX_NORM:
+            new_momentum = new_momentum * (self._MEMORY_MAX_NORM / (momentum_norm + 1e-8))
+        self.momentum_S.copy_(new_momentum.to(self.momentum_S.dtype))
+        new_weight = (1 - alpha) * mem_w.detach() + new_momentum
         # Max-norm constraint: prevent memory weight from exploding
         weight_norm = new_weight.norm()
         if weight_norm > self._MEMORY_MAX_NORM:
             new_weight = new_weight * (self._MEMORY_MAX_NORM / (weight_norm + 1e-8))
-        self.memory.weight.data.copy_(new_weight)
+        self.memory.weight.data.copy_(new_weight.to(self.memory.weight.dtype))
         return alpha.detach(), eta.detach(), theta.detach()
 
     def retrieve_and_update(
@@ -136,3 +152,15 @@ class TitansMemoryModule(nn.Module):
         with torch.no_grad():
             self.memory.weight.zero_()
             self.momentum_S.zero_()
+
+    def stabilize_momentum(self) -> bool:
+        """Принудительная нормировка momentum_S. Вызывать при LR restarts.
+
+        Returns True если была применена нормировка.
+        """
+        with torch.no_grad():
+            norm = self.momentum_S.norm()
+            if norm > self._MEMORY_MAX_NORM * 0.5:
+                self.momentum_S.mul_(self._MEMORY_MAX_NORM * 0.5 / (norm + 1e-8))
+                return True
+        return False

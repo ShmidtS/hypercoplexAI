@@ -118,8 +118,13 @@ class SoftMoERouter(nn.Module):
             z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
         self._z_loss = z_loss
 
-        # dispatch: нормализация по токенам (каждый слот получает mix токенов)
-        dispatch = F.softmax(logits, dim=0)   # (T, num_slots)
+        T = x.shape[0]
+        # C1 FIX: guard for T=1 — dim=0 softmax with single row returns all-ones
+        if T == 1:
+            dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype) / self.num_slots
+        else:
+            # dispatch: нормализация по токенам (каждый слот получает mix токенов)
+            dispatch = F.softmax(logits, dim=0)   # (T, num_slots)
         # combine: нормализация по слотам (каждый токен получает mix слотов)
         combine = F.softmax(logits, dim=-1)   # (T, num_slots)
         return dispatch, combine
@@ -148,14 +153,15 @@ class SoftMoERouter(nn.Module):
         slot_inputs = dispatch.T @ x_flat  # (num_slots, D)
 
         # Apply each expert to its slot(s)
-        # Batch process: group slots by expert for fewer forward passes
-        slot_outputs = torch.zeros(self.num_slots, D, device=x.device, dtype=x.dtype)
+        # C3 FIX: use torch.cat instead of in-place slice assignment
+        # (in-place assignment breaks torch.compile and gradient checkpointing)
+        expert_outs = []
         for expert_idx in range(self.num_experts):
             slot_start = expert_idx * self.slots_per_expert
             slot_end = slot_start + self.slots_per_expert
             expert_input = slot_inputs[slot_start:slot_end]  # (slots_per_expert, D)
-            expert_out = self.experts[expert_idx](expert_input)  # (slots_per_expert, D)
-            slot_outputs[slot_start:slot_end] = expert_out
+            expert_outs.append(self.experts[expert_idx](expert_input))  # (slots_per_expert, D)
+        slot_outputs = torch.cat(expert_outs, dim=0)  # (num_slots, D)
 
         # Combine: y = combine @ slot_outputs
         # Shape: (T, D)
@@ -211,14 +217,15 @@ class SoftMoERouter(nn.Module):
         combine: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Load balance loss через entropy:
-        Поощряет равномерное использование экспертов.
-        L = - (1/E) * Σ_e H(combine[:, e::S])
-        Минимизируем -entropy → максимизируем энтропию → равномерное использование.
+        Dynamic Switch Transformer load balance loss (C2 FIX).
+        Uses runtime expert fraction f_e (not static weight-based p).
+        L_lb = E * Σ_e f_e.detach() * mean_usage_e
+        Gradient flows only through mean_usage (not f_e) — standard Switch Transformer.
         """
         T = combine.shape[0]
         expert_weights = combine.reshape(T, self.num_experts, self.slots_per_expert).mean(-1)
-        mean_usage = expert_weights.mean(0)  # (E,)
-        # Switch Transformer style load balance
-        p = F.softmax(self.dispatch_proj.weight.mean(0).reshape(self.num_experts, -1).mean(-1), dim=0)
-        return self.num_experts * (mean_usage * p).sum()
+        # f_e: fraction of tokens dispatched to each expert (detached — no gradient)
+        dispatch_per_expert = expert_weights  # (T, E) — combine weights proxy for dispatch
+        f_e = dispatch_per_expert.mean(0).detach()  # (E,) — stop-gradient on fraction
+        mean_usage = expert_weights.mean(0)  # (E,) — gradient flows here
+        return self.num_experts * (f_e * mean_usage).sum()

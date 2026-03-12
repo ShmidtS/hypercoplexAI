@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 12.0 | Дата: 2026-03-12 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 13: 0.3076 (3 эп, augment=10, quick run)*
+*Версия: 17.0 | Дата: 2026-03-12 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 16: пик 0.378 (ep25), деградация до 0.181 (ep30) — MoE collapse + memory drift | Phase 17: 7×P0 + 5×P1 исправлений, запущена | Коммит: 036e3f5 (audit)*
 
 ---
 
@@ -37,9 +37,10 @@ $$U_{inv} = R_A^{-1} \otimes G_A \otimes R_A$$
 $$G_B = R_B \otimes U \otimes R_B^{-1}$$
 
 ### Loss функция
-$$L_{total} = L_{recon} + \lambda_{iso} L_{iso} + \lambda_{pair} L_{pair} + \lambda_{routing} L_{routing} + L_{memory}$$
+$$L_{total} = L_{recon} + \lambda_{iso} L_{iso} + \lambda_{pair} L_{pair} + \lambda_{routing} L_{routing} + \lambda_z L_z + L_{memory}$$
 
-Где $L_{pair}$ = InfoNCE + AnglE + SupCon (при наличии family labels).
+Где $L_{pair}$ = Focal-InfoNCE/InfoNCE + AnglE + SupCon (при наличии family labels).
+$L_z = (\log\sum_j e^{z_j})^2$ — Router Z-Loss для стабильности MoE (ST-MoE, Zoph et al. 2022).
 
 ---
 
@@ -58,36 +59,26 @@ $$L_{total} = L_{recon} + \lambda_{iso} L_{iso} + \lambda_{pair} L_{pair} + \lam
 | `HDIMPipeline` | `src/core/hdim_pipeline.py` | Оркестрация пайплайна |
 | `InvariantExtractor` | `src/core/domain_operators.py` | Извлечение инварианта |
 | `TitansMemory` | `src/core/titans_memory.py` | Ассоциативная память |
-| `SoftMoERouter` | `src/core/soft_moe_router.py` | Мягкая маршрутизация (Phase 9 рекорд) |
+| `SoftMoERouter` | `src/core/soft_moe_router.py` | Мягкая маршрутизация (DEFAULT, заменил R3MoERouter) |
 | `ModularMoERouter` | `src/core/modular_moe.py` | Модульный роутер (add/remove expert) |
 | `SBERTEncoder` | `src/models/sbert_encoder.py` | **Simple MLP** 768→384→256 |
 | `HDIMModel` | `src/models/hdim_model.py` | Batch-facing API |
 | `TextHDIMModel` | `src/models/text_hdim_model.py` | Text entry wrapper |
 | `build_*_model` | `src/models/model_factory.py` | Единственная точка сборки моделей |
-| `HDIMTrainer` | `src/training/trainer.py` | InfoNCE + AnglE + SupCon + HardNeg |
+| `HDIMTrainer` | `src/training/trainer.py` | Focal-InfoNCE + AnglE + SupCon + HardNeg + temp scheduling |
 | `gpu_train.py` | `scripts/gpu_train.py` | Основной скрипт обучения |
+| `gen_dataset_v8.py` | `scripts/gen_dataset_v8.py` | Генератор v8 датасета (330 пар) |
 
-### Phase 10 — Новые компоненты
+### Phase 10 — Что пробовали и откачали
 
-#### GatedProjection (SBERT 768 → hidden_dim)
-```python
-h = GELU(LayerNorm(W_down · sbert_emb))     # [B, phidden]
-out = LayerNorm(W_up(h) * σ(W_gate(h)))     # gated output [B, hidden_dim]
-```
-Мотивация: gated MLP стабильно превосходит простые MLP, особенно при переносе из 768-мерного SBERT пространства.
+| Компонент | Статус | Результат |
+|-----------|--------|-----------|
+| GatedProjection | ⚠️ **ОТКАТ** | -0.198 (REGRESSION: 0.9347 vs 1.1370) |
+| Online Hard Neg Mining | ⚠️ **ОТКАТ** | -0.064 (дестабилизирует) |
+| Partial SBERT unfreeze | ⚠️ **ОТКАТ** | -0.408 (REGRESSION: 0.729) |
+| Simple MLP projection | ✅ **ОПТИМАЛЬНЫЙ** | Рекорд 1.1370 |
 
-#### Partial SBERT Unfreezing
-```python
-# Размораживаем только слои 10, 11 (14.6M из 278M параметров)
---unfreeze_sbert_layers "10,11" --sbert_lr 1e-5
-```
-
-#### Online Hard Negative Mining
-```python
-# Находит hardest negatives в batche по cosine similarity
---use_hard_negatives
-```
-Алгоритм: строим sim_matrix (B×B), маскируем диагональ и истинные позитивы, берём argmax по строке.
+**Вывод:** Simple MLP (Linear→LayerNorm→GELU→Dropout→Linear) стабильно лучше всех сложных вариантов.
 
 ### Модульность экспертов (unlimited)
 ```python
@@ -108,48 +99,33 @@ model.remove_domain('obsolete_domain')
 
 | Файл | Пар | Описание |
 |------|-----|----------|
-| `data/real_pairs_v7.json` | 232 (191+ / 41-) | **Актуальный** — сбалансированные домены |
-| `data/real_pairs_v6.json` | 213 (172+ / 41-) | Phase 10-11 |
+| `data/real_pairs_v8.json` | 330 (212+ / 118-) | **АКТУАЛЬНЫЙ** — все 16 доменных пар покрыты, 35.8% neg |
+| `data/real_pairs_v7.json` | 232 (191+ / 41-) | Предыдущий (17.7% neg) |
+| `data/real_pairs_v6.json` | 213 (172+ / 41-) | Legacy |
 | `data/real_pairs_v5.json` | 175 (139+ / 36-) | Phase 9 рекорд |
-| `data/real_pairs_v4.json` | 140 | Phase 6e рекорд |
-
-**Новые домены в v6:**
-- Квантовая механика ↔ Термодинамика (туннелирование, декогеренция)
-- Нейронные сети ↔ Статистическая физика (backprop ↔ Monte Carlo)
-- Экономика ↔ Физика (броуновское движение, арбитраж)
-- Биология ↔ Информационные технологии (ДНК репликация, кэш)
-- Химия ↔ Астрофизика (катализ ↔ звёздообразование)
-- Теория информации ↔ Термодинамика (Шеннон ↔ Больцман)
-
-Структура элемента:
-```json
-{"source_text": "...", "source_domain": 0, "target_text": "...", "target_domain": 1,
- "relation": "positive", "group_id": 42, "family": "thermodynamics"}```
 
 **PRIMARY_SCORE** = `pair_margin × 1.0 + STS_exported × 0.3`
 
-### 5.1 Рекомендации для v8 dataset
+### 5.1 v8 Dataset (330 пар, 35.8% negatives)
 
-**Критические недостатки v7:**
-- `augment_factor` — это НЕ аугментация, только shuffle/repeat одних и тех же 423 текстов
-- Негативные пары: 17.7% (41/232) — недостаточно для контрастного обучения
-- Domain 2->3 отсутствует полностью (0 пар)
-- Domain 3 как источник: 0 пар
-- Каждый pair имеет уникальный group_id → split становится случайным per-pair
+**Ключевые улучшения v8:**
+- Все 16 доменных пар покрыты (v7: domain 1→3 = 0 пар → v8: 8 пар)
+- Negative ratio: 35.8% (v7: 17.7%) — лучший контраст
+- Domain 1 source: 18→32 пар (включая 1→3)
+- Intra-domain pairs увеличены: 0→0 (3→8), 1→1 (3→4), 2→2 (7→8), 3→3 (2→5)
+- Группировка по family_id для stratified split
 
-**План v8 (цель: 300+ пар, 35-40% негативных):**
+**Domain coverage v8:**
+```
+        ->0  ->1  ->2  ->3  total
+from 0:   8   70   28   20   126
+from 1:   7    4   12    8    31
+from 2:  29   61    8   17   115
+from 3:  11   24   18    5    58
+total:   55  159   66   50   330
+```
 
-| Приоритет | Действие | Ожидаемый эффект |
-|-----------|----------|------------------|
-| HIGH | Добавить Domain 2->3 пары (15-20) | Заполнить критический пробел |
-| HIGH | Добавить Domain 3 как source (10-15) | Полная coverage домена Physics |
-| HIGH | Увеличить негативные пары до 35-40% | Улучшить контрастное обучение |
-| MEDIUM | Добавить backward pairs для всех негативов | 2x negative data без нового контента |
-| MEDIUM | T5-based парфразинг для позитивных пар | Настоящая аугментация текста |
-| LOW | Back-translation (en-de, en-fr, en-ja) | Лексическое разнообразие |
-| LOW | Standardize family naming convention | Улучшить split quality |
-
-**Не использовать:** Embedding mixup (экспериментально, может генерировать бессмысленный текст).
+**Скрипт:** `scripts/gen_dataset_v8.py` — генерирует v8 из v7 + новые пары + негативы
 
 ## 6. Результаты обучения
 
@@ -166,30 +142,154 @@ model.remove_domain('obsolete_domain')
 | 10b | 0.729 | — | — | — | GatedProjection + partial unfreeze (РЕГРЕССИЯ) |
 | 10c | 0.9389 | — | — | ep25 | Simple MLP + v6 (best cycle 2) |
 | **12** | 0.9279 | 0.702 | 0.753 | ep10 | v7 + augment=50, T_mult=1 (ПРОВАЛ: деградация) |
-| **12b** | TBD | — | — | — | v7 + T_mult=2, warmup=5 (запущена 12.03) |
-| **13** | **0.3076** | **0.027** | **0.934** | **ep3** | **hidden=512, experts=8, lambda_z=0.001, augment=10 (в процессе)** |
-
-### Phase 9 — детальный прогресс
-| Эпоха | Score | Margin | STS | Событие |
-|-------|-------|--------|-----|---------|
-| 5 | 0.754 | 0.507 | 0.822 | Первый eval |
-| 20 | 0.780 | 0.539 | 0.801 | LR рестарт (T_0=20) |
-| 45 | 0.906 | 0.670 | 0.786 | Резкий рост |
-| 50 | 0.961 | 0.725 | 0.788 | Прорыв |
-| **55** | **0.993** | **0.757** | **0.788** | **Рекорд** |
+| **13** | **0.696** | **0.540** | **0.522** | **ep15** | **hidden=512, experts=8, lambda_z=0.001, augment=10, 687K params, v7, cosine_restarts** |
+| **14** | **TBD** | — | — | — | **hidden=512, experts=8, Focal-InfoNCE(gamma=0.5), cosine_decay, v8, 687K (в процессе)** |
+| **16** | 0.378 | — | — | ep25 | hidden=128, experts=4, T=0.07 — **ДЕГРАДАЦИЯ**: memory drift + MoE collapse (score 0.181 к ep30) |
+| **17** | **TBD** | — | — | — | **7×P0 + 5×P1 исправлений, hidden=128, experts=4, T=0.15, reset_memory, z-loss=0.01 (в процессе)** |
 
 ---
 
-## 7. Рекордная конфигурация (Phase 8e) + Оптимизированная Phase 12
+### Phase 16 — Диагностика (деградация)
 
-### Модель: 414,103 параметров (Phase 8e)
+| Эпоха | Score | loss_memory | loss_routing | Причина |
+|-------|-------|-------------|--------------|----------|
+| ep5 | ~0.2 | 2.029 | 0.1893 | базовый уровень |
+| ep25 | **0.378** | ~4.1 | ~0.08 | **пик score** |
+| ep30 | 0.181 | ~5.0 | 0.0198 | **обвал −52%** |
+| ep45 | — | 6.686 | 0.0198 | memory drift, MoE collapse |
+
+**Патологии Phase 16 (4 причины):**
+1. **memory drift**: `loss_memory` 2.029→6.686 (×3.3) — `reset_memory()` не вызывался между эпохами
+2. **MoE mode collapse**: `loss_routing` 0.1893→0.0198 — все токены маршрутятся к одному эксперту; Z-loss (`lambda_z`) не был активирован
+3. **Статический load-balance loss**: не обновлялся по dispatch-статистике — неверные градиенты
+4. **80% фиктивных записей**: лог содержал score=0 на non-eval эпохах — искажал анализ
+
+---
+
+## 7. Phase 13–17 Конфигурации
+
+### Phase 13 + 14 (hidden=512, experts=8, 687K params)
+
+### Модель: 687,891 параметров
 | Компонент | Параметры | Размерность |
 |-----------|-----------|-------------|
-| text_encoder.projection | 394,624 | 768→384→256 (simple MLP) |
-| core_model.pipeline | 15,127 | clifford_dim=16, hidden=256 |
-| training_inv_head | 4,352 | 16→256 |
+| text_encoder.projection | 643,328 | 768→384→512 (simple MLP) |
+| core_model.pipeline | 35,851 | clifford_dim=16, hidden=512, 8 experts |
+| training_inv_head | 8,712 | 16→512 |
 
-### Конфигурация запуска
+### Phase 13 конфиг (best=0.696, ep15 — LR restart проблема)
+```bash
+python scripts/gpu_train.py \
+  --epochs 200 --hidden_dim 512 --num_experts 8 --num_domains 4 \
+  --pretrained_encoder --soft_router \
+  --real_pairs data/real_pairs_v7.json --augment_factor 10 \
+  --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3 \
+  --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01 \
+  --lambda_z 0.001 \
+  --use_infonce --infonce_temperature 0.1 --learnable_temperature \
+  --early_stopping_patience 40 \
+  --lr 0.0005 --seed 42 --batch_size 32 \
+  --scheduler_type cosine_restarts --t_mult 2 --warmup_epochs 3 \
+  --eval_every 5 --save_every 25 \
+  --output_dir artifacts/phase13_scaled
+```
+**Проблема:** cosine_restarts LR restart (ep20) дестабилизирует модель, score падает с 0.696→0.581.
+
+### Phase 14 конфиг (в процессе — исправления + SOTA)
+```bash
+python scripts/gpu_train.py \
+  --epochs 200 --hidden_dim 512 --num_experts 8 --num_domains 4 \
+  --pretrained_encoder --soft_router \
+  --real_pairs data/real_pairs_v8.json --augment_factor 10 \
+  --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3 \
+  --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01 \
+  --lambda_z 0.001 \
+  --use_infonce --infonce_temperature 0.1 \
+  --focal_gamma 0.5 \
+  --temp_schedule warm_restart --tau_max 0.1 --tau_min 0.01 \
+  --scheduler_type cosine_decay \
+  --early_stopping_patience 40 \
+  --lr 0.0005 --seed 42 --batch_size 32 \
+  --eval_every 5 --save_every 25 \
+  --output_dir artifacts/phase14_sota
+```
+
+**Ключевые изменения Phase14:**
+- `--scheduler_type cosine_decay` вместо cosine_restarts (нет дестабилизирующих рестартов)
+- `--focal_gamma 0.5` — Focal-InfoNCE для focus на hardest negatives
+- `--temp_schedule warm_restart` — динамическая температура (tau_max→tau_min)
+- `--real_pairs data/real_pairs_v8.json` — 330 пар, 35.8% neg, все домены
+
+### Phase 17 конфиг (7×P0 + 5×P1 исправлений)
+
+```bat
+@echo off
+REM Phase 17 Training — HypercomplexAI HDIM
+REM Fixes: C1-C7 (P0), A1-A6 (P1)
+
+python scripts\gpu_train.py ^
+    --epochs 60 ^
+    --batch_size 32 ^
+    --lr 3e-4 ^
+    --hidden_dim 128 ^
+    --num_experts 4 ^
+    --num_domains 4 ^
+    --lambda_iso 0.1 ^
+    --lambda_pair 0.2 ^
+    --lambda_routing 0.05 ^
+    --lambda_memory 0.05 ^
+    --lambda_z 0.01 ^
+    --use_infonce ^
+    --infonce_temperature 0.15 ^
+    --focal_gamma 0.5 ^
+    --scheduler_type cosine_restarts ^
+    --t_mult 1 ^
+    --warmup_epochs 5 ^
+    --use_pairs ^
+    --num_samples 1000 ^
+    --train_fraction 0.8 ^
+    --eval_every 5 ^
+    --save_every 10 ^
+    --output_dir artifacts\phase17 ^
+    --results_json artifacts\phase17\results.json ^
+    --device auto ^
+    --amp ^
+    --seed 42
+```
+
+**Ключевые изменения Phase 17 (vs Phase 16):**
+- `--infonce_temperature 0.15` вместо 0.07 — снижение overconfidence
+- `--lambda_z 0.01` активирован — предотвращает MoE mode collapse
+- `--lambda_memory 0.05` снижен (vs default) — уменьшает memory drift
+- `reset_memory()` вызывается в `set_epoch()` каждую эпоху (fix C5)
+- `focal_gamma` применяется только к знаменателю InfoNCE (fix C6)
+- Динамический load-balance loss в SoftMoERouter (fix C2)
+- fp32 TTT path в TitansMemory — нет NaN/Inf при AMP (fix C4)
+- LR restart detector в `gpu_train.py` → auto `reset_memory()` (fix A2)
+
+**Исправления P0 (критические):**
+
+| ID | Файл | Проблема | Решение |
+|----|------|----------|---------|
+| C1 | `soft_moe_router.py` | T=1 → dispatch не identity | Guard: `if T == 1: return identity dispatch` |
+| C2 | `soft_moe_router.py` | Load balance loss статический | Динамический расчёт по текущему dispatch |
+| C3 | `soft_moe_router.py` | In-place slice → сбой AMP/compile | Заменён на `torch.cat` (out-of-place) |
+| C4 | `titans_memory.py` | NaN/Inf при AMP в TTT path | fp32 cast для TTT градиентного шага |
+| C5 | `trainer.py` | `reset_memory()` не вызывался | Вызов в `set_epoch()` перед каждой эпохой |
+| C6 | `trainer.py` | Focal gamma к числителю и знаменателю | gamma только к знаменателю (правильный gradient) |
+| C7 | `hierarchical_memory.py` | Non-leaf tensor `requires_grad` ошибка | `detach().float()` + `requires_grad_(True)` |
+
+**Исправления P1 (важные):**
+
+| ID | Файл | Проблема | Решение |
+|----|------|----------|---------|
+| A1 | `hdim_model.py` | Losses не нормированы по n_domains | Деление на `n_domains` |
+| A2 | `gpu_train.py` | Нет детектора LR restart | Auto `reset_memory()` при скачке LR >2× |
+| A3 | `trainer.py` | Default temperature 0.07 — слишком низкий | Изменён на 0.15 |
+| A4 | `soft_moe_router.py` | Нет Z-loss | Добавлен Z-loss (ST-MoE: `(log Σexp(z))²`) |
+| A6 | `gpu_train.py` | Фиктивные лог-записи с zeros | Лог только на eval эпохах |
+
+### Конфигурация запуска Phase 8e (рекорд 1.1370)
 ```bash
 cd E:/hypercoplexAI && python scripts/gpu_train.py \
   --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4 \
@@ -273,46 +373,7 @@ cd E:/hypercoplexAI && python scripts/gpu_train.py \
 
 ---
 
-## 8. Phase 10 — Команда запуска
-
-```bash
-# Phase 10: GatedProjection + HardNeg + v6 датасет (213 пар)
-cd E:/hypercoplexAI && python scripts/gpu_train.py \
-  --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4 \
-  --pretrained_encoder --soft_router \
-  --real_pairs data/real_pairs_v6.json --augment_factor 30 \
-  --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3 \
-  --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01 \
-  --use_infonce --infonce_temperature 0.1 --learnable_temperature \
-  --use_hard_negatives \
-  --early_stopping_patience 40 \
-  --lr 0.0005 --seed 42 --batch_size 32 \
-  --scheduler_type cosine_restarts --warmup_epochs 3 \
-  --eval_every 5 --save_every 25 \
-  --output_dir artifacts/phase10_v6_gated_hardneg
-```
-
-```bash
-# Phase 10b: + Partial SBERT unfreeze (слои 10, 11)
-cd E:/hypercoplexAI && python scripts/gpu_train.py \
-  --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4 \
-  --pretrained_encoder --soft_router \
-  --real_pairs data/real_pairs_v6.json --augment_factor 30 \
-  --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3 \
-  --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01 \
-  --use_infonce --infonce_temperature 0.1 --learnable_temperature \
-  --use_hard_negatives \
-  --unfreeze_sbert_layers "10,11" --sbert_lr 1e-5 \
-  --early_stopping_patience 40 \
-  --lr 0.0005 --seed 42 --batch_size 32 \
-  --scheduler_type cosine_restarts --warmup_epochs 5 \
-  --eval_every 5 --save_every 25 \
-  --output_dir artifacts/phase10b_v6_partial_unfreeze
-```
-
----
-
-## 9. Паттерны обучения
+## 8. Паттерны обучения
 
 - **Ep1-4:** score=0 (eval только на кратных 5)
 - **Ep5:** score~0.75 — первый прыжок
@@ -322,145 +383,147 @@ cd E:/hypercoplexAI && python scripts/gpu_train.py \
 - **STS ≈ 0.79-0.82** стабильно (frozen SBERT даёт хорошую базу)
 - **Best обычно на 3-м цикле** (ep45-60 при T_0=20)
 
+### Паттерн Phase 16 — деградация (anti-pattern)
+
+```
+ep5-25:  score растёт 0.2 → 0.378  (memory работает, но drift накапливается)
+ep25:    ПИКОВЫЙ score 0.378        (memory drift уже значительный: loss_memory≈4.1)
+ep25-30: score обваливается -52%   (MoE collapse: loss_routing 0.08→0.02)
+ep30-45: score стагнирует ~0.18    (все токены → 1 эксперт, память расходится)
+```
+
+**Признаки деградации (диагностические сигналы):**
+- `loss_memory` растёт монотонно без plateau → нет `reset_memory()` между эпохами
+- `loss_routing` падает ниже 0.02 → MoE mode collapse (нужен Z-loss)
+- score падает при стабильных или улучшающихся других лоссах → routing collapse
+- 80%+ записей лога имеют score=0 → фиктивные записи на non-eval эпохах
+
+### Ожидания для Phase 17
+
+- **Ep5:** score ~0.25-0.35 (hidden=128, меньше capacity)
+- **Ep15-25:** score ~0.4-0.5 (после исправления всех P0)
+- **loss_memory:** должна стабилизироваться (reset каждую эпоху)
+- **loss_routing:** должна оставаться в диапазоне 0.05-0.15 (Z-loss активен)
+- **Нет score=0 записей** в логе (только eval эпохи логируются)
+
 ---
 
-## 10. Phase 10 — Улучшения архитектуры
-
-### Что добавлено (и что откатили)
-
-| Компонент | Статус | Результат |
-|-----------|--------|-----------|
-| GatedProjection 768→hidden | ⚠️ Реализовано, **ОТКАТ** | -0.198 (REGRESSION: 0.9347 vs 1.1370) |
-| Online Hard Negative Mining | ⚠️ Реализовано, **ОТКАТ** | -0.064 (дестабилизирует) |
-| Датасет v6 (213 пар) | ✅ Создано | v7 (232 пары) лучше |
-| Partial SBERT unfreeze | ⚠️ Реализовано, **ОТКАТ** | -0.408 (REGRESSION: 0.729) |
-| Simple MLP projection | ✅ **ОПТИМАЛЬНЫЙ** | Рекорд 1.1370 |
-
-**Ключевой вывод:** Simple MLP (Linear→LayerNorm→GELU→Dropout→Linear) стабильно превосходит GatedProjection и сложные варианты.
-
-### 10.1 SOTA улучшения (Focal-InfoNCE, temperature scheduling)
+## 9. SOTA улучшения
 
 | Метод | Источник | Статус | Ожидаемый прирост |
 |-------|----------|--------|-------------------|
-| **Router Z-Loss** | ST-MoE (Zoph et al., 2022) | ✅ Реализовано | +0.005-0.015 (стабильность) |
-| **Focal-InfoNCE** | Hou & Li, EMNLP 2023 | ⚠️ Запланировано | +0.010-0.015 |
-| **Temperature-Free InfoNCE** | Kim et al., Jan 2025 | ⚠️ Запланировано | убирает гиперпараметр |
+| **Router Z-Loss** | ST-MoE (Zoph et al., 2022) | ✅ Реализовано (Phase 13) | +0.005-0.015 |
+| **Focal-InfoNCE** | Hou & Li, EMNLP 2023 | ✅ Реализовано (Phase 14) | +0.010-0.015 |
+| **Temperature Scheduling** | warm_restart, synced с LR | ✅ Реализовано (Phase 14) | +0.003-0.008 |
+| **cosine_decay (нет restarts)** | альтернатива cosine_restarts | ✅ Реализовано (Phase 14) | устраняет дестабилизацию |
 | **Learnable Temperature** | CLIP, 2023 | ✅ Реализовано | стабильные градиенты |
+| **fp32 TTT path (AMP safe)** | Phase 17 fix C4 | ✅ Реализовано (Phase 17) | устраняет NaN/Inf при AMP |
+| **reset_memory() per epoch** | Phase 17 fix C5 | ✅ Реализовано (Phase 17) | устраняет memory drift |
+| **Dynamic load-balance loss** | Phase 17 fix C2 | ✅ Реализовано (Phase 17) | корректные градиенты MoE |
+| **Focal gamma → denominator only** | Phase 17 fix C6 | ✅ Реализовано (Phase 17) | правильный InfoNCE gradient |
+| **LR-restart detector + auto reset** | Phase 17 fix A2 | ✅ Реализовано (Phase 17) | стабильность при LR скачках |
 | **SparseMixer / Dense Backprop** | Panda et al., Apr 2025 | ⚠️ Запланировано | лучшие градиенты для роутера |
 
-**Router Z-Loss (lambda_z=0.001):**
+**Router Z-Loss** — critical при num_experts > 4:
 ```python
-# Формула: L_z = (1/B) * Σ_b (log Σ_e exp(router_logit_b,e))^2
-# Штрафует большие magnitudes router logits → стабильные dispatch weights
 z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
 ```
-**Для HDIM:** critical при num_experts > 4 (8 экспертов в Phase 13).
 
-**Focal-InfoNCE (следующий приоритет):**
+**Focal-InfoNCE** (Hou & Li, EMNLP 2023):
 ```python
-# Downweights easy negatives, focuses on hard negatives
-# +1.64 Spearman improvement на SimCSE-BERTbase
-# Рекомендация: использовать если Hard Neg Mining нестабилен
+# Downweights easy negatives via gamma scaling
+focal_sim = torch.exp(sim_matrix * gamma)  # gamma < 1
+log_denom = torch.logsumexp(focal_sim.masked_fill(eye, 0), dim=-1)
+loss = -(log(sim_diag) - log_denom[pos_indices]).mean()
 ```
-
-### GatedProjection
-```python
-# Вместо простого MLP:
-h = GELU(LayerNorm(Linear(768 → phidden)))
-out = LayerNorm(Linear_up(h) * sigmoid(Linear_gate(h)))
-```
-Mотивация: GLU-варианты (gated linear units) стабильно превосходят plain MLP в задачах трансформации embedding пространств.
-
-### Ожидаемый потолок Phase 10
-| Сценарий | Оценка |
-|----------|--------|
-| GatedProj + HardNeg + v6 | 0.993-0.997 |
-| + Partial SBERT unfreeze | 0.997-0.999 |
-| + hidden_dim=512, experts=8 | >0.999 |
 
 ---
 
-## 11. Исправленные баги (Phase 8)
+## 10. Исправленные баги
 
-### БАГ 1: Хардкод `config.num_experts` в `_allocate_state_tensors`
-**Файл:** `src/models/hdim_model.py`
-**Фикс:** заменить `self.config.num_experts` → `self.pipeline.moe.num_experts`
+### Phase 8
+| БАГ | Файл | Проблема | Фикс |
+|-----|------|----------|------|
+| 1 | `hdim_model.py` | Хардкод `config.num_experts` | → `moe.num_experts` |
+| 2 | `hdim_model.py` | `reset_memory` без guard | `hasattr(moe, 'train_scores')` |
+| 3 | `trainer.py` | fp16 overflow в HardNeg | `-1e9` → `-1e4` |
 
-### БАГ 2: `reset_memory` без guard на `train_scores`
-**Файл:** `src/models/hdim_model.py`
-**Фикс:** `if hasattr(self.pipeline.moe, 'train_scores'):` перед обращением
+### Phase 13 (аудит)
+| БАГ | Файл | Проблема | Фикс |
+|-----|------|----------|------|
+| 4 | `metrics.py` | re-concat `all_group_ids` в цикле | переиспользовать pre-computed `groups` |
+| 5 | `trainer.py` | GradScaler state не сохранялся | `scaler.load_state_dict()` в `load_checkpoint` |
+| 6 | `train.py` | Избыточная условная проверка | `needs_text` уже включает все условия |
 
-### БАГ 3: Hard Negative Mining fp16 overflow
-**Файл:** `src/training/trainer.py`
-**Фикс:** использовать `-1e4` вместо `-1e9` при masked_fill для fp16 совместимости
+### Phase 14 (исправление training instability)
+| Проблема | Причина | Решение |
+|----------|---------|---------|
+| LR restart дестабилизирует модель | CosineAnnealingWarmRestarts T_0=20 restart | → `cosine_decay` (монотонное снижение) |
+| Негативы слишком далеко | Все negatives equal weight | → Focal-InfoNCE (gamma=0.5) |
+| Зафиксированная температура | infonce_temperature=0.01 | → warm_restart schedule (0.1→0.01) |
 
-### 11.4 Исправленные баги (Phase 13)
+### Phase 17 (7×P0 + 5×P1 исправлений)
 
-#### БАГ 4: val_metrics не содержит loss_z
-**Файл:** `src/training/trainer.py:774-794`
-**Проблема:** `validate()` возвращает только 6 loss ключей (recon, iso, pair, routing, memory, total), но не включает `loss_z`.
-**Фикс:** добавить `loss_z` в totals dict:
-```python
-def validate(self, dataloader):
-    totals = {
-        "loss_recon": 0.0, "loss_iso": 0.0, "loss_pair": 0.0,
-        "loss_routing": 0.0, "loss_memory": 0.0, "loss_z": 0.0,  # NEW
-        "loss_total": 0.0,
-    }
-```
-**Причина:** val_loss не учитывает z-loss, что даёт неверное представление о стабильности роутера.
+**Критические баги P0 — устраняли silent failures и неверные градиенты:**
 
-#### БАГ 5: GradScaler checkpoint не восстанавливается в load_checkpoint
-**Файл:** `src/training/trainer.py:806-810`
-**Проблема:** `load_checkpoint()` восстанавливает model/optimizer/step, но не восстанавливает GradScaler state.
-**Фикс:** добавить `scaler.load_state_dict()`:
-```python
-def load_checkpoint(self, path, scaler=None):
-    checkpoint = torch.load(path, map_location=self.device)
-    self.model.load_state_dict(checkpoint["model_state_dict"])
-    self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    self._step = checkpoint.get("step", 0)
-    if scaler is not None and "scaler_state_dict" in checkpoint:
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
-```
-**Важно:** без этого восстановление AMP training после checkpoint даёт потерю scale factor → gradient explosion.
+| ID | Файл | Проблема | Решение |
+|----|------|----------|---------|
+| C1 | `soft_moe_router.py` | T=1 → dispatch не identity, некорректный forward | Guard: `if T == 1: return identity dispatch` |
+| C2 | `soft_moe_router.py` | Load balance loss статический (не обновлялся) | Пересчёт по текущей dispatch-матрице каждый forward |
+| C3 | `soft_moe_router.py` | In-place slice `buf[:, i] = ...` → сбой AMP/`torch.compile` | Заменён на `torch.cat` (out-of-place concat) |
+| C4 | `titans_memory.py` | NaN/Inf в TTT gradient step при AMP (fp16 overflow) | Явный cast TTT вычислений в fp32 |
+| C5 | `trainer.py` | `reset_memory()` не вызывался между эпохами → memory drift | Вызов `reset_memory()` внутри `set_epoch()` |
+| C6 | `trainer.py` | Focal gamma применялась к числителю И знаменателю InfoNCE | gamma только к знаменателю (математически корректно) |
+| C7 | `hierarchical_memory.py` | `requires_grad` на non-leaf tensor → RuntimeError | `detach().float().requires_grad_(True)` |
+
+**Важные проблемы P1 — улучшали стабильность и качество:**
+
+| ID | Файл | Проблема | Решение |
+|----|------|----------|---------|
+| A1 | `hdim_model.py` | Loss sum не нормирован по числу доменов | Деление каждого loss-слагаемого на `n_domains` |
+| A2 | `gpu_train.py` | Нет детектора LR restart → память не сбрасывается | Детектор скачка LR >2× + auto `reset_memory()` |
+| A3 | `trainer.py` | Default temperature 0.07 → overconfidence, плохие градиенты | Изменён дефолт на 0.15 |
+| A4 | `soft_moe_router.py` | Z-loss не был активирован по умолчанию | Z-loss включён: `lambda_z=0.01` в Phase 17 конфиге |
+| A6 | `gpu_train.py` | Лог писал score=0 на non-eval эпохах (80% фиктивных записей) | Логирование только при выполнении eval |
 
 ---
 
-## 12. Индекс файлов
+## 11. Индекс файлов
 
 ```
 src/core/
   hypercomplex.py         — Clifford/quaternion algebra и слои
   domain_operators.py     — DomainRotationOperator, InvariantExtractor
   titans_memory.py        — TitansMemory, HierarchicalTitansMemory
-  moe_router.py           — R3MoERouter (baseline)
-  soft_moe_router.py      — SoftMoERouter (Phase 9 рекорд)
-  modular_moe.py          — ModularMoERouter (add/remove expert)
+  soft_moe_router.py      — SoftMoERouter (DEFAULT router, soft dispatch)
+  modular_moe.py          — ModularMoERouter (add/remove expert, runtime)
   hdim_pipeline.py        — HDIMPipeline (оркестрация)
 
 src/models/
-  hdim_model.py           — HDIMModel (batch API)
-  text_hdim_model.py      — TextHDIMModel (text wrapper)
-  sbert_encoder.py        — SBERTEncoder + GatedProjection + partial unfreeze
+  hdim_model.py           — HDIMModel (batch API, domain-aware)
+  text_hdim_model.py      — TextHDIMModel (text wrapper, encode_texts)
+  sbert_encoder.py        — SBERTEncoder + SimpleMLP 768→384→hidden
   model_factory.py        — build_hdim_model, build_text_hdim_model, build_sbert_hdim_model
-  metrics.py              — compute_all_metrics, PRIMARY_SCORE
+  metrics.py              — compute_all_metrics, PRIMARY_SCORE, AFR, DRS
 
 src/training/
-  trainer.py              — HDIMTrainer + Hard Negative Mining
-  dataset.py              — demo datasets
-  real_dataset.py         — load_real_pairs_dataset, split_real_pairs
+  trainer.py              — HDIMTrainer (Focal-InfoNCE + AnglE + SupCon + temp schedule + AMP)
+  real_dataset.py         — RealPairsDataset, load_real_pairs_dataset
 
 scripts/
-  gpu_train.py            — основной скрипт обучения (AMP, scheduler, early stopping)
-  gen_dataset_v6.py       — генератор датасета v6 (213 пар)
+  gpu_train.py            — основной скрипт (AMP, scheduler, focal_gamma, temp_schedule)
+  gen_dataset_v8.py       — генератор v8 датасета (330 пар, 35.8% neg)
+  phase17_train.bat       — Phase 17 launch script (7×P0 + 5×P1 fixes, hidden=128, T=0.15)
 
 data/
-  real_pairs_v6.json      — 213 пар (актуальный датасет, Phase 10)
+  real_pairs_v8.json      — 330 пар (212+ / 118-) — АКТУАЛЬНЫЙ
+  real_pairs_v7.json      — 232 пары (legacy)
+  real_pairs_v6.json      — 213 пар (legacy)
   real_pairs_v5.json      — 175 пар (Phase 9 рекорд)
-  real_pairs_v4.json      — 140 пар (Phase 6e рекорд)
 
 artifacts/
-  phase9_v5_baseline/     — результаты Phase 9 (score=0.9930)
-  phase10_v6_gated_hardneg/ — Phase 10 результаты (TBD)
+  phase8e_soft_eval5/     — РЕКОРД: score=1.1370 (ep45, hidden=256, 4 experts)
+  phase13_scaled/         — Phase 13: best=0.696 (ep15, LR restart проблема)
+  phase14_sota/           — Phase 14: Focal-InfoNCE + cosine_decay + v8 (в процессе)
+  phase17/                — Phase 17: 7×P0 + 5×P1 fixes, hidden=128, T=0.15 (в процессе)
 ```

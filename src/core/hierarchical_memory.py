@@ -140,7 +140,9 @@ class HierarchicalTitansMemory(nn.Module):
             theta = theta * scale.clamp(0.0, 1.0)
 
         # TTT gradient in float32
-        mem_weight_fp32 = memory.weight.float()
+        # C7 FIX: use detach().float().requires_grad_(True) to create a fp32 leaf tensor
+        # memory.weight.float() creates a non-leaf node → autograd.grad() would fail
+        mem_weight_fp32 = memory.weight.detach().float().requires_grad_(True)
         pred = k32 @ mem_weight_fp32.T
         loss_ttt = F.mse_loss(pred, v32)
         if torch.isnan(loss_ttt) or torch.isinf(loss_ttt):
@@ -189,13 +191,39 @@ class HierarchicalTitansMemory(nn.Module):
         from src.core.titans_memory import MemoryState  # local import to avoid circularity
 
         h_state = self.retrieve(keys, values)
+        alpha, eta, theta = None, None, None
         if update_memory and self.training:
-            self.update(keys, values)
-        # MemoryState fields: retrieved, loss, updated — same contract as TitansMemoryModule
+            # A6 FIX: capture gate values from working memory update for MemoryState
+            alpha_w, eta_w, theta_w = self._update_level(
+                self.working_memory,
+                self.working_momentum,
+                keys, values,
+                self.working_gates,
+            )
+            # surprise-gated long-term update
+            surprise = self._compute_surprise(keys, values)
+            k_agg = self._aggregate_key(keys.detach())
+            gate_input = torch.cat(
+                [k_agg.reshape(1, -1),
+                 surprise.unsqueeze(0).reshape(1, 1)], dim=-1
+            ).squeeze(0)
+            longterm_gate = self.surprise_gate(gate_input.unsqueeze(0)).squeeze()
+            self._update_level(
+                self.longterm_memory,
+                self.longterm_momentum,
+                keys, values,
+                self.longterm_gates,
+                scale=longterm_gate,
+            )
+            alpha, eta, theta = alpha_w, eta_w, theta_w
+        # A6 FIX: populate alpha/eta/theta fields in MemoryState
         return MemoryState(
             retrieved=h_state.retrieved,
             loss=h_state.loss,
             updated=update_memory and self.training,
+            alpha=alpha,
+            eta=eta,
+            theta=theta,
         )
 
     def retrieve(
