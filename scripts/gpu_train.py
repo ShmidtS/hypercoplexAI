@@ -240,7 +240,10 @@ class GPUTrainingMonitor:
     def summary(self) -> dict:
         if not self.history:
             return {}
-        best = max(self.history, key=lambda x: x.get("score", -float("inf")))
+        scored = [x for x in self.history if x.get("score") is not None]
+        if not scored:
+            return {}
+        best = max(scored, key=lambda x: x["score"])
         return {
             "best_epoch": best["epoch"],
             "best_pair_margin": best["pair_margin"],
@@ -427,7 +430,13 @@ def run_gpu_training(
             generator=torch.Generator().manual_seed(args.seed + 99),
         )
 
-    _num_workers = min(4, __import__("os").cpu_count() or 1) if device.type == "cuda" else 0
+    # HDIM_NUM_WORKERS=0 отключает workers (используется auto_tune для экономии RAM)
+    import os as _os
+    _nw_env = _os.environ.get("HDIM_NUM_WORKERS")
+    if _nw_env is not None:
+        _num_workers = int(_nw_env)
+    else:
+        _num_workers = min(4, _os.cpu_count() or 1) if device.type == "cuda" else 0
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
     metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
