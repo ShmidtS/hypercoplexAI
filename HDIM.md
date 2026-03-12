@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 11.0 | Дата: 2026-03-12 | Рекорд: score=1.1370 (Phase 8e, ep45)*
+*Версия: 12.0 | Дата: 2026-03-12 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 13: 0.3076 (3 эп, augment=10, quick run)*
 
 ---
 
@@ -128,7 +128,28 @@ model.remove_domain('obsolete_domain')
 
 **PRIMARY_SCORE** = `pair_margin × 1.0 + STS_exported × 0.3`
 
----
+### 5.1 Рекомендации для v8 dataset
+
+**Критические недостатки v7:**
+- `augment_factor` — это НЕ аугментация, только shuffle/repeat одних и тех же 423 текстов
+- Негативные пары: 17.7% (41/232) — недостаточно для контрастного обучения
+- Domain 2->3 отсутствует полностью (0 пар)
+- Domain 3 как источник: 0 пар
+- Каждый pair имеет уникальный group_id → split становится случайным per-pair
+
+**План v8 (цель: 300+ пар, 35-40% негативных):**
+
+| Приоритет | Действие | Ожидаемый эффект |
+|-----------|----------|------------------|
+| HIGH | Добавить Domain 2->3 пары (15-20) | Заполнить критический пробел |
+| HIGH | Добавить Domain 3 как source (10-15) | Полная coverage домена Physics |
+| HIGH | Увеличить негативные пары до 35-40% | Улучшить контрастное обучение |
+| MEDIUM | Добавить backward pairs для всех негативов | 2x negative data без нового контента |
+| MEDIUM | T5-based парфразинг для позитивных пар | Настоящая аугментация текста |
+| LOW | Back-translation (en-de, en-fr, en-ja) | Лексическое разнообразие |
+| LOW | Standardize family naming convention | Улучшить split quality |
+
+**Не использовать:** Embedding mixup (экспериментально, может генерировать бессмысленный текст).
 
 ## 6. Результаты обучения
 
@@ -144,6 +165,9 @@ model.remove_domain('obsolete_domain')
 | 10a | 0.9347 | — | — | — | GatedProjection + HardNeg + v6 (РЕГРЕССИЯ) |
 | 10b | 0.729 | — | — | — | GatedProjection + partial unfreeze (РЕГРЕССИЯ) |
 | 10c | 0.9389 | — | — | ep25 | Simple MLP + v6 (best cycle 2) |
+| **12** | 0.9279 | 0.702 | 0.753 | ep10 | v7 + augment=50, T_mult=1 (ПРОВАЛ: деградация) |
+| **12b** | TBD | — | — | — | v7 + T_mult=2, warmup=5 (запущена 12.03) |
+| **13** | **0.3076** | **0.027** | **0.934** | **ep3** | **hidden=512, experts=8, lambda_z=0.001, augment=10 (в процессе)** |
 
 ### Phase 9 — детальный прогресс
 | Эпоха | Score | Margin | STS | Событие |
@@ -184,7 +208,22 @@ cd E:/hypercoplexAI && python scripts/gpu_train.py \
 **Результат:** score=1.1370 (ep45), pair_margin=0.9059, STS=0.7701
 **GPU:** NVIDIA RTX 3070 Laptop (8.6GB), PyTorch 2.6+cu124, 0.024 GB VRAM
 
-### Оптимизированная Phase 12 (к запуску)
+### Phase 12 — Провал (T_mult=1)
+
+```bash
+# ПРОВАЛ: score=0.9279 на ep10, затем деградация до 0.8010
+# Причина: T_mult=1 создаёт короткие циклы (20 эп), модель не сходится
+# loss_memory вырос с 2.41 до 3.67 — память расходится
+```
+
+| Эпоха | Score | Margin | STS | loss_memory | Причина |
+|-------|-------|--------|-----|-------------|---------|
+| ep10 | 0.9279 | 0.7019 | 0.7534 | 2.41 | **BEST** — цикл 1 |
+| ep15 | 0.8981 | 0.6651 | 0.7766 | 2.65 | цикл 1 конец |
+| ep20 | 0.9212 | 0.6986 | 0.7418 | 3.16 | рестарт LR |
+| ep29 | 0.8010 | 0.5718 | 0.7640 | 3.67 | деградация |
+
+### Phase 12b — Исправленная (запущена 12.03.2026)
 
 ```bash
 python scripts/gpu_train.py \
@@ -194,14 +233,43 @@ python scripts/gpu_train.py \
   --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3 \
   --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01 \
   --use_infonce --infonce_temperature 0.1 --learnable_temperature \
-  --early_stopping_patience 15 \
+  --early_stopping_patience 25 \
   --lr 0.0005 --seed 42 --batch_size 32 \
-  --scheduler_type cosine_restarts --t_mult 1 --warmup_epochs 3 \
+  --scheduler_type cosine_restarts --t_mult 2 --warmup_epochs 5 \
   --eval_every 5 --save_every 25 \
-  --output_dir artifacts/phase12_v7_clifford
+  --output_dir artifacts/phase12b_v7_fixed
 ```
 
-**Ожидание:** score 1.15-1.20, v7 (232 пары), T_mult=1 (без LR explosion)
+**Ключевое исправление:** `--t_mult 2` (возврат к Phase8e) + `--warmup_epochs 5` (T_0=30)
+**Ожидание:** score 1.15-1.20 на цикле 3 (ep60-90)
+
+### Phase 13 — Конфигурация (hidden=512, experts=8, lambda_z)
+
+```bash
+# Phase 13: scaled model + router z-loss + augment=10
+cd E:/hypercoplexAI && python scripts/gpu_train.py \
+  --epochs 200 --hidden_dim 512 --num_experts 8 --num_domains 4 \
+  --pretrained_encoder --soft_router \
+  --real_pairs data/real_pairs_v7.json --augment_factor 10 \
+  --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3 \
+  --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01 \
+  --lambda_z 0.001 \
+  --use_infonce --infonce_temperature 0.1 --learnable_temperature \
+  --early_stopping_patience 40 \
+  --lr 0.0005 --seed 42 --batch_size 32 \
+  --scheduler_type cosine_restarts --t_mult 2 --warmup_epochs 3 \
+  --eval_every 5 --save_every 25 \
+  --output_dir artifacts/phase13_scaled
+```
+
+**Ключевые изменения:**
+- `hidden_dim 512` — удвоение capacity для лучшего представления
+- `num_experts 8` — 4→8 экспертов для finer-grained routing
+- `lambda_z 0.001` — Router Z-Loss (ST-MoE) для стабильности logits
+- `augment_factor 10` — снижение с 50 до 10 (данные не настоящая аугментация, только shuffle)
+
+**Размер модели:** ~1.6M параметров (vs 414K в Phase 8e)
+**Текущий результат:** score=0.3076 (3 эп, augment=10) — training в процессе
 
 ---
 
@@ -270,6 +338,31 @@ cd E:/hypercoplexAI && python scripts/gpu_train.py \
 
 **Ключевой вывод:** Simple MLP (Linear→LayerNorm→GELU→Dropout→Linear) стабильно превосходит GatedProjection и сложные варианты.
 
+### 10.1 SOTA улучшения (Focal-InfoNCE, temperature scheduling)
+
+| Метод | Источник | Статус | Ожидаемый прирост |
+|-------|----------|--------|-------------------|
+| **Router Z-Loss** | ST-MoE (Zoph et al., 2022) | ✅ Реализовано | +0.005-0.015 (стабильность) |
+| **Focal-InfoNCE** | Hou & Li, EMNLP 2023 | ⚠️ Запланировано | +0.010-0.015 |
+| **Temperature-Free InfoNCE** | Kim et al., Jan 2025 | ⚠️ Запланировано | убирает гиперпараметр |
+| **Learnable Temperature** | CLIP, 2023 | ✅ Реализовано | стабильные градиенты |
+| **SparseMixer / Dense Backprop** | Panda et al., Apr 2025 | ⚠️ Запланировано | лучшие градиенты для роутера |
+
+**Router Z-Loss (lambda_z=0.001):**
+```python
+# Формула: L_z = (1/B) * Σ_b (log Σ_e exp(router_logit_b,e))^2
+# Штрафует большие magnitudes router logits → стабильные dispatch weights
+z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+```
+**Для HDIM:** critical при num_experts > 4 (8 экспертов в Phase 13).
+
+**Focal-InfoNCE (следующий приоритет):**
+```python
+# Downweights easy negatives, focuses on hard negatives
+# +1.64 Spearman improvement на SimCSE-BERTbase
+# Рекомендация: использовать если Hard Neg Mining нестабилен
+```
+
 ### GatedProjection
 ```python
 # Вместо простого MLP:
@@ -300,6 +393,37 @@ Mотивация: GLU-варианты (gated linear units) стабильно 
 ### БАГ 3: Hard Negative Mining fp16 overflow
 **Файл:** `src/training/trainer.py`
 **Фикс:** использовать `-1e4` вместо `-1e9` при masked_fill для fp16 совместимости
+
+### 11.4 Исправленные баги (Phase 13)
+
+#### БАГ 4: val_metrics не содержит loss_z
+**Файл:** `src/training/trainer.py:774-794`
+**Проблема:** `validate()` возвращает только 6 loss ключей (recon, iso, pair, routing, memory, total), но не включает `loss_z`.
+**Фикс:** добавить `loss_z` в totals dict:
+```python
+def validate(self, dataloader):
+    totals = {
+        "loss_recon": 0.0, "loss_iso": 0.0, "loss_pair": 0.0,
+        "loss_routing": 0.0, "loss_memory": 0.0, "loss_z": 0.0,  # NEW
+        "loss_total": 0.0,
+    }
+```
+**Причина:** val_loss не учитывает z-loss, что даёт неверное представление о стабильности роутера.
+
+#### БАГ 5: GradScaler checkpoint не восстанавливается в load_checkpoint
+**Файл:** `src/training/trainer.py:806-810`
+**Проблема:** `load_checkpoint()` восстанавливает model/optimizer/step, но не восстанавливает GradScaler state.
+**Фикс:** добавить `scaler.load_state_dict()`:
+```python
+def load_checkpoint(self, path, scaler=None):
+    checkpoint = torch.load(path, map_location=self.device)
+    self.model.load_state_dict(checkpoint["model_state_dict"])
+    self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    self._step = checkpoint.get("step", 0)
+    if scaler is not None and "scaler_state_dict" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+```
+**Важно:** без этого восстановление AMP training после checkpoint даёт потерю scale factor → gradient explosion.
 
 ---
 

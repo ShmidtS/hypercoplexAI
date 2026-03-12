@@ -40,6 +40,7 @@ class HDIMAuxState:
     train_scores_snapshot: torch.Tensor
     expert_usage: torch.Tensor
     routing_entropy: torch.Tensor
+    z_loss: torch.Tensor
     memory_updated: bool
     memory_mode: str
     update_memory: bool
@@ -58,6 +59,7 @@ class HDIMAuxState:
             "train_scores_snapshot": self.train_scores_snapshot,
             "expert_usage": self.expert_usage,
             "routing_entropy": self.routing_entropy,
+            "z_loss": self.z_loss,
             "memory_updated": self.memory_updated,
             "memory_mode": self.memory_mode,
             "update_memory": self.update_memory,
@@ -181,6 +183,7 @@ class HDIMModel(nn.Module):
         routing_entropy: torch.Tensor,
         memory_loss: torch.Tensor,
         router_loss: torch.Tensor,
+        z_loss: torch.Tensor,
         memory_updated: bool,
         runtime: HDIMRuntimeConfig,
     ) -> HDIMAuxState:
@@ -197,6 +200,7 @@ class HDIMModel(nn.Module):
             train_scores_snapshot=train_scores_snapshot,
             expert_usage=expert_usage,
             routing_entropy=routing_entropy,
+            z_loss=z_loss,
             memory_updated=memory_updated,
             memory_mode=runtime.memory_mode,
             update_memory=runtime.update_memory,
@@ -223,6 +227,7 @@ class HDIMModel(nn.Module):
             routing_entropy=router_state["routing_entropy"].to(device=device, dtype=dtype),
             memory_loss=transfer_state["memory_loss"].to(device=device, dtype=dtype),
             router_loss=router_state["router_loss"].to(device=device, dtype=dtype),
+            z_loss=router_state.get("z_loss", torch.zeros((), device=device, dtype=dtype)).to(device=device, dtype=dtype),
             memory_updated=bool(transfer_state["memory_updated"]),
             runtime=runtime,
         )
@@ -330,6 +335,7 @@ class HDIMModel(nn.Module):
         )
         memory_loss = torch.zeros((), device=x.device, dtype=x.dtype)
         router_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+        z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
         routing_entropy = torch.zeros((), device=x.device, dtype=x.dtype)
         memory_updated = False
 
@@ -355,6 +361,7 @@ class HDIMModel(nn.Module):
             memory_augmented_invariant[mask] = transfer_state["memory_augmented_invariant"].to(dtype=x.dtype)
             memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=x.dtype)
             router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=x.dtype)
+            z_loss = z_loss + transfer_state["router_state"].get("z_loss", torch.zeros((), device=x.device, dtype=x.dtype)).to(dtype=x.dtype)
             routing_entropy = routing_entropy + transfer_state["router_state"]["routing_entropy"].to(dtype=x.dtype)
             train_scores_snapshot.copy_(transfer_state["router_state"]["train_scores_snapshot"].to(dtype=x.dtype))
             expert_usage.copy_(transfer_state["router_state"]["expert_usage"].to(dtype=x.dtype))
@@ -375,6 +382,7 @@ class HDIMModel(nn.Module):
                 routing_entropy=routing_entropy,
                 memory_loss=memory_loss,
                 router_loss=router_loss,
+                z_loss=z_loss,
                 memory_updated=memory_updated,
                 runtime=runtime,
             )
@@ -492,6 +500,7 @@ class HDIMModel(nn.Module):
         output = torch.empty_like(source_encoding)
         memory_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
         router_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
+        z_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
         routing_entropy = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
         memory_updated = False
 
@@ -519,6 +528,7 @@ class HDIMModel(nn.Module):
             memory_augmented_invariant[mask] = transfer_state["memory_augmented_invariant"].to(dtype=source_encoding.dtype)
             memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=source_encoding.dtype)
             router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=source_encoding.dtype)
+            z_loss = z_loss + transfer_state["router_state"].get("z_loss", torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)).to(dtype=source_encoding.dtype)
             routing_entropy = routing_entropy + transfer_state["router_state"]["routing_entropy"].to(dtype=source_encoding.dtype)
             train_scores_snapshot.copy_(transfer_state["router_state"]["train_scores_snapshot"].to(dtype=source_encoding.dtype))
             expert_usage.copy_(transfer_state["router_state"]["expert_usage"].to(dtype=source_encoding.dtype))
@@ -537,6 +547,7 @@ class HDIMModel(nn.Module):
             routing_entropy=routing_entropy,
             memory_loss=memory_loss,
             router_loss=router_loss,
+            z_loss=z_loss,
             memory_updated=memory_updated,
             runtime=runtime,
         )

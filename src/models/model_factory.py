@@ -46,7 +46,7 @@ def _patch_hierarchical_memory(core_model: HDIMModel) -> None:
     pipeline.memory = new_memory  # type: ignore[assignment]
 
 
-def _patch_soft_router(core_model: HDIMModel) -> None:
+def _patch_soft_router(core_model: HDIMModel, z_loss_weight: float = 0.0) -> None:
     """Replace pipeline.moe with SoftMoERouter in-place.
 
     The replacement uses the same input_dim / num_experts as the original
@@ -65,6 +65,7 @@ def _patch_soft_router(core_model: HDIMModel) -> None:
         num_experts=cfg.num_experts,
         expert_dim=expert_dim,
         top_k=cfg.top_k,
+        z_loss_weight=z_loss_weight,
     )
     pipeline.moe = new_moe  # type: ignore[assignment]
 
@@ -152,6 +153,7 @@ def build_text_hdim_model(
     soft_router: bool = False,
     modular_moe: bool = False,
     modular_moe_routing_type: str = 'soft',
+    z_loss_weight: float = 0.0,
 ) -> TextHDIMModel:
     """Build a TextHDIMModel, optionally with Phase-2 advanced components.
 
@@ -171,7 +173,7 @@ def build_text_hdim_model(
         _patch_hierarchical_memory(core_model)
 
     if soft_router:
-        _patch_soft_router(core_model)
+        _patch_soft_router(core_model, z_loss_weight=z_loss_weight)
 
     if modular_moe:
         _patch_modular_moe(core_model, routing_type=modular_moe_routing_type)
@@ -196,6 +198,7 @@ def build_sbert_hdim_model(
     sbert_dropout: float = 0.1,
     unfreeze_layers: list | None = None,
     projection_hidden: int | None = None,
+    z_loss_weight: float = 0.0,
 ) -> TextHDIMModel:
     """Build a TextHDIMModel with frozen SBERT encoder (Phase 4 modernization).
 
@@ -217,7 +220,7 @@ def build_sbert_hdim_model(
         _patch_hierarchical_memory(core_model)
 
     if soft_router:
-        _patch_soft_router(core_model)
+        _patch_soft_router(core_model, z_loss_weight=z_loss_weight)
 
     if modular_moe:
         _patch_modular_moe(core_model, routing_type=modular_moe_routing_type)

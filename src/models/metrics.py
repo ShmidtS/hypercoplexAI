@@ -5,7 +5,7 @@ HDIM Quality Metrics:
 - DRS (Domain Routing Stability) — стабильность роутера при повторных вызовах
 - AFR (Analogy Feasibility Rate) — доля aligned pairs, проходящих margin-aware проверку
 """
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -16,28 +16,12 @@ def _model_device(model) -> torch.device:
     return next(model.parameters()).device
 
 
-def structural_transfer_score(
-    inv_source: torch.Tensor,
-    inv_target: torch.Tensor,
-) -> torch.Tensor:
-    """Косинусное сходство между двумя представлениями."""
-    return F.cosine_similarity(inv_source, inv_target, dim=-1).mean()
-
-
 def domain_routing_stability(
     routing_weights_list: List[torch.Tensor],
 ) -> torch.Tensor:
     """DRS: стабильность роутера — стандартное отклонение весов по нескольким прогонам."""
     stacked = torch.stack(routing_weights_list, dim=0)
     return stacked.std(dim=0).mean()
-
-
-def aligned_pair_margin(
-    aligned_scores: torch.Tensor,
-    mismatched_scores: torch.Tensor,
-) -> torch.Tensor:
-    """Средний зазор между aligned и mismatched similarity."""
-    return (aligned_scores - mismatched_scores).mean()
 
 
 def _compute_negative_pair_indices(batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
@@ -274,7 +258,7 @@ def compute_all_metrics(
                     neg_scores_list = []
                     pos_indices = pos_mask.nonzero(as_tuple=True)[0]
                     for pi in pos_indices:
-                        neg_mask2 = torch.cat(all_group_ids) != torch.cat(all_group_ids)[pi]
+                        neg_mask2 = groups != groups[pi]
                         if neg_mask2.any():
                             neg_sims = (src[pi:pi+1] * tgt[neg_mask2]).sum(dim=-1)
                             neg_scores_list.append(neg_sims.mean())

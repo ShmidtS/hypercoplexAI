@@ -6,7 +6,7 @@ HDIM — Hypercomplex Domain Isomorphism Machine
   1. Encoder: вход → мультивектор Cl_{p,q,r}
   2. InvariantExtractor: мультивектор → U_inv (структурный инвариант)
   3. TitansMemory: кэширование и поиск инвариантов
-  4. R3MoERouter: маршрутизация к доменным экспертам
+  4. SoftMoERouter: маршрутизация к доменным экспертам (soft dispatch)
   5. Decoder: U_inv → выход целевого домена
 """
 
@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from .domain_operators import DomainRotationOperator, InvariantExtractor, sandwich_transfer
 from .titans_memory import MemoryState, TitansMemoryModule
-from .moe_router import R3MoERouter
+from .soft_moe_router import SoftMoERouter
 
 
 @dataclass
@@ -166,11 +166,11 @@ class HDIMPipeline(nn.Module):
             hidden_dim=memory_key_dim * 2,
         )
         self.memory_key_proj = nn.Linear(clifford_dim, memory_key_dim)
-        self.moe = R3MoERouter(
+        self.moe = SoftMoERouter(
             input_dim=clifford_dim,
             num_experts=num_experts,
-            top_k=top_k,
             expert_dim=clifford_dim * 2,
+            top_k=top_k,
         )
 
     def encode_domain(

@@ -126,7 +126,7 @@ def _build_model(
 
     needs_text = args.text_mode or advanced_encoder or hierarchical_memory or soft_router
 
-    if needs_text or advanced_encoder or hierarchical_memory or soft_router:
+    if needs_text:
         return build_text_hdim_model(
             cfg,
             advanced_encoder=advanced_encoder,

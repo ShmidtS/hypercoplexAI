@@ -35,6 +35,7 @@ class HDIMTrainer:
         lambda_sts: float = 0.0,
         lambda_angle: float = 0.0,
         lambda_supcon: float = 0.0,
+        lambda_z: float = 0.0,
         learnable_temperature: bool = False,
     ) -> None:
         self.model = model.to(device)
@@ -51,6 +52,7 @@ class HDIMTrainer:
         self.lambda_sts = lambda_sts
         self.lambda_angle = lambda_angle
         self.lambda_supcon = lambda_supcon
+        self.lambda_z = lambda_z
         self._step: int = 0
         # Learnable temperature (log-scale for numerical stability)
         import math
@@ -697,6 +699,8 @@ class HDIMTrainer:
                     cos_sim = (src_norm * tgt_norm).sum(dim=-1)
                     loss_sts = (1.0 - cos_sim).mean()
 
+        # Router z-loss (ST-MoE stability)
+        loss_z = aux_state.z_loss
         loss_total = (
             loss_recon
             + self.lambda_iso * loss_iso
@@ -704,6 +708,7 @@ class HDIMTrainer:
             + self.lambda_routing * loss_routing
             + self.lambda_memory * loss_memory
             + self.lambda_sts * loss_sts
+            + self.lambda_z * loss_z
         )
         batch_losses = {
             "loss_total": loss_total,
@@ -787,19 +792,21 @@ class HDIMTrainer:
             for key in totals:
                 totals[key] /= n_batches
         return totals
-    def save_checkpoint(self, path: str) -> None:
+    def save_checkpoint(self, path: str, scaler=None) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        torch.save(
-            {
-                "step": self._step,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-            },
-            path,
-        )
+        checkpoint = {
+            "step": self._step,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }
+        if scaler is not None:
+            checkpoint["scaler_state_dict"] = scaler.state_dict()
+        torch.save(checkpoint, path)
 
-    def load_checkpoint(self, path: str) -> None:
+    def load_checkpoint(self, path: str, scaler=None) -> None:
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self._step = checkpoint.get("step", 0)
+        if scaler is not None and "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])

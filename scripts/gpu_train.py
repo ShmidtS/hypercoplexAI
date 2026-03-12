@@ -356,6 +356,7 @@ def run_gpu_training(
         lambda_sts=getattr(args, 'lambda_sts', 0.0),
         lambda_angle=getattr(args, 'lambda_angle', 0.0),
         lambda_supcon=getattr(args, 'lambda_supcon', 0.0),
+        lambda_z=getattr(args, 'lambda_z', 0.0),
         learnable_temperature=getattr(args, 'learnable_temperature', False),
     )
     # Attach hard negative mining flag
@@ -373,7 +374,7 @@ def run_gpu_training(
         augment = getattr(args, 'augment_factor', 8)
         dataset = load_real_pairs_dataset(real_pairs_path, augment_factor=augment, seed=args.seed)
         train_ds, val_ds = split_real_pairs(dataset, train_fraction=args.train_fraction, seed=args.seed)
-        metrics_ds = dataset  # use full dataset for metrics
+        metrics_ds = val_ds  # use held-out val split for honest metrics
         print(f"Real pairs dataset: {len(dataset)} total (augment x{augment})")
     else:
         dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
@@ -498,9 +499,9 @@ def run_gpu_training(
             if score > best_score:
                 best_score = score
                 best_score_epoch = epoch
-                trainer.save_checkpoint(str(best_checkpoint))
+                trainer.save_checkpoint(str(best_checkpoint), scaler=scaler)
 
-            # Early stopping — вне блока if score > best_score
+            # Early stopping
             early_stop_patience = getattr(args, 'early_stopping_patience', 0)
             if early_stop_patience > 0 and best_score_epoch > 0:
                 evals_since_best = (epoch - best_score_epoch) // args.eval_every
@@ -509,14 +510,16 @@ def run_gpu_training(
                     break
         else:
             monitor.log_epoch(
-                epoch, args.epochs, train_loss, val_metrics, quality_metrics,
+                epoch, args.epochs, train_loss,
+                {"loss_total": train_loss, "loss_recon": 0, "loss_iso": 0, "loss_pair": 0, "loss_routing": 0, "loss_memory": 0},
+                {"STS_exported": 0, "pair_margin": 0},
                 current_lr, nan_batches_epoch, nan_batches_total
             )
 
         if epoch % args.save_every == 0:
-            trainer.save_checkpoint(str(output_dir / "checkpoints" / f"epoch_{epoch:04d}.pt"))
+            trainer.save_checkpoint(str(output_dir / "checkpoints" / f"epoch_{epoch:04d}.pt"), scaler=scaler)
 
-    trainer.save_checkpoint(str(final_checkpoint))
+    trainer.save_checkpoint(str(final_checkpoint), scaler=scaler)
 
     training_summary = monitor.summary()
     results = {
@@ -574,6 +577,8 @@ def main() -> None:
     parser.add_argument("--lambda_iso", type=float, default=0.1)
     parser.add_argument("--lambda_pair", type=float, default=0.1)
     parser.add_argument("--lambda_routing", type=float, default=0.05)
+    parser.add_argument("--lambda_z", type=float, default=0.0,
+                        help="Router z-loss weight (ST-MoE stability, default=0=disabled)")
     parser.add_argument("--lambda_memory", type=float, default=0.01)
     parser.add_argument("--ranking_margin", type=float, default=0.3)
     # Dataset

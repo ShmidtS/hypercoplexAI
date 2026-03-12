@@ -67,6 +67,7 @@ class SoftMoERouter(nn.Module):
         slots_per_expert: int = 1,
         top_k: int = 2,  # kept for API compatibility
         temperature: float = 1.0,
+        z_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -75,6 +76,7 @@ class SoftMoERouter(nn.Module):
         self.top_k = min(top_k, num_experts)  # API compat
         self.temperature = temperature
         self.num_slots = num_experts * slots_per_expert
+        self.z_loss_weight = z_loss_weight
 
         # Dispatch parameter matrix: (input_dim, num_slots)
         self.dispatch_proj = nn.Linear(input_dim, self.num_slots, bias=False)
@@ -108,6 +110,14 @@ class SoftMoERouter(nn.Module):
         """
         # logits: (T, num_slots)
         logits = self.dispatch_proj(x) / self.temperature
+
+        # Router z-loss (ST-MoE): penalize large logit magnitudes
+        if self.z_loss_weight > 0:
+            z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+        else:
+            z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+        self._z_loss = z_loss
+
         # dispatch: нормализация по токенам (каждый слот получает mix токенов)
         dispatch = F.softmax(logits, dim=0)   # (T, num_slots)
         # combine: нормализация по слотам (каждый токен получает mix слотов)
@@ -138,12 +148,14 @@ class SoftMoERouter(nn.Module):
         slot_inputs = dispatch.T @ x_flat  # (num_slots, D)
 
         # Apply each expert to its slot(s)
+        # Batch process: group slots by expert for fewer forward passes
         slot_outputs = torch.zeros(self.num_slots, D, device=x.device, dtype=x.dtype)
         for expert_idx in range(self.num_experts):
-            for slot in range(self.slots_per_expert):
-                slot_id = expert_idx * self.slots_per_expert + slot
-                slot_out = self.experts[expert_idx](slot_inputs[slot_id].unsqueeze(0)).squeeze(0)
-                slot_outputs[slot_id] = slot_out
+            slot_start = expert_idx * self.slots_per_expert
+            slot_end = slot_start + self.slots_per_expert
+            expert_input = slot_inputs[slot_start:slot_end]  # (slots_per_expert, D)
+            expert_out = self.experts[expert_idx](expert_input)  # (slots_per_expert, D)
+            slot_outputs[slot_start:slot_end] = expert_out
 
         # Combine: y = combine @ slot_outputs
         # Shape: (T, D)
@@ -174,9 +186,14 @@ class SoftMoERouter(nn.Module):
         expert_usage = expert_weights.mean(0).detach()  # (num_experts,)
         routing_entropy = -(gate_weights * (gate_weights + 1e-8).log()).sum(dim=-1).mean()
 
+        # Add z_loss to router loss for stability
+        z_loss = getattr(self, '_z_loss', torch.zeros((), device=x.device, dtype=x.dtype))
+        router_loss = router_loss + self.z_loss_weight * z_loss
+
         router_state: Dict[str, Any] = {
             "loss": router_loss,
             "router_loss": router_loss,
+            "z_loss": z_loss,
             "scores": expert_weights.reshape(*orig_shape[:-1], self.num_experts),
             "topk_idx": topk_idx_view,
             "gate_weights": gate_weights,

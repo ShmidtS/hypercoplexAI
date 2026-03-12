@@ -15,14 +15,13 @@ from .domain_operators import (
     sandwich_transfer,
 )
 from .titans_memory import TitansMemoryModule
-from .moe_router import R3MoERouter
 from .hdim_pipeline import HDIMPipeline, HDIMEncoder, HDIMDecoder
 from .modular_moe import ModularMoERouter, ExpertConfig, ExpertModule, build_modular_moe
 
 __all__ = [
     'CliffordAlgebra', 'QuaternionLinear', 'PHMLinear', 'QLayerNorm', 'hamilton_product',
     'DomainRotationOperator', 'InvariantExtractor', 'DomainRegistry', 'sandwich_transfer',
-    'TitansMemoryModule', 'R3MoERouter',
+    'TitansMemoryModule',
     'HDIMPipeline', 'HDIMEncoder', 'HDIMDecoder',
     'ModularMoERouter', 'ExpertConfig', 'ExpertModule', 'build_modular_moe',
 ]
