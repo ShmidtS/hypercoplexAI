@@ -345,13 +345,13 @@ def run_gpu_training(
     )
 
     total_steps = args.epochs * max(1, getattr(args, 'num_samples', 500) // args.batch_size)
-    scheduler, scheduler_needs_score = _build_scheduler(optimizer, args, total_steps)
-    print(f"Scheduler: {getattr(args, 'scheduler_type', 'cosine_restarts')}")
-
     use_amp = (device.type == "cuda") and args.amp
     scaler = GradScaler("cuda") if use_amp else None
     if use_amp:
         print("Using Automatic Mixed Precision (AMP)")
+
+    total_steps = args.epochs * max(1, getattr(args, 'num_samples', 500) // args.batch_size)
+    scheduler, scheduler_needs_score = _build_scheduler(optimizer, args, total_steps)
 
     trainer = HDIMTrainer(
         model, optimizer,
@@ -368,11 +368,13 @@ def run_gpu_training(
         lambda_supcon=getattr(args, 'lambda_supcon', 0.0),
         lambda_z=getattr(args, 'lambda_z', 0.0),
         learnable_temperature=getattr(args, 'learnable_temperature', False),
+        lambda_dcl=getattr(args, 'lambda_dcl', 0.0),
+        lambda_uniformity=getattr(args, 'lambda_uniformity', 0.0),
     )
     # Focal-InfoNCE
     _focal_gamma = getattr(args, 'focal_gamma', 1.0)
+    trainer._focal_gamma = _focal_gamma
     if _focal_gamma < 1.0:
-        trainer._focal_gamma = _focal_gamma
         print(f"Focal-InfoNCE: gamma={_focal_gamma}")
     # Temperature scheduling
     _temp_schedule = getattr(args, 'temp_schedule', 'none')
@@ -385,11 +387,10 @@ def run_gpu_training(
     trainer.use_hard_negatives = getattr(args, 'use_hard_negatives', False)
     if trainer.use_hard_negatives:
         print("Hard Negative Mining: ENABLED")
-    # Add learnable temperature to optimizer if enabled
+    # Add learnable temperature to optimizer (must be before scheduler)
     if getattr(args, 'learnable_temperature', False) and trainer._log_temp is not None:
         optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * 0.1})
         print(f"Learnable temperature enabled (init={trainer._log_temp.exp().item():.4f})")
-
     real_pairs_path = getattr(args, 'real_pairs', None)
     if real_pairs_path:
         from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
@@ -426,9 +427,11 @@ def run_gpu_training(
             generator=torch.Generator().manual_seed(args.seed + 99),
         )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=(device.type == "cuda"))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"))
-    metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"))
+    _num_workers = min(4, __import__("os").cpu_count() or 1) if device.type == "cuda" else 0
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+    metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+    print(f"DataLoader: num_workers={_num_workers}, pin_memory={device.type == chr(99)+chr(117)+chr(100)+chr(97)}")
 
     print(f"Dataset: {len(train_ds)} train / {len(val_ds)} val")
 
@@ -617,6 +620,10 @@ def main() -> None:
     parser.add_argument("--lambda_routing", type=float, default=0.05)
     parser.add_argument("--lambda_z", type=float, default=0.0,
                         help="Router z-loss weight (ST-MoE stability, default=0=disabled)")
+    parser.add_argument("--lambda_dcl", type=float, default=0.0,
+                        help="DCL loss weight (Decoupled Contrastive, Yeh et al. 2022, try 0.3-0.5)")
+    parser.add_argument("--lambda_uniformity", type=float, default=0.0,
+                        help="Uniformity+Alignment loss weight (Wang & Isola 2020, try 0.1-0.3)")
     parser.add_argument("--lambda_memory", type=float, default=0.01)
     parser.add_argument("--ranking_margin", type=float, default=0.3)
     # Dataset

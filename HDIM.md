@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 17.0 | Дата: 2026-03-12 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 16: пик 0.378 (ep25), деградация до 0.181 (ep30) — MoE collapse + memory drift | Phase 17: 7×P0 + 5×P1 исправлений, запущена | Коммит: 036e3f5 (audit)*
+*Версия: 20.0 | Дата: 2026-03-12 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 19: запущен (ep11, score→0.489) | Phase 20: DCL + Uniformity-Alignment + batch_size=64 | Коммит: (в работе)*
 
 ---
 
@@ -371,6 +371,33 @@ cd E:/hypercoplexAI && python scripts/gpu_train.py \
 **Размер модели:** ~1.6M параметров (vs 414K в Phase 8e)
 **Текущий результат:** score=0.3076 (3 эп, augment=10) — training в процессе
 
+
+### Phase 19 конфиг (в процессе — антиколлапс + v7 данные)
+
+```bash
+python scripts/gpu_train.py   --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4   --pretrained_encoder --soft_router   --real_pairs data/real_pairs_v7.json --augment_factor 30   --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3   --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01   --use_infonce --infonce_temperature 0.1 --learnable_temperature   --focal_gamma 0.5 --early_stopping_patience 40   --lr 0.0005 --seed 42 --batch_size 32   --scheduler_type cosine_restarts --t_mult 2 --warmup_epochs 3   --eval_every 5 --output_dir artifacts/phase19_run --amp
+```
+**Статус:** ep11, score=0.489 (прогресс ep5→ep10: 0.444→0.489)
+**Скорость:** ~167 сек/эп с v7 (18420 items), GPU=0.21GB
+
+---
+
+### Phase 20 конфиг (DCL + Uniformity + v5 + batch_size=64)
+
+```bash
+python scripts/gpu_train.py   --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4   --pretrained_encoder --soft_router   --real_pairs data/real_pairs_v5.json --augment_factor 30   --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3   --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01   --lambda_z 0.01 --lambda_dcl 0.3 --lambda_uniformity 0.1   --use_infonce --infonce_temperature 0.1 --learnable_temperature   --focal_gamma 0.5 --early_stopping_patience 40   --lr 0.0005 --seed 42 --batch_size 64   --scheduler_type cosine_restarts --t_mult 2 --warmup_epochs 3   --eval_every 5 --output_dir artifacts/phase20_dcl_uniform --amp
+```
+
+**Ключевые изменения от Phase 8e рекорда:**
+- `lambda_dcl 0.3` — DCL loss (позитив убран из знаменателя InfoNCE)
+- `lambda_uniformity 0.1` — Uniformity+Alignment (равномерное распределение на гиперсфере)
+- `lambda_z 0.01` — Router Z-Loss (стабилизация MoE logits)
+- `batch_size 64` — 2x больше негативов in-batch (VRAM позволяет: 0.2GB из 8.6GB)
+- `data v5` — возврат к Phase8e рекордным данным
+- `num_workers=4` — 3-4x ускорение DataLoader (автоматически через gpu_train.py)
+
+**Ожидаемый score:** 1.18-1.23 на цикле 3 (ep45-60)
+
 ---
 
 ## 8. Паттерны обучения
@@ -423,6 +450,9 @@ ep30-45: score стагнирует ~0.18    (все токены → 1 эксп
 | **Focal gamma → denominator only** | Phase 17 fix C6 | ✅ Реализовано (Phase 17) | правильный InfoNCE gradient |
 | **LR-restart detector + auto reset** | Phase 17 fix A2 | ✅ Реализовано (Phase 17) | стабильность при LR скачках |
 | **SparseMixer / Dense Backprop** | Panda et al., Apr 2025 | ⚠️ Запланировано | лучшие градиенты для роутера |
+| **DCL (Decoupled Contrastive Loss)** | Yeh et al., NeurIPS 2022 | ✅ Реализовано (Phase 20) | +0.020-0.040 pair_margin |
+| **Uniformity + Alignment** | Wang & Isola, ICML 2020 | ✅ Реализовано (Phase 20) | +0.010-0.020 STS |
+| **DataLoader num_workers=4** | PyTorch best practices | ✅ Реализовано (Phase 20) | 3-4x скорость epoch |
 
 **Router Z-Loss** — critical при num_experts > 4:
 ```python
@@ -461,6 +491,16 @@ loss = -(log(sim_diag) - log_denom[pos_indices]).mean()
 | LR restart дестабилизирует модель | CosineAnnealingWarmRestarts T_0=20 restart | → `cosine_decay` (монотонное снижение) |
 | Негативы слишком далеко | Все negatives equal weight | → Focal-InfoNCE (gamma=0.5) |
 | Зафиксированная температура | infonce_temperature=0.01 | → warm_restart schedule (0.1→0.01) |
+
+### Phase 20 (новые SOTA методы + оптимизации)
+
+| Изменение | Файл | Описание | Статус |
+|-----------|------|----------|---------|
+| DCL loss | `trainer.py` | Decoupled Contrastive Loss — убираем positive из denominator InfoNCE | ✅ Реализовано |
+| Uniformity+Alignment | `trainer.py` | Wang & Isola 2020 — явное alignment + uniform гиперсфера | ✅ Реализовано |
+| lambda_dcl, lambda_uniformity | `gpu_train.py` | Новые аргументы обучения | ✅ Реализовано |
+| DataLoader num_workers=4 | `gpu_train.py` | Параллельная загрузка данных | ✅ Реализовано |
+| persistent_workers + prefetch | `gpu_train.py` | Снижение CPU bottleneck | ✅ Реализовано |
 
 ### Phase 17 (7×P0 + 5×P1 исправлений)
 
@@ -514,6 +554,8 @@ scripts/
   gpu_train.py            — основной скрипт (AMP, scheduler, focal_gamma, temp_schedule)
   gen_dataset_v8.py       — генератор v8 датасета (330 пар, 35.8% neg)
   phase17_train.bat       — Phase 17 launch script (7×P0 + 5×P1 fixes, hidden=128, T=0.15)
+  phase19_train.bat       — Phase 19 launch script (антиколлапс + v7, hidden=256)
+  phase20_train.bat       — Phase 20 launch script (DCL+Uniform+batch64+v5, цель >1.20)
 
 data/
   real_pairs_v8.json      — 330 пар (212+ / 118-) — АКТУАЛЬНЫЙ

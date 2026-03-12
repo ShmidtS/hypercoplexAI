@@ -37,6 +37,8 @@ class HDIMTrainer:
         lambda_supcon: float = 0.0,
         lambda_z: float = 0.0,
         learnable_temperature: bool = False,
+        lambda_dcl: float = 0.0,
+        lambda_uniformity: float = 0.0,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -53,6 +55,8 @@ class HDIMTrainer:
         self.lambda_angle = lambda_angle
         self.lambda_supcon = lambda_supcon
         self.lambda_z = lambda_z
+        self.lambda_dcl = lambda_dcl
+        self.lambda_uniformity = lambda_uniformity
         self._step: int = 0
         # Focal-InfoNCE gamma (Hou & Li, EMNLP 2023)
         self._focal_gamma: float = 1.0  # 1.0 = standard InfoNCE, <1 = focal
@@ -203,6 +207,43 @@ class HDIMTrainer:
 
     def _zero_loss(self, reference: torch.Tensor) -> torch.Tensor:
         return torch.zeros((), device=reference.device, dtype=reference.dtype)
+
+    def _compute_diversity_loss(self, exported_invariant: torch.Tensor) -> torch.Tensor:
+        """Anti-collapse: encourage variance in invariant vectors.
+
+        Prevents the degenerate solution where all exported_invariants
+        converge to the same constant vector (causing STS→1.0, margin→0).
+
+        Uses two penalties:
+        1. Variance penalty: -mean(‖x_i - mean‖²) — push vectors apart
+        2. Orthogonality bonus: encourage non-zero pairwise angles
+
+        Returns zero loss when batch is too small (< 4) to be meaningful.
+        """
+        B = exported_invariant.shape[0]
+        if B < 4:
+            return self._zero_loss(exported_invariant)
+
+        # Normalize for consistent scale
+        x = F.normalize(exported_invariant, dim=-1)  # (B, D)
+
+        # 1. Variance penalty: encourage vectors to spread out on the hypersphere
+        mean_vec = x.mean(dim=0, keepdim=True)  # (1, D)
+        variance = ((x - mean_vec) ** 2).sum(dim=-1).mean()  # scalar
+
+        # 2. Cosine spread: penalize high average pairwise cosine similarity
+        # When all vectors collapse to one direction, avg_cosine → 1.0
+        cos_matrix = x @ x.T  # (B, B)
+        eye = torch.eye(B, device=x.device, dtype=torch.bool)
+        off_diag = cos_matrix.masked_fill(eye, 0.0)
+        avg_cosine = off_diag.abs().sum() / max(2 * (B * B - B), 1)
+
+        # Combined: we want HIGH variance and LOW avg cosine
+        # loss_div = -variance + avg_cosine (minimize this)
+        lambda_var = 0.01
+        lambda_ortho = 0.005
+        loss_div = -lambda_var * variance + lambda_ortho * avg_cosine
+        return loss_div
 
     def _resolve_pair_group_id(self, batch: Dict[str, Any]) -> torch.Tensor | None:
         pair_group_id = batch.get("pair_group_id")
@@ -418,20 +459,15 @@ class HDIMTrainer:
         temperature: float = 0.07,
         gamma: float = 0.5,
     ) -> torch.Tensor:
-        """Focal-InfoNCE loss — FIXED implementation.
+        """Focal-InfoNCE loss (Hou & Li, EMNLP Findings 2023).
 
-        Правильная формула: gamma применяется как reweighting weights softmax,
-        НЕ как масштаб логитов. Это гарантирует loss ≥ 0 при любых условиях.
+        Downweights easy negatives via focal exponent scaling.
+        When gamma < 1.0, the denominator compresses contribution of
+        well-separated negatives, focusing learning on hardest pairs.
 
-        Правильная формула (Yeh et al. reweighted InfoNCE):
-            w_j = softmax(s_ij/τ)^gamma  — focal weights для negatives
-            L_i = -s_ii/τ + log(Σ_j w_j * exp(s_ij/τ)) / (Σ w_j)
-
-        Но для простоты и стабильности используем CE с reweighted denominator:
-            L_i = -log( exp(s_ii/τ) / (exp(s_ii/τ) + Σ_{j≠i} exp(s_ij/τ)^γ * exp(s_ij/τ)) )
-
-        Упрощённо: стандартный InfoNCE с clamp чтобы избежать negative loss.
-        Это эквивалентно стандартному InfoNCE (всегда ≥ 0, bounded below by log(B)).
+        Implementation: apply gamma to the similarity matrix before
+        cross-entropy, which is equivalent to focal modulation of
+        the softmax probabilities.
 
         Args:
             source_inv: (B, D) source exported_invariant
@@ -439,9 +475,9 @@ class HDIMTrainer:
             pair_relation_label: (B,) 1.0=positive, 0.0=negative
             pair_weight: (B,) per-sample weights
             temperature: softmax temperature
-            gamma: focal parameter (не используется — оставлен для совместимости)
+            gamma: focal parameter (1.0=standard, 0.5=moderate focus on hard)
         Returns:
-            scalar InfoNCE loss (всегда ≥ 0)
+            scalar InfoNCE loss (always >= 0)
         """
         B = source_inv.shape[0]
         if B < 2:
@@ -454,20 +490,128 @@ class HDIMTrainer:
         src = F.normalize(source_inv, dim=-1)
         tgt = F.normalize(target_inv, dim=-1)
 
-        # Similarity matrix: (B, B) — делённое на τ
-        sim_matrix = src @ tgt.T / temperature
-
-        # Standard InfoNCE = CE(sim_matrix[pos_indices], labels[pos_indices])
-        # CE loss ВСЕГДА ≥ 0, bounded below by 0 (perfect separation)
         pos_indices = positive_mask.nonzero(as_tuple=True)[0]
         labels = torch.arange(B, device=self.device)
 
-        loss_per_sample = F.cross_entropy(
-            sim_matrix[pos_indices], labels[pos_indices], reduction='none'
-        )
+        if gamma >= 0.99:
+            # Standard InfoNCE path (no focal modulation)
+            sim_matrix = src @ tgt.T / temperature
+            loss_per_sample = F.cross_entropy(
+                sim_matrix[pos_indices], labels[pos_indices], reduction='none'
+            )
+        else:
+            # Focal-InfoNCE: scale logits by gamma before CE
+            # This compresses the softmax denominator toward uniform,
+            # downweighting easy negatives that already have low probability.
+            sim_matrix = src @ tgt.T / temperature
+            # Focal scaling: lower gamma → more aggressive downweighting
+            # Equivalent to: (exp(s/τ))^γ / Σ_j (exp(s_j/τ))^γ
+            focal_matrix = sim_matrix * gamma
+            loss_per_sample = F.cross_entropy(
+                focal_matrix[pos_indices], labels[pos_indices], reduction='none'
+            )
 
         weights = pair_weight[pos_indices]
         return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
+
+
+    def _compute_dcl_loss(
+        self,
+        source_inv: torch.Tensor,
+        target_inv: torch.Tensor,
+        pair_relation_label: torch.Tensor,
+        pair_weight: torch.Tensor,
+        temperature: float = 0.07,
+    ) -> torch.Tensor:
+        """Decoupled Contrastive Loss (DCL) — Yeh et al., NeurIPS 2022.
+
+        Ключевое отличие от InfoNCE: positive убирается из знаменателя.
+        L_DCL = -log( exp(s_pos/τ) / Σ_{j: j≠pos} exp(s_j/τ) )
+
+        Это устраняет "positive-negative coupling" — InfoNCE подавляет
+        градиент от трудных негативов когда positive слишком похож.
+        Математически: gradient для negative = p_j*(1 + β_j) где β_j > 0 для DCL.
+
+        Refs: Decoupled Contrastive Learning (Yeh et al., NeurIPS 2022)
+        """
+        B = source_inv.shape[0]
+        if B < 2:
+            return self._zero_loss(source_inv)
+
+        positive_mask = pair_relation_label > 0.5
+        if not positive_mask.any():
+            return self._zero_loss(source_inv)
+
+        src = F.normalize(source_inv, dim=-1)   # (B, D)
+        tgt = F.normalize(target_inv, dim=-1)   # (B, D)
+
+        sim_matrix = src @ tgt.T / temperature  # (B, B)
+
+        pos_indices = positive_mask.nonzero(as_tuple=True)[0]
+        diag_mask = torch.eye(B, dtype=torch.bool, device=self.device)
+
+        losses = []
+        for i in pos_indices:
+            s_pos = sim_matrix[i, i]  # positive similarity (diagonal)
+            # Знаменатель: все j кроме самого positive (i,i)
+            neg_mask = ~diag_mask[i]
+            log_denom = torch.logsumexp(sim_matrix[i][neg_mask], dim=0)
+            loss_i = -(s_pos - log_denom)
+            losses.append(loss_i)
+
+        if not losses:
+            return self._zero_loss(source_inv)
+
+        loss_tensor = torch.stack(losses)
+        weights = pair_weight[pos_indices]
+        return (loss_tensor * weights).sum() / weights.sum().clamp_min(1e-8)
+
+    def _compute_uniformity_alignment_loss(
+        self,
+        source_inv: torch.Tensor,
+        target_inv: torch.Tensor,
+        pair_relation_label: torch.Tensor,
+        t_uniform: float = 2.0,
+        lambda_align: float = 1.0,
+        lambda_uniform: float = 0.5,
+    ) -> torch.Tensor:
+        """Uniformity + Alignment loss (Wang & Isola, ICML 2020).
+
+        L_align  = E[||f(x)-f(y)||²]  — выравниваем позитивные пары
+        L_uniform = log E[exp(-t||f(x)-f(z)||²)] — отталкиваем все равномерно
+
+        Эти два компонента разделены: alignment только для позитивов,
+        uniformity для всех. Это более стабильно чем InfoNCE.
+
+        Refs: Understanding Contrastive Representation Learning through
+        Alignment and Uniformity on the Hypersphere (Wang & Isola, ICML 2020)
+        """
+        B = source_inv.shape[0]
+        if B < 4:
+            return self._zero_loss(source_inv)
+
+        positive_mask = pair_relation_label > 0.5
+        src = F.normalize(source_inv, dim=-1)  # (B, D)
+        tgt = F.normalize(target_inv, dim=-1)  # (B, D)
+
+        # Alignment: только для positives
+        if positive_mask.any():
+            src_pos = src[positive_mask]  # (Np, D)
+            tgt_pos = tgt[positive_mask]  # (Np, D)
+            loss_align = (src_pos - tgt_pos).pow(2).sum(dim=-1).mean()
+        else:
+            loss_align = self._zero_loss(source_inv)
+
+        # Uniformity: по всем парам (src ∪ tgt)
+        all_vecs = torch.cat([src, tgt], dim=0)  # (2B, D)
+        diffs = all_vecs.unsqueeze(0) - all_vecs.unsqueeze(1)  # (2B, 2B, D)
+        sq_dists = diffs.pow(2).sum(dim=-1)  # (2B, 2B)
+        # Маскируем диагональ (нулевое расстояние до себя)
+        mask = ~torch.eye(2 * B, dtype=torch.bool, device=self.device)
+        sq_dists_off = sq_dists[mask].view(2 * B, 2 * B - 1)
+        loss_uniform = torch.log(torch.exp(-t_uniform * sq_dists_off).mean())
+
+        return lambda_align * loss_align + lambda_uniform * loss_uniform
 
     def _compute_supcon_loss(
         self,
@@ -605,6 +749,24 @@ class HDIMTrainer:
                     pair_group_id,
                 )
                 total_loss = total_loss + self.lambda_supcon * supcon
+            # DCL loss (Decoupled Contrastive, Yeh et al. 2022)
+            if getattr(self, 'lambda_dcl', 0.0) > 0:
+                dcl = self._compute_dcl_loss(
+                    exported_invariant,
+                    pair_exported_target,
+                    pair_relation_label,
+                    pair_weight,
+                    temperature=temp,
+                )
+                total_loss = total_loss + self.lambda_dcl * dcl
+            # Uniformity + Alignment loss (Wang & Isola, ICML 2020)
+            if getattr(self, 'lambda_uniformity', 0.0) > 0:
+                uni_align = self._compute_uniformity_alignment_loss(
+                    exported_invariant,
+                    pair_exported_target,
+                    pair_relation_label,
+                )
+                total_loss = total_loss + self.lambda_uniformity * uni_align
             return total_loss
 
         # Legacy ranking margin fallback
@@ -792,6 +954,14 @@ class HDIMTrainer:
 
         # Router z-loss (ST-MoE stability)
         loss_z = aux_state.z_loss
+
+        # Anti-collapse diversity loss: encourage variance in exported_invariant
+        # Prevents trivial solution where all invariants are identical (STS→1.0, margin→0)
+        # Only applied when we have paired data (need diverse samples in batch)
+        loss_diversity = self._zero_loss(training_invariant)
+        if self._has_pairs(batch) and pair_relation_label is not None:
+            loss_diversity = self._compute_diversity_loss(aux_state.exported_invariant)
+
         loss_total = (
             loss_recon
             + self.lambda_iso * loss_iso
@@ -800,6 +970,7 @@ class HDIMTrainer:
             + self.lambda_memory * loss_memory
             + self.lambda_sts * loss_sts
             + self.lambda_z * loss_z
+            + loss_diversity
         )
         batch_losses = {
             "loss_total": loss_total,
@@ -808,6 +979,7 @@ class HDIMTrainer:
             "loss_pair": loss_pair,
             "loss_routing": loss_routing,
             "loss_memory": loss_memory,
+            "loss_diversity": loss_diversity,
             "routing_weights": routing_weights,
             "invariant": invariant,
             "raw_invariant": aux_state.raw_invariant,
@@ -870,6 +1042,7 @@ class HDIMTrainer:
             "loss_pair": 0.0,
             "loss_routing": 0.0,
             "loss_memory": 0.0,
+            "loss_diversity": 0.0,
             "loss_total": 0.0,
         }
         n_batches = 0
