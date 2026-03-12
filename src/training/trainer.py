@@ -737,14 +737,22 @@ class HDIMTrainer:
         with torch.no_grad():
             return self._compute_batch_losses(batch)
 
-    def train_step(self, batch: Dict[str, Any]) -> torch.Tensor:
+    def train_step(self, batch: Dict[str, Any], scaler=None) -> torch.Tensor:
+        """Execute one training step with optional AMP scaler support."""
         self.model.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         losses = self._compute_batch_losses(batch)
         loss_total = losses["loss_total"]
-        loss_total.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss_total).backward()
+            scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            scaler.step(self.optimizer)
+            scaler.update()
+        else:
+            loss_total.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
         self._step += 1
         return loss_total.detach()
 

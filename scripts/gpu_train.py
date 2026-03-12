@@ -48,6 +48,7 @@ from src.training.trainer import HDIMTrainer
 
 
 # ---------------------------------------------------------------------------
+
 # Primary score formula — единственное место определения «качества прогона».
 # autoresearch_loop.py импортирует эту же формулу для согласованности.
 # ---------------------------------------------------------------------------
@@ -127,7 +128,7 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             unfreeze_layers=unfreeze_layers,
             projection_hidden=getattr(args, 'sbert_projection_hidden', None),
         )
-        print("Components: SBERT(paraphrase-multilingual-mpnet-base-v2) + GatedProjection")
+        print("Components: SBERT(paraphrase-multilingual-mpnet-base-v2) + SimpleMLP")
         if unfreeze_layers:
             print(f"  + Partial SBERT unfreeze: {unfreeze_layers}")
         if args.hierarchical_memory:
@@ -261,7 +262,7 @@ def _build_scheduler(optimizer, args, total_steps: int):
         return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
             T_0=max(getattr(args, "warmup_epochs", 3) * 3, 20),
-            T_mult=2,
+            T_mult=getattr(args, "t_mult", 2),
             eta_min=lr * 1e-3,
         ), False  # (scheduler, needs_score)
     elif stype == "cosine_decay":
@@ -453,17 +454,13 @@ def run_gpu_training(
             try:
                 if use_amp and scaler is not None:
                     with autocast("cuda"):
-                        loss = trainer.train_step(batch)
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        nan_batches_epoch += 1
-                        nan_batches_total += 1
-                        continue
+                        loss = trainer.train_step(batch, scaler=scaler)
                 else:
                     loss = trainer.train_step(batch)
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        nan_batches_epoch += 1
-                        nan_batches_total += 1
-                        continue
+                if torch.isnan(loss) or torch.isinf(loss):
+                    nan_batches_epoch += 1
+                    nan_batches_total += 1
+                    continue
                 epoch_loss += loss.item()
                 n_batches += 1
             except RuntimeError as e:
@@ -490,7 +487,6 @@ def run_gpu_training(
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val_metrics = trainer.validate(val_loader)
-            from src.models.metrics import compute_all_metrics
             quality_metrics = compute_all_metrics(model, metrics_loader)
 
             score = compute_primary_score(quality_metrics)
@@ -629,6 +625,8 @@ def main() -> None:
     parser.add_argument("--scheduler_type", default="cosine_restarts",
                         choices=["cosine_restarts", "cosine_decay", "plateau", "onecycle"],
                         help="LR scheduler type (default: cosine_restarts)")
+    parser.add_argument("--t_mult", type=int, default=2,
+                        help="T_mult for cosine_restarts scheduler (default: 2, use 1 for stable LR)")
     parser.add_argument("--learnable_temperature", action="store_true", default=False,
                         help="Use learnable InfoNCE temperature (log-parameterized)")
     # Monitoring

@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 10.0 | Дата: 2026-03-11 | Рекорд: score=0.9930 (Phase 9, ep55)*
+*Версия: 11.0 | Дата: 2026-03-12 | Рекорд: score=1.1370 (Phase 8e, ep45)*
 
 ---
 
@@ -47,8 +47,10 @@ $$L_{total} = L_{recon} + \lambda_{iso} L_{iso} + \lambda_{pair} L_{pair} + \lam
 
 ### Пайплайн
 ```
-Текст → SBERT(frozen/partial) → GatedProjection → InvariantExtractor → TitansMemory → SoftMoERouter → DecoupledDecoder
+Текст → SBERT(frozen) → SimpleMLP(768→384→256) → InvariantExtractor → TitansMemory → SoftMoERouter → DecoupledDecoder
 ```
+
+**Важно:** GatedProjection (Phase 10) показал **регрессию** — 0.9347 << 1.1370. Оптимальная проекция: simple MLP (Linear→LayerNorm→GELU→Dropout→Linear).
 
 ### Ключевые модули
 | Модуль | Файл | Назначение |
@@ -58,7 +60,7 @@ $$L_{total} = L_{recon} + \lambda_{iso} L_{iso} + \lambda_{pair} L_{pair} + \lam
 | `TitansMemory` | `src/core/titans_memory.py` | Ассоциативная память |
 | `SoftMoERouter` | `src/core/soft_moe_router.py` | Мягкая маршрутизация (Phase 9 рекорд) |
 | `ModularMoERouter` | `src/core/modular_moe.py` | Модульный роутер (add/remove expert) |
-| `SBERTEncoder` | `src/models/sbert_encoder.py` | **GatedProjection** 768→hidden_dim |
+| `SBERTEncoder` | `src/models/sbert_encoder.py` | **Simple MLP** 768→384→256 |
 | `HDIMModel` | `src/models/hdim_model.py` | Batch-facing API |
 | `TextHDIMModel` | `src/models/text_hdim_model.py` | Text entry wrapper |
 | `build_*_model` | `src/models/model_factory.py` | Единственная точка сборки моделей |
@@ -106,7 +108,8 @@ model.remove_domain('obsolete_domain')
 
 | Файл | Пар | Описание |
 |------|-----|----------|
-| `data/real_pairs_v6.json` | 213 (172+ / 41-) | **Актуальный** — Phase 10 |
+| `data/real_pairs_v7.json` | 232 (191+ / 41-) | **Актуальный** — сбалансированные домены |
+| `data/real_pairs_v6.json` | 213 (172+ / 41-) | Phase 10-11 |
 | `data/real_pairs_v5.json` | 175 (139+ / 36-) | Phase 9 рекорд |
 | `data/real_pairs_v4.json` | 140 | Phase 6e рекорд |
 
@@ -130,13 +133,17 @@ model.remove_domain('obsolete_domain')
 ## 6. Результаты обучения
 
 ### Хронология рекордов
-| Phase | Score | Эпоха | Конфигурация |
-|-------|-------|-------|-------------- |
-| 5a | 0.967 | — | AnglE loss + learnable temp |
-| 6e | 0.9745 | ep75 | SoftMoE + v4 данные + seed=77 |
-| 7 | 0.804 | — | ModularMoE (с багами) |
-| **9** | **0.9930** | **ep55** | **SoftMoE + v5 данные + seed=42** |
-| 10 | TBD | — | GatedProj + HardNeg + v6 данные |
+| Phase | Score | Margin | STS | Эпоха | Конфигурация |
+|-------|-------|--------|-----|-------|-------------- |
+| 5a | 0.967 | — | — | — | AnglE loss + learnable temp |
+| 6e | 0.9745 | — | — | ep75 | SoftMoE + v4 данные + seed=77 |
+| 7 | 0.804 | — | — | — | ModularMoE (с багами) |
+| **8e** | **1.1370** | **0.906** | **0.770** | **ep45** | **SoftMoE + v5 + simple MLP, hidden=256, clifford=16, 4 experts** |
+| 11a | 1.0072 | 0.776 | 0.771 | ep50 | Phase9 config + v6 данные |
+| 9 | 0.9930 | 0.757 | 0.788 | ep55 | SoftMoE + v5 данные + seed=42 |
+| 10a | 0.9347 | — | — | — | GatedProjection + HardNeg + v6 (РЕГРЕССИЯ) |
+| 10b | 0.729 | — | — | — | GatedProjection + partial unfreeze (РЕГРЕССИЯ) |
+| 10c | 0.9389 | — | — | ep25 | Simple MLP + v6 (best cycle 2) |
 
 ### Phase 9 — детальный прогресс
 | Эпоха | Score | Margin | STS | Событие |
@@ -149,8 +156,16 @@ model.remove_domain('obsolete_domain')
 
 ---
 
-## 7. Рекордная конфигурация (Phase 9)
+## 7. Рекордная конфигурация (Phase 8e) + Оптимизированная Phase 12
 
+### Модель: 414,103 параметров (Phase 8e)
+| Компонент | Параметры | Размерность |
+|-----------|-----------|-------------|
+| text_encoder.projection | 394,624 | 768→384→256 (simple MLP) |
+| core_model.pipeline | 15,127 | clifford_dim=16, hidden=256 |
+| training_inv_head | 4,352 | 16→256 |
+
+### Конфигурация запуска
 ```bash
 cd E:/hypercoplexAI && python scripts/gpu_train.py \
   --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4 \
@@ -163,10 +178,30 @@ cd E:/hypercoplexAI && python scripts/gpu_train.py \
   --lr 0.0005 --seed 42 --batch_size 32 \
   --scheduler_type cosine_restarts --warmup_epochs 3 \
   --eval_every 5 --save_every 25 \
-  --output_dir artifacts/phase9_v5_baseline
+  --output_dir artifacts/phase8e_soft_eval5
 ```
 
-**GPU:** NVIDIA RTX 3070 Laptop (8.6GB), PyTorch 2.6+cu124
+**Результат:** score=1.1370 (ep45), pair_margin=0.9059, STS=0.7701
+**GPU:** NVIDIA RTX 3070 Laptop (8.6GB), PyTorch 2.6+cu124, 0.024 GB VRAM
+
+### Оптимизированная Phase 12 (к запуску)
+
+```bash
+python scripts/gpu_train.py \
+  --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4 \
+  --pretrained_encoder --soft_router \
+  --real_pairs data/real_pairs_v7.json --augment_factor 50 \
+  --lambda_pair 0.4 --lambda_sts 0.2 --lambda_angle 0.3 \
+  --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.01 \
+  --use_infonce --infonce_temperature 0.1 --learnable_temperature \
+  --early_stopping_patience 15 \
+  --lr 0.0005 --seed 42 --batch_size 32 \
+  --scheduler_type cosine_restarts --t_mult 1 --warmup_epochs 3 \
+  --eval_every 5 --save_every 25 \
+  --output_dir artifacts/phase12_v7_clifford
+```
+
+**Ожидание:** score 1.15-1.20, v7 (232 пары), T_mult=1 (без LR explosion)
 
 ---
 
@@ -223,15 +258,17 @@ cd E:/hypercoplexAI && python scripts/gpu_train.py \
 
 ## 10. Phase 10 — Улучшения архитектуры
 
-### Что добавлено
+### Что добавлено (и что откатили)
 
-| Компонент | Статус | Ожидаемый Δscore |
-|-----------|--------|------------------|
-| GatedProjection 768→hidden | ✅ Реализовано | +0.003-0.010 |
-| Online Hard Negative Mining | ✅ Реализовано | +0.008-0.020 |
-| Датасет v6 (213 пар) | ✅ Создано | +0.005-0.015 |
-| Partial SBERT unfreeze (слои 10,11) | ✅ Реализовано | +0.010-0.025 |
-| Раздельные LR (HDIM vs SBERT) | ✅ Реализовано | вспомогательное |
+| Компонент | Статус | Результат |
+|-----------|--------|-----------|
+| GatedProjection 768→hidden | ⚠️ Реализовано, **ОТКАТ** | -0.198 (REGRESSION: 0.9347 vs 1.1370) |
+| Online Hard Negative Mining | ⚠️ Реализовано, **ОТКАТ** | -0.064 (дестабилизирует) |
+| Датасет v6 (213 пар) | ✅ Создано | v7 (232 пары) лучше |
+| Partial SBERT unfreeze | ⚠️ Реализовано, **ОТКАТ** | -0.408 (REGRESSION: 0.729) |
+| Simple MLP projection | ✅ **ОПТИМАЛЬНЫЙ** | Рекорд 1.1370 |
+
+**Ключевой вывод:** Simple MLP (Linear→LayerNorm→GELU→Dropout→Linear) стабильно превосходит GatedProjection и сложные варианты.
 
 ### GatedProjection
 ```python
