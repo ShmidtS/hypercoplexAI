@@ -67,9 +67,9 @@ class TitansMemoryModule(nn.Module):
         return MemoryState(retrieved=retrieved, loss=loss_memory, updated=False)
 
     # Максимальная норма весов памяти — предотвращает TTT взрыв
-    _MEMORY_MAX_NORM: float = 10.0
-    # Масштаб шага TTT — уменьшен для стабильности
-    _TTT_LR_SCALE: float = 0.01
+    _MEMORY_MAX_NORM: float = 5.0
+    # Масштаб шага TTT — снижен для стабильности (Phase 19)
+    _TTT_LR_SCALE: float = 0.005
 
     def update(
         self,

@@ -1,1 +1,5 @@
-pytest>=8.0
+SQLAlchemy
+alembic
+pytest
+sentence-transformers
+torch
