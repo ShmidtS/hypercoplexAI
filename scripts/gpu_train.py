@@ -394,10 +394,18 @@ def run_gpu_training(
     if real_pairs_path:
         from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
         augment = getattr(args, 'augment_factor', 8)
-        dataset = load_real_pairs_dataset(real_pairs_path, augment_factor=augment, seed=args.seed)
+        dataset = load_real_pairs_dataset(
+            real_pairs_path,
+            augment_factor=augment,
+            seed=args.seed,
+            add_negatives=True,
+            negative_ratio=1.0,
+        )
         train_ds, val_ds = split_real_pairs(dataset, train_fraction=args.train_fraction, seed=args.seed)
         metrics_ds = val_ds  # use held-out val split for honest metrics
-        print(f"Real pairs dataset: {len(dataset)} total (augment x{augment})")
+        n_pos = sum(1 for it in dataset._items if it['relation'] == 'positive')
+        n_neg = sum(1 for it in dataset._items if it['relation'] == 'negative')
+        print(f"Real pairs dataset: {len(dataset)} total (augment x{augment}, pos={n_pos}, neg={n_neg})")
     else:
         dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
         dataset_kwargs: dict = {

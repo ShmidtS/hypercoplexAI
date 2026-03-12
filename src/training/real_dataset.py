@@ -51,18 +51,23 @@ class RealPairsDataset(Dataset):
         *,
         augment_factor: int = 1,
         seed: int = 42,
+        add_negatives: bool = True,
+        negative_ratio: float = 1.0,
     ) -> None:
         self.pairs = pairs
         self.augment_factor = augment_factor
         self.seed = seed
+        self.add_negatives = add_negatives
+        self.negative_ratio = negative_ratio
         self._items = self._build_items(seed)
 
     def _build_items(self, seed: int) -> List[Dict]:
         """Build flat list of items from pairs.
 
-        Каждая пара порождает два элемента:
-        - source → target (forward)
-        - target → source (backward, для положительных пар)
+        Каждая пара порождает:
+        - source → target (forward, positive)
+        - target → source (backward, positive)
+        - synthetic negatives: src из группы A paired с tgt из группы B (cross-group)
         """
         rng = random.Random(seed)
         items = []
@@ -88,6 +93,32 @@ class RealPairsDataset(Dataset):
                     "group_id": pair["group_id"],
                 }
                 items.append(item_bwd)
+
+        # Generate hard synthetic negatives: cross-group pairs
+        if self.add_negatives and len(self.pairs) > 1:
+            pos_pairs = [p for p in self.pairs if p["relation"] == "positive"]
+            n_neg = int(len(pos_pairs) * self.negative_ratio)
+            shuffled_pairs = list(pos_pairs)
+            rng.shuffle(shuffled_pairs)
+            neg_targets = list(pos_pairs)
+            rng.shuffle(neg_targets)
+            added = 0
+            for src_p, tgt_p in zip(shuffled_pairs, neg_targets):
+                if added >= n_neg:
+                    break
+                # Ensure different group to create a true negative
+                if src_p["group_id"] == tgt_p["group_id"]:
+                    continue
+                item_neg = {
+                    "text": src_p["source_text"],
+                    "pair_text": tgt_p["target_text"],
+                    "domain_id": src_p["source_domain"],
+                    "pair_domain_id": tgt_p["target_domain"],
+                    "relation": "negative",
+                    "group_id": src_p["group_id"],
+                }
+                items.append(item_neg)
+                added += 1
 
         # Augmentation: repeat with shuffled order
         base_items = list(items)
@@ -122,13 +153,26 @@ def load_real_pairs_dataset(
     *,
     augment_factor: int = 5,
     seed: int = 42,
+    add_negatives: bool = True,
+    negative_ratio: float = 1.0,
 ) -> RealPairsDataset:
-    """Load real pairs from JSON file."""
+    """Load real pairs from JSON file.
+
+    Args:
+        add_negatives: генерировать синтетические негативные пары (cross-group)
+        negative_ratio: отношение negatives к positives (1.0 = 1:1)
+    """
     path = Path(json_path)
     if not path.exists():
         raise FileNotFoundError(f"Real pairs JSON not found: {path}")
     pairs = json.loads(path.read_text(encoding="utf-8"))
-    return RealPairsDataset(pairs, augment_factor=augment_factor, seed=seed)
+    return RealPairsDataset(
+        pairs,
+        augment_factor=augment_factor,
+        seed=seed,
+        add_negatives=add_negatives,
+        negative_ratio=negative_ratio,
+    )
 
 
 def split_real_pairs(
