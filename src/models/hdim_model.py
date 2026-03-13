@@ -455,13 +455,28 @@ class HDIMModel(nn.Module):
         # pipeline.remove_domain already removes from pipeline.domain_names
         # which is the same list as self._domain_names
 
-    def reset_memory(self) -> None:
-        """Reset stateful HDIM memory and router replay state."""
-        self.pipeline.reset_memory()
+    def reset_memory(self, strategy: str = 'geometric') -> None:
+        """Reset stateful HDIM memory and router replay state.
+
+        strategy:
+            'hard'      — полный сброс (только epoch=1 или новый trial)
+            'geometric' — мягкое затухание (per-epoch, сохраняет паттерны)
+            'stabilize' — только нормировка momentum (LR restart)
+        """
+        self.pipeline.reset_memory(strategy=strategy)
         with torch.no_grad():
             if hasattr(self.pipeline.moe, 'train_scores'):
                 n = self.pipeline.moe.num_experts
-                self.pipeline.moe.train_scores.fill_(1.0 / n)
+                if strategy == 'hard':
+                    # Полный сброс EMA весов роутера
+                    self.pipeline.moe.train_scores.fill_(1.0 / n)
+                elif strategy == 'geometric':
+                    # Мягкое затухание к равномерному (не теряем всю историю)
+                    uniform = torch.full((n,), 1.0 / n,
+                                        device=self.pipeline.moe.train_scores.device,
+                                        dtype=self.pipeline.moe.train_scores.dtype)
+                    self.pipeline.moe.train_scores.mul_(0.7).add_(uniform * 0.3)
+                # 'stabilize': не трогаем train_scores
 
     def transfer_pairs(
         self,

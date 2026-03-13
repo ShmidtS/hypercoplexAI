@@ -317,12 +317,18 @@ class HDIMTrainer:
         return negative_indices
     def set_epoch(self, epoch: int) -> None:
         """Set current epoch for temperature scheduling.
-        C5 FIX: reset memory at the start of each epoch to prevent
-        monotonic loss_memory growth across epochs.
+
+        Memory reset strategy (revised Phase 21):
+          epoch=1 -> hard reset (new training run)
+          epoch>1 -> NO per-epoch reset (memory accumulates patterns per LR cycle)
+
+        Per-epoch geometric decay was counterproductive:
+        score at ep5 dropped from ~0.75 to ~0.25 (patterns lost each epoch).
+        LR restart in gpu_train.py calls stabilize() for momentum normalization.
         """
         self._current_epoch = epoch
-        if epoch > 0 and hasattr(self.model, 'reset_memory'):
-            self.model.reset_memory()
+        if epoch == 1 and hasattr(self.model, "reset_memory"):
+            self.model.reset_memory(strategy="hard")
 
     def _effective_temperature(self) -> float:
         """Возвращает эффективную температуру (обучаемую, scheduled, или фиксированную)."""

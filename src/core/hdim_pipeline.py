@@ -310,9 +310,9 @@ class HDIMPipeline(nn.Module):
         del self.domain_rotors[domain_name]
         self.domain_names.remove(domain_name)
 
-    def reset_memory(self) -> None:
-        """Сбрасывает stateful память перед новым экспериментом."""
-        self.memory.reset_memory()
+    def reset_memory(self, strategy: str = 'geometric') -> None:
+        """Сбрасывает stateful память. strategy передаётся в TitansMemoryModule."""
+        self.memory.reset_memory(strategy=strategy)
 
     def compute_isomorphism_loss(
         self,

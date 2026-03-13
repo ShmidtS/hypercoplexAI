@@ -249,8 +249,8 @@ class TextHDIMModel(nn.Module):
     def transfer_pairs(self, *args, **kwargs):
         return self.core_model.transfer_pairs(*args, **kwargs)
 
-    def reset_memory(self) -> None:
-        self.core_model.reset_memory()
+    def reset_memory(self, strategy: str = 'geometric') -> None:
+        self.core_model.reset_memory(strategy=strategy)
 
     def encode_texts(
         self,

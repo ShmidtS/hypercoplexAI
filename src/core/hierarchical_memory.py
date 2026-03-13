@@ -319,10 +319,33 @@ class HierarchicalTitansMemory(nn.Module):
 
         return retrieved, loss
 
-    def reset_memory(self):
-        """Сбрасывает всю память и momentum к нулям."""
+    def reset_memory(self, strategy: str = 'geometric', decay_window: float = 50.0) -> None:
+        """Умный reset иерархической памяти.
+
+        strategy:
+            'hard'      — полный сброс обеих памятей в нули
+            'geometric' — экспоненциальное затухание (working быстрее longterm)
+            'stabilize' — только нормировка momentum
+        """
         with torch.no_grad():
-            self.working_memory.weight.zero_()
-            self.working_momentum.zero_()
-            self.longterm_memory.weight.zero_()
-            self.longterm_momentum.zero_()
+            if strategy == 'hard':
+                self.working_memory.weight.zero_()
+                self.working_momentum.zero_()
+                self.longterm_memory.weight.zero_()
+                self.longterm_momentum.zero_()
+            elif strategy == 'geometric':
+                import torch as _t
+                decay = _t.exp(_t.tensor(-1.0 / max(decay_window, 1.0)))
+                # working memory затухает быстрее (короткосрочная)
+                self.working_memory.weight.mul_(decay * 0.7)
+                self.working_momentum.mul_(decay * 0.3)
+                # longterm memory затухает медленнее
+                self.longterm_memory.weight.mul_(decay)
+                self.longterm_momentum.mul_(decay * 0.5)
+            elif strategy == 'stabilize':
+                # Только нормировка momentum
+                _MAX = 5.0
+                for mom in (self.working_momentum, self.longterm_momentum):
+                    norm = mom.norm()
+                    if norm > _MAX:
+                        mom.mul_(_MAX / (norm + 1e-8))

@@ -147,11 +147,33 @@ class TitansMemoryModule(nn.Module):
         state = self.retrieve_and_update(k, v, update_memory=update_memory)
         return state.retrieved, state.loss
 
-    def reset_memory(self):
-        """Сбрасывает память и momentum state к нулям."""
+    def reset_memory(self, strategy: str = 'geometric', decay_window: float = 50.0) -> None:
+        """Умный reset памяти — не обнуляет полностью, сохраняет важное.
+
+        Стратегии:
+            'hard'      — полный сброс в нули (только при инициализации/epoch=1)
+            'geometric' — экспоненциальное затухание весов (сохраняет паттерны)
+            'stabilize' — нормировка momentum без изменения весов памяти
+
+        Аргументы:
+            strategy:     тип сброса
+            decay_window: характерное время затухания для 'geometric' (эпох)
+        """
         with torch.no_grad():
-            self.memory.weight.zero_()
-            self.momentum_S.zero_()
+            if strategy == 'hard':
+                self.memory.weight.zero_()
+                self.momentum_S.zero_()
+            elif strategy == 'geometric':
+                # Экспоненциальное затухание — сохраняет паттерны, убирает шум
+                # decay_factor ≈ 0.607 при decay_window=50 (медленное забывание)
+                decay = torch.exp(torch.tensor(-1.0 / max(decay_window, 1.0)))
+                self.memory.weight.mul_(decay)
+                self.momentum_S.mul_(decay * 0.5)  # momentum затухает быстрее
+            elif strategy == 'stabilize':
+                # Только нормировка momentum — не трогаем веса памяти
+                norm = self.momentum_S.norm()
+                if norm > self._MEMORY_MAX_NORM:
+                    self.momentum_S.mul_(self._MEMORY_MAX_NORM / (norm + 1e-8))
 
     def stabilize_momentum(self) -> bool:
         """Принудительная нормировка momentum_S. Вызывать при LR restarts.

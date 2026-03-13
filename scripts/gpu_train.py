@@ -529,11 +529,13 @@ def run_gpu_training(
                 current_lr = scheduler.get_last_lr()[0]
             except Exception:
                 current_lr = optimizer.param_groups[0]["lr"]
-            # A2 FIX: detect LR restart (CosineWarmRestarts) and reset memory
-            # A restart occurs when LR jumps back up significantly
+            # A2 FIX (upgraded): detect LR restart (CosineWarmRestarts)
+            # Use 'stabilize' instead of hard reset — preserves memory patterns,
+            # only normalizes momentum to prevent exploding gradients after LR spike.
+            # Hard reset would cause score drop at each restart cycle.
             if current_lr > prev_lr * 1.5 and hasattr(model, 'reset_memory'):
-                model.reset_memory()
-                print(f"[LR restart detected at epoch {epoch}] Memory reset. LR: {prev_lr:.6f} → {current_lr:.6f}")
+                model.reset_memory(strategy='stabilize')
+                print(f"[LR restart ep{epoch}] Memory stabilized. LR: {prev_lr:.6f} -> {current_lr:.6f}")
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val_metrics = trainer.validate(val_loader)
