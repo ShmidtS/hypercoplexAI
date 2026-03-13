@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 20.0 | Дата: 2026-03-12 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 19: запущен (ep11, score→0.489) | Phase 20: DCL + Uniformity-Alignment + batch_size=64 | Коммит: (в работе)*
+*Версия: 20.0 | Дата: 2026-03-13 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 19: запущен (ep11, score→0.489) | Phase 20: DCL + Uniformity-Alignment + batch_size=64 (in progress) | README: обновлён*
 
 ---
 
