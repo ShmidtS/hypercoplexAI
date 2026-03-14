@@ -119,14 +119,12 @@
 | -------------------------------------------------------------- | -------------------------- | ---------------------------- | ------------ |
 | `[hypercomplex.py](../src/core/hypercomplex.py)`               | `CliffordAlgebra`          | Алгебра Клиффорда Cl_{p,q,r} | **Stable**   |
 |                                                                | `QuaternionLinear`         | Кватернионный слой           | **Stable**   |
-|                                                                | `PHMLinear`                | Parameterized Hypercomplex   | Experimental |
+|                                                                | `PHMLinear`                | Parameterized Hypercomplex   | *Удалён* |
 | `[domain_operators.py](../src/core/domain_operators.py)`       | `DomainRotationOperator`   | Обучаемый ротор домена       | **Stable**   |
 |                                                                | `InvariantExtractor`       | Извлечение U_inv = R⁻¹GR     | **Stable**   |
 |                                                                | `DomainRegistry`           | Реестр доменов               | **Stable**   |
 | `[titans_memory.py](../src/core/titans_memory.py)`             | `TitansMemoryModule`       | Test-Time Training память    | **Stable**   |
-| `[hierarchical_memory.py](../src/core/hierarchical_memory.py)` | `HierarchicalTitansMemory` | Двухуровневая память         | Experimental |
 | `[soft_moe_router.py](../src/core/soft_moe_router.py)`         | `SoftMoERouter`            | Soft Mixture-of-Experts      | **Stable**   |
-| `[modular_moe.py](../src/core/modular_moe.py)`                 | `ModularMoERouter`         | Динамический MoE             | Experimental |
 | `[hdim_pipeline.py](../src/core/hdim_pipeline.py)`             | `HDIMPipeline`             | Главный orchestrator         | **Stable**   |
 |                                                                | `HDIMEncoder`              | Кодирование → мультивектор   | **Stable**   |
 |                                                                | `HDIMDecoder`              | Мультивектор → выход         | **Stable**   |
@@ -297,7 +295,6 @@ HDIMConfig (dataclass)
     └── HDIMModel(nn.Module)
             └── TextHDIMModel(nn.Module)
                     ├── SimpleTextEncoder (по умолчанию)
-                    ├── AdvancedTextEncoder (опционально)
                     └── SBERTEncoder (опционально, frozen)
 ```
 
@@ -729,9 +726,6 @@ config = HDIMConfig(
 | Флаг                       | Эффект                                            |
 | -------------------------- | ------------------------------------------------- |
 | `soft_router=True`         | Заменяет R3MoERouter на SoftMoERouter             |
-| `hierarchical_memory=True` | Заменяет TitansMemory на HierarchicalTitansMemory |
-| `modular_moe=True`         | Заменяет SoftMoE на ModularMoE (experimental)     |
-| `advanced_encoder=True`    | Заменяет SimpleTextEncoder на AdvancedTextEncoder |
 | `freeze_sbert=True`        | Frozen SBERT + trainable projection               |
 
 
@@ -757,16 +751,9 @@ config = HDIMConfig(
 | `HDIMTrainer`            | `[trainer.py:19](../src/training/trainer.py:19)`                 | **Stable** |
 
 
-### 10.2 Experimental
+### 10.2 Удалено (Occam's razor)
 
-
-| Компонент                  | Файл                                                                         | Предупреждение                                        |
-| -------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `PHMLinear`                | `[hypercomplex.py:268](../src/core/hypercomplex.py:268)`                     | Не используется в основном пайплайне                  |
-| `HierarchicalTitansMemory` | `[hierarchical_memory.py:46](../src/core/hierarchical_memory.py:46)`         | README: "experimental"                                |
-| `ModularMoERouter`         | `[modular_moe.py:93](../src/core/modular_moe.py:93)`                         | README: "Do not use in production"                    |
-| `DomainRotor`              | `[hypercomplex.py:398](../src/core/hypercomplex.py:398)`                     | Упрощённая версия, дублирует `DomainRotationOperator` |
-| `AdvancedTextEncoder`      | `[advanced_text_encoder.py:244](../src/models/advanced_text_encoder.py:244)` | Хуже SBERT по качеству                                |
+Компоненты удалены как неиспользуемый мёртвый код:
 
 
 ---

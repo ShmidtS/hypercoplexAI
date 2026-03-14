@@ -82,10 +82,6 @@ def _apply_experiment_defaults(
     )
 
     # Phase-2 advanced component flags from manifest
-    if experiment.advanced_encoder:
-        args.advanced_encoder = True
-    if experiment.hierarchical_memory:
-        args.hierarchical_memory = True
     if experiment.soft_router:
         args.soft_router = True
 
@@ -120,17 +116,13 @@ def _build_model(
     args: argparse.Namespace,
 ) -> HDIMModel | TextHDIMModel:
     """Build the model using model_factory when advanced flags are set."""
-    advanced_encoder: bool = getattr(args, "advanced_encoder", False)
-    hierarchical_memory: bool = getattr(args, "hierarchical_memory", False)
     soft_router: bool = getattr(args, "soft_router", False)
 
-    needs_text = args.text_mode or advanced_encoder or hierarchical_memory or soft_router
+    needs_text = args.text_mode or soft_router
 
     if needs_text:
         return build_text_hdim_model(
             cfg,
-            advanced_encoder=advanced_encoder,
-            hierarchical_memory=hierarchical_memory,
             soft_router=soft_router,
         )
 
@@ -189,8 +181,6 @@ def _build_run_summary(
             "seed": args.seed,
             "text_mode": args.text_mode,
             "description": args.description,
-            "advanced_encoder": getattr(args, "advanced_encoder", False),
-            "hierarchical_memory": getattr(args, "hierarchical_memory", False),
             "soft_router": getattr(args, "soft_router", False),
         },
         "validation": val_metrics,
@@ -269,14 +259,6 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Phase-2 advanced component flags                                    #
     # ------------------------------------------------------------------ #
-    parser.add_argument(
-        "--advanced_encoder", action="store_true",
-        help="Replace SimpleTextEncoder with AdvancedTextEncoder (Transformer+RoPE).",
-    )
-    parser.add_argument(
-        "--hierarchical_memory", action="store_true",
-        help="Replace TitansMemoryModule with HierarchicalTitansMemory.",
-    )
     parser.add_argument(
         "--soft_router", action="store_true",
         help="Replace R3MoERouter with SoftMoERouter.",

@@ -51,9 +51,9 @@ structural topology.
 │  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘          │
 ├───────────┼────────────────────┼────────────────────┼───────────────────┤
 │  Training Layer                                                         │
-│  ┌────────┴────────┐  ┌────────┴────────┐   ┌───────┴────────┐          │
-│  │  HDIMTrainer    │  │ ExperimentRun   │   │   Datasets     │          │
-│  └────────┬────────┘  └─────────────────┘   └────────────────┘          │
+│  ┌────────┴────────┐   ┌───────┴────────┐          │
+│  │  HDIMTrainer    │   │   Datasets     │          │
+│  └────────┬────────┘   └────────────────┘          │
 ├───────────┼─────────────────────────────────────────────────────────────┤
 │  Model Layer                                                            │
 │  ┌────────┴────────┐  ┌─────────────────┐  ┌─────────────────┐          │
@@ -97,7 +97,7 @@ hypercoplexAI/
 ├── src/
 │   ├── core/
 │   │   ├── hypercomplex.py       # CliffordAlgebra, QuaternionLinear
-│   │   ├── domain_operators.py   # DomainRotor, InvariantExtractor
+│   │   ├── domain_operators.py   # DomainRotationOperator, InvariantExtractor
 │   │   ├── hdim_pipeline.py      # HDIMPipeline orchestrator
 │   │   ├── titans_memory.py      # TitansMemoryModule (TTT)
 │   │   └── soft_moe_router.py    # SoftMoERouter (DEFAULT)
@@ -300,9 +300,7 @@ PRIMARY_SCORE = pair_margin × 1.0 + STS_exported × 0.3
 
 | Component                  | File                                                                      | Warning          |
 | -------------------------- | ------------------------------------------------------------------------- | ---------------- |
-| `HierarchicalTitansMemory` | `[hierarchical_memory.py:46](src/core/hierarchical_memory.py:46)`         | Experimental     |
-| `ModularMoERouter`         | `[modular_moe.py:93](src/core/modular_moe.py:93)`                         | ⚠️ Do not use    |
-| `AdvancedTextEncoder`      | `[advanced_text_encoder.py:244](src/models/advanced_text_encoder.py:244)` | Worse than SBERT |
+| *(deleted — was experimental)* | — | Removed in cleanup |
 
 
 ---
@@ -311,7 +309,7 @@ PRIMARY_SCORE = pair_margin × 1.0 + STS_exported × 0.3
 
 ### Anti-Patterns (Do NOT)
 
-- ❌ `ModularMoERouter` — use `SoftMoERouter`
+- ❌ `ModularMoERouter` — removed; use `SoftMoERouter`
 - ❌ `reset_memory('zero')` — use `reset_memory('geometric')`
 - ❌ `batch_size < 32` — InfoNCE requires sufficient negatives
 - ❌ `temperature < 0.15` — causes overconfidence

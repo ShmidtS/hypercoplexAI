@@ -1,9 +1,8 @@
 """
 HDIM — Hypercomplex Domain Isomorphism Machine
-Корневые гиперкомплексные операции: алгебра Клиффорда, кватернионные слои, PHM, роторы доменов.
+Корневые гиперкомплексные операции: алгебра Клиффорда и кватернионные слои.
 
 Математическая основа: Cl_{p,q,r}(R) — вырожденная алгебра Клиффорда.
-U_inv = R^{-1} ⊗_Cl G ⊗_Cl R  — структурный инвариант.
 """
 
 import torch
@@ -262,93 +261,6 @@ class QuaternionLinear(nn.Module):
 
 
 # ============================================================
-#  3. PHMLinear — параметризованное гиперкомплексное умножение
-# ============================================================
-
-class PHMLinear(nn.Module):
-    """
-    Parameterized Hypercomplex Multiplication (PHM).
-    Zhang et al., "Parameterized Hypercomplex Graph Neural Networks for Graph Classification"
-
-    Матрица весов: W = Σ_{s=1}^n A_s ⊗ S_s
-    где A_s — обучаемые скалярные матрицы (n x n)
-          S_s — обучаемые блочные матрицы (out/n x in/n)
-    n — размерность гиперкомплексной алгебры (4 для кватернионов)
-    """
-
-    def __init__(self, n: int, in_features: int, out_features: int, bias: bool = True):
-        super().__init__()
-        assert in_features % n == 0 and out_features % n == 0, \
-            f"in_features и out_features должны быть кратны n={n}"
-
-        self.in_features  = in_features
-        self.out_features = out_features
-        self.n            = n
-
-        self.A = nn.ParameterList(
-            [nn.Parameter(torch.Tensor(n, n)) for _ in range(n)]
-        )
-        self.S = nn.ParameterList(
-            [nn.Parameter(torch.Tensor(out_features // n, in_features // n)) for _ in range(n)]
-        )
-
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features))
-        else:
-            self.register_parameter("bias", None)
-
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        for a in self.A:
-            nn.init.eye_(a)
-        for s in self.S:
-            nn.init.kaiming_uniform_(s, a=math.sqrt(5))
-
-    def kronecker_product(self, A: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
-        return torch.kron(A, S)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        W = sum(torch.kron(a, s) for a, s in zip(self.A, self.S))
-        return F.linear(x, W, self.bias)
-
-    def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, "
-            f"out_features={self.out_features}, "
-            f"n={self.n}, "
-            f"bias={self.bias is not None}"
-        )
-
-
-# ============================================================
-#  4. hamilton_product — standalone функция
-# ============================================================
-
-def hamilton_product(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-    """
-    Произведение Гамильтона двух кватернионных тензоров.
-
-    Parameters
-    ----------
-    q1, q2 : Tensor shape (..., 4) — порядок компонент (w, x, y, z)
-
-    Returns
-    -------
-    Tensor shape (..., 4)
-    """
-    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
-    w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
-
-    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-
-    return torch.stack([w, x, y, z], dim=-1)
-
-
-# ============================================================
 #  5. QLayerNorm — покомпонентная нормализация кватерниона
 # ============================================================
 
@@ -389,50 +301,3 @@ class QLayerNorm(nn.Module):
         parts = [x[..., i * chunk:(i + 1) * chunk] for i in range(4)]
         normed = [self.norms[i](parts[i]) for i in range(4)]
         return torch.cat(normed, dim=-1)
-
-
-# ============================================================
-#  6. DomainRotor — обучаемый роторный оператор
-# ============================================================
-
-class DomainRotor(nn.Module):
-    """
-    Обучаемый ротационный оператор в алгебре Клиффорда через сэндвич-произведение.
-
-    Parameters
-    ----------
-    algebra       : экземпляр CliffordAlgebra
-    init_identity : если True — инициализирует R как единичный мультивектор (R[0]=1)
-    """
-
-    def __init__(self, algebra: CliffordAlgebra, init_identity: bool = True):
-        super().__init__()
-        self.algebra = algebra
-        self.R = nn.Parameter(torch.zeros(algebra.dim))
-        if init_identity:
-            with torch.no_grad():
-                self.R[0] = 1.0
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Применяет сэндвич-произведение R x R^{-1}.
-
-        Parameters
-        ----------
-        x : Tensor — вход в виде мультивектора
-
-        Returns
-        -------
-        Tensor той же формы
-        """
-        return self.algebra.sandwich(self.R, x)
-
-    def get_inverse(self) -> torch.Tensor:
-        """
-        Вычисляет обратный ротор: R^{-1} = reverse(R) / ||R||^2.
-
-        Returns
-        -------
-        Tensor shape (algebra.dim,)
-        """
-        return self.algebra.reverse(self.R) / (self.algebra.norm(self.R) ** 2 + 1e-8)

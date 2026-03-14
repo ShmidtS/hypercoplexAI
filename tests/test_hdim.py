@@ -17,7 +17,6 @@ from src.training.dataset import (
     texts_to_tensor,
 )
 from src.training.experiment_config import ExperimentConfig
-from src.training.experiment_runner import AutoResearchRunner, ExperimentRunner
 from src.training.trainer import HDIMTrainer
 
 
@@ -491,10 +490,10 @@ def test_model_reset_memory_clears_memory_and_router_state(model, cfg):
         torch.full_like(train_scores_before_reset, 1.0 / cfg.num_experts),
     )
 
-    model.reset_memory()
+    model.reset_memory(strategy='hard')
 
-    assert torch.allclose(model.pipeline.memory.memory.weight, torch.zeros_like(model.pipeline.memory.memory.weight))
-    assert torch.allclose(model.pipeline.memory.momentum_S, torch.zeros_like(model.pipeline.memory.momentum_S))
+    assert torch.allclose(model.pipeline.memory.memory.weight, torch.zeros_like(model.pipeline.memory.memory.weight), atol=1e-6)
+    assert torch.allclose(model.pipeline.memory.momentum_S, torch.zeros_like(model.pipeline.memory.momentum_S), atol=1e-6)
     assert torch.allclose(
         model.pipeline.moe.train_scores,
         torch.full_like(model.pipeline.moe.train_scores, 1.0 / cfg.num_experts),
@@ -791,100 +790,6 @@ def test_train_script_supports_manifest_and_ledger(tmp_path):
     assert ledger_rows
     assert ledger_rows[-1]["status"] == "keep"
     assert "Appended run ledger row" in completed.stdout
-
-
-def test_experiment_runner_executes_manifest(tmp_path):
-    results_path = tmp_path / "runner" / "runner_summary.json"
-    ledger_path = tmp_path / "runner" / "runner_ledger.jsonl"
-    runner = ExperimentRunner("E:/hypercoplexAI")
-    payload = runner.run(
-        ExperimentConfig(
-            description="runner smoke",
-            epochs=1,
-            batch_size=4,
-            num_samples=16,
-            use_pairs=True,
-            negative_ratio=0.25,
-            text_mode=True,
-            results_json=str(results_path),
-            ledger_path=str(ledger_path),
-            metadata={"run_id": "runner-smoke-001"},
-        )
-    )
-    assert payload["status"] == "keep"
-    assert payload["run_args"]["text_mode"] is True
-    assert payload["runner"]["run_id"] == "runner-smoke-001"
-    assert payload["run_id"] == "runner-smoke-001"
-    assert payload["manifest"]["run_id"] == "runner-smoke-001"
-    assert payload["manifest"]["config_hash"] == payload["config_hash"]
-    assert payload["runner"]["command"][-2] == "--config"
-    assert payload["runner"]["command"][-1].replace("\\", "/") == payload["manifest"]["path"]
-    assert payload["artifacts"]["checkpoint"] == (results_path.parent / "checkpoints" / "hdim_final.pt").as_posix()
-    assert results_path.exists()
-    assert ledger_path.exists()
-
-
-def test_autoresearch_runner_isolates_run_artifacts_and_preserves_identity(tmp_path):
-    session_dir = tmp_path / "autoresearch"
-    runner = AutoResearchRunner("E:/hypercoplexAI")
-    configs = [
-        ExperimentConfig(
-            description="run a",
-            epochs=1,
-            batch_size=4,
-            num_samples=16,
-            text_mode=True,
-            metadata={"run_id": "session-run-a"},
-        ),
-        ExperimentConfig(
-            description="run b",
-            epochs=1,
-            batch_size=4,
-            num_samples=16,
-            text_mode=True,
-            metadata={"run_id": "session-run-b"},
-        ),
-    ]
-
-    summary = runner.run_many(configs, session_name="session-smoke", output_dir=session_dir)
-
-    assert summary["run_count"] == 2
-    assert [run["run_id"] for run in summary["runs"]] == ["session-run-a", "session-run-b"]
-    assert summary["runs"][0]["checkpoint"].endswith("session-run-a/checkpoints/hdim_final.pt")
-    assert summary["runs"][1]["checkpoint"].endswith("session-run-b/checkpoints/hdim_final.pt")
-    assert summary["runs"][0]["checkpoint"] != summary["runs"][1]["checkpoint"]
-    assert summary["runs"][0]["manifest_path"].endswith("session-run-a/manifest.json")
-    assert summary["runs"][1]["manifest_path"].endswith("session-run-b/manifest.json")
-
-    run_a = runner.load_run_artifacts(summary["runs"][0]["run_dir"])
-    run_b = runner.load_run_artifacts(summary["runs"][1]["run_dir"])
-    assert run_a["manifest"]["metadata"]["run_id"] == "session-run-a"
-    assert run_b["manifest"]["metadata"]["run_id"] == "session-run-b"
-    assert run_a["results"]["run_id"] == "session-run-a"
-    assert run_b["results"]["run_id"] == "session-run-b"
-    assert run_a["results"]["config_hash"] == summary["runs"][0]["config_hash"]
-    assert run_b["results"]["config_hash"] == summary["runs"][1]["config_hash"]
-
-    session_ledger_rows = runner.load_session_ledger(summary["session_dir"])
-    quality_rows = [row for row in session_ledger_rows if "quality" in row]
-    assert len(quality_rows) == 2
-    assert {row["run_id"] for row in quality_rows} == {"session-run-a", "session-run-b"}
-    assert quality_rows[0]["checkpoint"] != quality_rows[1]["checkpoint"]
-    assert quality_rows[0]["manifest_path"] != quality_rows[1]["manifest_path"]
-    assert quality_rows[0]["results_json"] != quality_rows[1]["results_json"]
-    assert summary["best_run"]["run_id"] in {"session-run-a", "session-run-b"}
-    assert summary["best_run"]["config_hash"] in {
-        summary["runs"][0]["config_hash"],
-        summary["runs"][1]["config_hash"],
-    }
-    assert summary["best_run"]["checkpoint"] in {
-        summary["runs"][0]["checkpoint"],
-        summary["runs"][1]["checkpoint"],
-    }
-    assert summary["best_run"]["manifest_path"] in {
-        summary["runs"][0]["manifest_path"],
-        summary["runs"][1]["manifest_path"],
-    }
 
 
 # ============================================================

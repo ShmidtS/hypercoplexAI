@@ -6,14 +6,14 @@ HDIM GPU Training Script с AMP, gradient checkpointing и live monitoring.
   - Автоматическое определение GPU/CPU
   - Mixed Precision Training (AMP) для GPU
   - Gradient checkpointing для экономии памяти
-  - Живой мониторинг через progress bar (tqdm) и tensorboard/json
+  - Живой мониторинг через progress bar (tqdm) и json
   - Checkpoint сохранение каждые N эпох и по лучшей валидации
-  - Поддержка AdvancedTextEncoder, HierarchicalTitansMemory, SoftMoERouter
-  - Совместим с ExperimentConfig/AutoResearchRunner
+  - Поддержка SoftMoERouter и frozen SBERT encoder
+  - Совместим с ExperimentConfig
   - Использует model_factory как единственный источник сборки моделей
 
 Запуск:
-  python scripts/gpu_train.py --epochs 50 --device cuda --use_pairs --text_mode --advanced_encoder
+  python scripts/gpu_train.py --epochs 50 --device cuda --use_pairs --text_mode --soft_router
   python scripts/gpu_train.py --config path/to/config.json
 """
 
@@ -121,43 +121,24 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             unfreeze_layers = [s.strip() for s in _unfreeze_str.split(',') if s.strip()]
         model = build_sbert_hdim_model(
             cfg,
-            hierarchical_memory=args.hierarchical_memory,
             soft_router=args.soft_router,
-            modular_moe=getattr(args, 'modular_moe', False),
-            modular_moe_routing_type=getattr(args, 'modular_moe_routing_type', 'soft'),
             unfreeze_layers=unfreeze_layers,
             projection_hidden=getattr(args, 'sbert_projection_hidden', None),
         )
         print("Components: SBERT(paraphrase-multilingual-mpnet-base-v2) + SimpleMLP")
         if unfreeze_layers:
             print(f"  + Partial SBERT unfreeze: {unfreeze_layers}")
-        if args.hierarchical_memory:
-            print("  + HierarchicalTitansMemory")
         if args.soft_router:
             print("  + SoftMoERouter")
         return model
 
-    needs_text = args.text_mode or args.advanced_encoder or args.hierarchical_memory or args.soft_router or getattr(args, 'modular_moe', False)
-    if needs_text:
+    if args.text_mode or args.soft_router:
         model = build_text_hdim_model(
             cfg,
-            advanced_encoder=args.advanced_encoder,
-            hierarchical_memory=args.hierarchical_memory,
             soft_router=args.soft_router,
-            modular_moe=getattr(args, 'modular_moe', False),
-            modular_moe_routing_type=getattr(args, 'modular_moe_routing_type', 'soft'),
         )
-        components = []
-        if args.advanced_encoder:
-            components.append("AdvancedTextEncoder")
-        if args.hierarchical_memory:
-            components.append("HierarchicalTitansMemory")
         if args.soft_router:
-            components.append("SoftMoERouter")
-        if getattr(args, 'modular_moe', False):
-            components.append(f"ModularMoERouter({getattr(args, 'modular_moe_routing_type', 'soft')})")
-        if components:
-            print(f"Components: {', '.join(components)}")
+            print("Components: SoftMoERouter")
         return model
     return build_hdim_model(cfg)
 
@@ -644,14 +625,7 @@ def main() -> None:
     parser.add_argument("--negative_ratio", type=float, default=0.3)
     parser.add_argument("--train_fraction", type=float, default=0.8)
     # Advanced components
-    parser.add_argument("--advanced_encoder", action="store_true")
-    parser.add_argument("--hierarchical_memory", action="store_true")
     parser.add_argument("--soft_router", action="store_true")
-    parser.add_argument("--modular_moe", action="store_true", default=False,
-                        help="Use ModularMoERouter (динамическое добавление экспертов)")
-    parser.add_argument("--modular_moe_routing_type", default="soft",
-                        choices=["soft", "hard"],
-                        help="ModularMoERouter routing type (default: soft)")
     parser.add_argument("--pretrained_encoder", action="store_true",
                         help="Use frozen SBERT encoder (paraphrase-multilingual-mpnet-base-v2)")
     parser.add_argument("--unfreeze_sbert_layers", type=str, default=None,
