@@ -47,13 +47,13 @@ class TitansMemoryModule(nn.Module):
 
         # Память M реализована как линейный слой (матрица весов)
         self.memory = nn.Linear(key_dim, val_dim, bias=False)
-        nn.init.zeros_(self.memory.weight)  # инициализация нулями
+        nn.init.normal_(self.memory.weight, std=0.01)  # small random init
 
         # Momentum state S (не параметр, а буфер)
         self.register_buffer('momentum_S', torch.zeros(val_dim, key_dim))
 
         # Гейты α (forget), η (momentum), θ (lr) — проекции из входа
-        self.gate_proj = nn.Linear(key_dim, 3, bias=True)  # 3 скаляра
+        self.gate_proj = nn.Linear(key_dim + val_dim, 3, bias=True)  # 3 скаляра
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, 0.5)  # начальные значения ~0.5
 
@@ -83,7 +83,9 @@ class TitansMemoryModule(nn.Module):
         # Create fp32 leaf copy of memory weights (detached from main param)
         mem_w = self.memory.weight.detach().float().requires_grad_(True)
         k_agg = k32.mean(0) if k32.dim() > 1 else k32
-        gates = torch.sigmoid(self.gate_proj(k_agg.to(self.gate_proj.weight.dtype)))
+        v_agg = v32.mean(0) if v32.dim() > 1 else v32
+        kv_agg = torch.cat([k_agg, v_agg], dim=-1)
+        gates = torch.sigmoid(self.gate_proj(kv_agg.to(self.gate_proj.weight.dtype)))
         alpha = gates[..., 0].float()
         eta   = gates[..., 1].float()
         theta = gates[..., 2].float()

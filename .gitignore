@@ -133,6 +133,7 @@ oauth_creds/
 
 #Agentic tools
 .omc/
+.factory/
 .memorious/
 .vscode/
 .serena/

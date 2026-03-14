@@ -8,10 +8,11 @@ batch training scenarios.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union, Any
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from src.core.hdim_pipeline import HDIMPipeline
 
@@ -108,11 +109,13 @@ class HDIMConfig:
     memory_key_dim: int = 32
     domain_names: Optional[List[str]] = None
     text: HDIMTextConfig = field(default_factory=HDIMTextConfig)
+
     def get_domain_names(self) -> List[str]:
         """Return the resolved list of domain names."""
         if self.domain_names is not None:
             return list(self.domain_names)
         return [f"domain_{i}" for i in range(self.num_domains)]
+
 
 class HDIMModel(nn.Module):
     """Hypercomplex Domain-Invariant Model (HDIM).
@@ -169,6 +172,50 @@ class HDIMModel(nn.Module):
             memory_mode=memory_mode,
         )
 
+    def _moe_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Run MoE forward with optional gradient checkpointing.
+
+        checkpoint() requires tensor-only outputs. We compute the output tensor
+        under checkpoint (for gradient savings), then re-run the forward without
+        checkpoint to get the full router_state dict, but skip the EMA update
+        on the second pass to avoid double-mutation.
+        """
+        if self.pipeline._use_gradient_checkpointing and self.training:
+            moe = self.pipeline.moe
+
+            def _moe_output_only(inp: torch.Tensor) -> torch.Tensor:
+                """Forward returning only the output tensor (for checkpoint)."""
+                orig_shape = inp.shape
+                x_flat = inp.reshape(-1, inp.shape[-1])
+                T = x_flat.shape[0]
+
+                dispatch, combine = moe._compute_dispatch_combine(x_flat)
+                slot_inputs = dispatch.T @ x_flat
+
+                x_exp = slot_inputs.view(moe.num_experts, moe.slots_per_expert, -1)
+                h = torch.einsum('esd,ehd->esh', x_exp, moe.W1_stack) + moe.b1_stack.unsqueeze(1)
+                h = torch.nn.functional.gelu(h)
+                h = torch.nn.functional.dropout(h, p=0.1, training=moe.training)
+                out = torch.einsum('esh,edh->esd', h, moe.W2_stack) + moe.b2_stack.unsqueeze(1)
+                slot_outputs = out.reshape(-1, slot_inputs.shape[-1])
+                output = combine @ slot_outputs
+                return output.reshape(orig_shape)
+
+            output = checkpoint(_moe_output_only, x, use_reentrant=False)
+
+            # Second pass: get router_state dict but skip EMA update
+            # Temporarily disable training flag to prevent EMA mutation
+            was_training = moe.training
+            moe.eval()
+            with torch.no_grad():
+                _, router_state = moe(x)
+            moe.train(was_training)
+            # Recompute forward for the dict fields we need (cheap)
+            _, router_state = moe(x)
+            return output, router_state
+        else:
+            return self.pipeline.moe(x)
+
     def _build_aux_state(
         self,
         *,
@@ -208,7 +255,9 @@ class HDIMModel(nn.Module):
 
     def _build_aux_state_from_transfer_state(
         self,
-        transfer_state: Dict[str, Union[torch.Tensor, bool, str, Dict[str, torch.Tensor]]],
+        transfer_state: Dict[
+            str, Union[torch.Tensor, bool, str, Dict[str, torch.Tensor]]
+        ],
         *,
         runtime: HDIMRuntimeConfig,
         dtype: torch.dtype,
@@ -216,18 +265,34 @@ class HDIMModel(nn.Module):
     ) -> HDIMAuxState:
         router_state = transfer_state["router_state"]
         return self._build_aux_state(
-            raw_invariant=transfer_state["raw_invariant"].to(device=device, dtype=dtype),
-            memory_augmented_invariant=transfer_state["memory_augmented_invariant"].to(device=device, dtype=dtype),
-            exported_invariant=transfer_state["exported_invariant"].to(device=device, dtype=dtype),
-            routing_weights=transfer_state["routing_weights"].to(device=device, dtype=dtype),
+            raw_invariant=transfer_state["raw_invariant"].to(
+                device=device, dtype=dtype
+            ),
+            memory_augmented_invariant=transfer_state["memory_augmented_invariant"].to(
+                device=device, dtype=dtype
+            ),
+            exported_invariant=transfer_state["exported_invariant"].to(
+                device=device, dtype=dtype
+            ),
+            routing_weights=transfer_state["routing_weights"].to(
+                device=device, dtype=dtype
+            ),
             topk_idx=router_state["topk_idx"].to(device=device),
-            topk_gate_weights=router_state["topk_gate_weights"].to(device=device, dtype=dtype),
-            train_scores_snapshot=router_state["train_scores_snapshot"].to(device=device, dtype=dtype),
+            topk_gate_weights=router_state["topk_gate_weights"].to(
+                device=device, dtype=dtype
+            ),
+            train_scores_snapshot=router_state["train_scores_snapshot"].to(
+                device=device, dtype=dtype
+            ),
             expert_usage=router_state["expert_usage"].to(device=device, dtype=dtype),
-            routing_entropy=router_state["routing_entropy"].to(device=device, dtype=dtype),
+            routing_entropy=router_state["routing_entropy"].to(
+                device=device, dtype=dtype
+            ),
             memory_loss=transfer_state["memory_loss"].to(device=device, dtype=dtype),
             router_loss=router_state["router_loss"].to(device=device, dtype=dtype),
-            z_loss=router_state.get("z_loss", torch.zeros((), device=device, dtype=dtype)).to(device=device, dtype=dtype),
+            z_loss=router_state.get(
+                "z_loss", torch.zeros((), device=device, dtype=dtype)
+            ).to(device=device, dtype=dtype),
             memory_updated=bool(transfer_state["memory_updated"]),
             runtime=runtime,
         )
@@ -238,7 +303,14 @@ class HDIMModel(nn.Module):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         raw_invariant = torch.empty(
             batch_size,
             self.pipeline.clifford_dim,
@@ -294,12 +366,15 @@ class HDIMModel(nn.Module):
         return_state: bool = False,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        HDIMAuxState,
-    ]:
+    ) -> (
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            HDIMAuxState,
+        ]
+    ):
         """Run the HDIM forward pass for same-domain reconstruction batches."""
         x = self.dropout(x)
         domain_id = domain_id.to(device=x.device, dtype=torch.long)
@@ -339,40 +414,93 @@ class HDIMModel(nn.Module):
         routing_entropy = torch.zeros((), device=x.device, dtype=x.dtype)
         memory_updated = False
 
+        # ── Batched domain processing ──────────────────────────────────
+        # Encoder, memory, and decoder are domain-agnostic → run on full batch.
+        # Invariant extraction and transfer use per-sample rotors → batch with
+        # index_select into domain rotor tensors.
+        # MoE softmax(dim=0) is group-dependent → iterate per domain group.
+        pipeline = self.pipeline
+
+        # 1) Encode full batch once (domain-agnostic encoder)
+        g_source = pipeline.encoder(x)
+
+        # 2) Build per-sample rotors via index_select
+        rotors_n = torch.stack(
+            [
+                pipeline.domain_rotors[self._domain_names[i]]._normalized_R()
+                for i in range(len(self._domain_names))
+            ]
+        )  # (num_domains, clifford_dim)
+        rotors_inv = torch.stack(
+            [
+                pipeline.domain_rotors[self._domain_names[i]].get_inverse()
+                for i in range(len(self._domain_names))
+            ]
+        )  # (num_domains, clifford_dim)
+        R_per_sample = rotors_n[domain_id]  # (batch_size, clifford_dim)
+        R_inv_per_sample = rotors_inv[domain_id]  # (batch_size, clifford_dim)
+
+        # 3) Batched invariant extraction: u_inv = R^{-1} @ g_source @ R
+        step1 = pipeline.algebra.geometric_product(R_inv_per_sample, g_source)
+        u_inv = pipeline.algebra.geometric_product(step1, R_per_sample)
+        u_inv = pipeline.invariant_norm(u_inv)
+
+        # 4) Apply memory (domain-agnostic — operates on full batch)
+        u_mem, memory_state = pipeline._apply_memory(
+            u_inv,
+            update_memory=runtime.update_memory,
+            memory_mode=runtime.memory_mode,
+        )
+
+        # 5) MoE routing — must run per domain group because
+        #    SoftMoERouter uses softmax(dim=0) across all input tokens,
+        #    so mixing domains would contaminate dispatch weights.
+        u_route = torch.empty_like(u_mem)
         for batch_domain_idx in domain_id.unique(sorted=True):
-            domain_idx = int(batch_domain_idx.item())
-            domain_name = self._domain_idx_to_name(domain_idx)
             mask = domain_id == batch_domain_idx
-            group_x = x[mask]
-            group_output, transfer_state = self.pipeline.transfer(
-                group_x,
-                domain_name,
-                domain_name,
-                update_memory=runtime.update_memory,
-                memory_mode=runtime.memory_mode,
+            group_route, group_router_state = pipeline.moe(u_mem[mask])
+            u_route[mask] = group_route
+
+            # Scatter per-group router state into batch tensors
+            routing_weights[mask] = group_router_state["gate_weights"].to(dtype=x.dtype)
+            topk_idx[mask] = group_router_state["topk_idx"].to(device=x.device)
+            topk_gate_weights[mask] = group_router_state["topk_gate_weights"].to(
+                dtype=x.dtype
             )
+            router_loss = router_loss + group_router_state["router_loss"].to(
+                dtype=x.dtype
+            )
+            z_loss = z_loss + group_router_state.get(
+                "z_loss", torch.zeros((), device=x.device, dtype=x.dtype)
+            ).to(dtype=x.dtype)
+            routing_entropy = routing_entropy + group_router_state[
+                "routing_entropy"
+            ].to(dtype=x.dtype)
+            train_scores_snapshot.copy_(
+                group_router_state["train_scores_snapshot"].to(dtype=x.dtype)
+            )
+            expert_usage.copy_(group_router_state["expert_usage"].to(dtype=x.dtype))
 
-            output[mask] = group_output
-            routing_weights[mask] = transfer_state["routing_weights"].to(dtype=x.dtype)
-            topk_idx[mask] = transfer_state["router_state"]["topk_idx"].to(device=x.device)
-            topk_gate_weights[mask] = transfer_state["router_state"]["topk_gate_weights"].to(dtype=x.dtype)
-            exported_invariant[mask] = transfer_state["exported_invariant"].to(dtype=x.dtype)
-            raw_invariant[mask] = transfer_state["raw_invariant"].to(dtype=x.dtype)
-            memory_augmented_invariant[mask] = transfer_state["memory_augmented_invariant"].to(dtype=x.dtype)
-            memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=x.dtype)
-            router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=x.dtype)
-            z_loss = z_loss + transfer_state["router_state"].get("z_loss", torch.zeros((), device=x.device, dtype=x.dtype)).to(dtype=x.dtype)
-            routing_entropy = routing_entropy + transfer_state["router_state"]["routing_entropy"].to(dtype=x.dtype)
-            train_scores_snapshot.copy_(transfer_state["router_state"]["train_scores_snapshot"].to(dtype=x.dtype))
-            expert_usage.copy_(transfer_state["router_state"]["expert_usage"].to(dtype=x.dtype))
-            memory_updated = memory_updated or bool(transfer_state["memory_updated"])
+        # 6) Batched domain transfer: g_target = R @ u_route @ R^{-1}
+        step2 = pipeline.algebra.geometric_product(R_per_sample, u_route)
+        g_target = pipeline.algebra.geometric_product(step2, R_inv_per_sample)
 
-        # A1 FIX: normalize accumulated losses by number of unique domains
-        # prevents loss scale from growing linearly with domain count
-        n_unique_domains = max(int(domain_id.unique().numel()), 1)
-        memory_loss = memory_loss / n_unique_domains
-        router_loss = router_loss / n_unique_domains
-        z_loss = z_loss / n_unique_domains
+        # 7) Decode full batch (domain-agnostic)
+        output[:] = pipeline.decoder(g_target)
+
+        # Collect remaining state
+        exported_invariant[:] = u_route.to(dtype=x.dtype)
+        raw_invariant[:] = u_inv.to(dtype=x.dtype)
+        memory_augmented_invariant[:] = u_mem.to(dtype=x.dtype)
+        memory_loss = memory_state.loss.to(dtype=x.dtype)
+        memory_updated = bool(memory_state.updated)
+
+        # B17 FIX: normalize accumulated losses by total samples
+        # prevents bias when group sizes are uneven across domains
+        total_samples = max(batch_size, 1)
+        memory_loss = memory_loss / total_samples
+        router_loss = router_loss / total_samples
+        z_loss = z_loss / total_samples
 
         invariant = self.training_inv_head(exported_invariant).to(dtype=x.dtype)
 
@@ -455,7 +583,15 @@ class HDIMModel(nn.Module):
         # pipeline.remove_domain already removes from pipeline.domain_names
         # which is the same list as self._domain_names
 
-    def reset_memory(self, strategy: str = 'geometric') -> None:
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing on the pipeline's memory and MoE paths."""
+        self.pipeline.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing on the pipeline."""
+        self.pipeline.disable_gradient_checkpointing()
+
+    def reset_memory(self, strategy: str = "geometric") -> None:
         """Reset stateful HDIM memory and router replay state.
 
         strategy:
@@ -465,16 +601,19 @@ class HDIMModel(nn.Module):
         """
         self.pipeline.reset_memory(strategy=strategy)
         with torch.no_grad():
-            if hasattr(self.pipeline.moe, 'train_scores'):
+            if hasattr(self.pipeline.moe, "train_scores"):
                 n = self.pipeline.moe.num_experts
-                if strategy == 'hard':
+                if strategy == "hard":
                     # Полный сброс EMA весов роутера
                     self.pipeline.moe.train_scores.fill_(1.0 / n)
-                elif strategy == 'geometric':
+                elif strategy == "geometric":
                     # Мягкое затухание к равномерному (не теряем всю историю)
-                    uniform = torch.full((n,), 1.0 / n,
-                                        device=self.pipeline.moe.train_scores.device,
-                                        dtype=self.pipeline.moe.train_scores.dtype)
+                    uniform = torch.full(
+                        (n,),
+                        1.0 / n,
+                        device=self.pipeline.moe.train_scores.device,
+                        dtype=self.pipeline.moe.train_scores.dtype,
+                    )
                     self.pipeline.moe.train_scores.mul_(0.7).add_(uniform * 0.3)
                 # 'stabilize': не трогаем train_scores
 
@@ -488,8 +627,12 @@ class HDIMModel(nn.Module):
         memory_mode: str = "update",
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
         """Run explicit paired transfer for mixed-domain batches."""
-        source_domain_id = source_domain_id.to(device=source_encoding.device, dtype=torch.long)
-        target_domain_id = target_domain_id.to(device=source_encoding.device, dtype=torch.long)
+        source_domain_id = source_domain_id.to(
+            device=source_encoding.device, dtype=torch.long
+        )
+        target_domain_id = target_domain_id.to(
+            device=source_encoding.device, dtype=torch.long
+        )
         runtime = self._resolve_runtime_config(
             update_memory=update_memory,
             memory_mode=memory_mode,
@@ -520,49 +663,123 @@ class HDIMModel(nn.Module):
             dtype=source_encoding.dtype,
         )
         output = torch.empty_like(source_encoding)
-        memory_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
-        router_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
-        z_loss = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
-        routing_entropy = torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
+        memory_loss = torch.zeros(
+            (), device=source_encoding.device, dtype=source_encoding.dtype
+        )
+        router_loss = torch.zeros(
+            (), device=source_encoding.device, dtype=source_encoding.dtype
+        )
+        z_loss = torch.zeros(
+            (), device=source_encoding.device, dtype=source_encoding.dtype
+        )
+        routing_entropy = torch.zeros(
+            (), device=source_encoding.device, dtype=source_encoding.dtype
+        )
         memory_updated = False
 
+        # ── Batched domain transfer processing ────────────────────────
+        # Encoder, memory, and decoder are domain-agnostic → run on full batch.
+        # Invariant extraction uses source rotors, transfer uses target rotors.
+        # MoE softmax(dim=0) is group-dependent → iterate per (src, tgt) pair.
+        pipeline = self.pipeline
+
+        # 1) Encode full batch once (domain-agnostic encoder)
+        g_source = pipeline.encoder(source_encoding)
+
+        # 2) Build per-sample source/target rotors
+        rotors_n = torch.stack(
+            [
+                pipeline.domain_rotors[self._domain_names[i]]._normalized_R()
+                for i in range(len(self._domain_names))
+            ]
+        )
+        rotors_inv = torch.stack(
+            [
+                pipeline.domain_rotors[self._domain_names[i]].get_inverse()
+                for i in range(len(self._domain_names))
+            ]
+        )
+        R_src_per_sample = rotors_n[source_domain_id]
+        R_src_inv_per_sample = rotors_inv[source_domain_id]
+        R_tgt_per_sample = rotors_n[target_domain_id]
+        R_tgt_inv_per_sample = rotors_inv[target_domain_id]
+
+        # 3) Batched invariant extraction: u_inv = R_src^{-1} @ g_source @ R_src
+        step1 = pipeline.algebra.geometric_product(R_src_inv_per_sample, g_source)
+        u_inv = pipeline.algebra.geometric_product(step1, R_src_per_sample)
+        u_inv = pipeline.invariant_norm(u_inv)
+
+        # 4) Apply memory (domain-agnostic)
+        u_mem, memory_state = pipeline._apply_memory(
+            u_inv,
+            update_memory=runtime.update_memory,
+            memory_mode=runtime.memory_mode,
+        )
+
+        # 5) MoE routing — per (src, tgt) pair group (softmax(dim=0) dependency)
+        u_route = torch.empty_like(u_mem)
         pair_keys = torch.stack((source_domain_id, target_domain_id), dim=1)
         unique_pairs = pair_keys.unique(dim=0)
         for pair in unique_pairs:
             src_idx, tgt_idx = int(pair[0].item()), int(pair[1].item())
-            src_name = self._domain_idx_to_name(src_idx)
-            tgt_name = self._domain_idx_to_name(tgt_idx)
             mask = (source_domain_id == src_idx) & (target_domain_id == tgt_idx)
-            group_x = source_encoding[mask]
-            group_output, transfer_state = self.pipeline.transfer(
-                group_x,
-                src_name,
-                tgt_name,
-                update_memory=runtime.update_memory,
-                memory_mode=runtime.memory_mode,
+            group_route, group_router_state = pipeline.moe(u_mem[mask])
+            u_route[mask] = group_route
+
+            routing_weights[mask] = group_router_state["gate_weights"].to(
+                dtype=source_encoding.dtype
             )
-            output[mask] = group_output
-            routing_weights[mask] = transfer_state["routing_weights"].to(dtype=source_encoding.dtype)
-            topk_idx[mask] = transfer_state["router_state"]["topk_idx"].to(device=source_encoding.device)
-            topk_gate_weights[mask] = transfer_state["router_state"]["topk_gate_weights"].to(dtype=source_encoding.dtype)
-            exported_invariant[mask] = transfer_state["exported_invariant"].to(dtype=source_encoding.dtype)
-            raw_invariant[mask] = transfer_state["raw_invariant"].to(dtype=source_encoding.dtype)
-            memory_augmented_invariant[mask] = transfer_state["memory_augmented_invariant"].to(dtype=source_encoding.dtype)
-            memory_loss = memory_loss + transfer_state["memory_loss"].to(dtype=source_encoding.dtype)
-            router_loss = router_loss + transfer_state["router_state"]["router_loss"].to(dtype=source_encoding.dtype)
-            z_loss = z_loss + transfer_state["router_state"].get("z_loss", torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)).to(dtype=source_encoding.dtype)
-            routing_entropy = routing_entropy + transfer_state["router_state"]["routing_entropy"].to(dtype=source_encoding.dtype)
-            train_scores_snapshot.copy_(transfer_state["router_state"]["train_scores_snapshot"].to(dtype=source_encoding.dtype))
-            expert_usage.copy_(transfer_state["router_state"]["expert_usage"].to(dtype=source_encoding.dtype))
-            memory_updated = memory_updated or bool(transfer_state["memory_updated"])
+            topk_idx[mask] = group_router_state["topk_idx"].to(
+                device=source_encoding.device
+            )
+            topk_gate_weights[mask] = group_router_state["topk_gate_weights"].to(
+                dtype=source_encoding.dtype
+            )
+            router_loss = router_loss + group_router_state["router_loss"].to(
+                dtype=source_encoding.dtype
+            )
+            z_loss = z_loss + group_router_state.get(
+                "z_loss",
+                torch.zeros(
+                    (), device=source_encoding.device, dtype=source_encoding.dtype
+                ),
+            ).to(dtype=source_encoding.dtype)
+            routing_entropy = routing_entropy + group_router_state[
+                "routing_entropy"
+            ].to(dtype=source_encoding.dtype)
+            train_scores_snapshot.copy_(
+                group_router_state["train_scores_snapshot"].to(
+                    dtype=source_encoding.dtype
+                )
+            )
+            expert_usage.copy_(
+                group_router_state["expert_usage"].to(dtype=source_encoding.dtype)
+            )
 
-        # A1 FIX: normalize accumulated losses by number of unique domain pairs
-        n_unique_pairs = max(int(unique_pairs.shape[0]), 1)
-        memory_loss = memory_loss / n_unique_pairs
-        router_loss = router_loss / n_unique_pairs
-        z_loss = z_loss / n_unique_pairs
+        # 6) Batched domain transfer: g_target = R_tgt @ u_route @ R_tgt^{-1}
+        step2 = pipeline.algebra.geometric_product(R_tgt_per_sample, u_route)
+        g_target = pipeline.algebra.geometric_product(step2, R_tgt_inv_per_sample)
 
-        invariant = self.training_inv_head(exported_invariant).to(dtype=source_encoding.dtype)
+        # 7) Decode full batch (domain-agnostic)
+        output[:] = pipeline.decoder(g_target)
+
+        # Collect remaining state
+        exported_invariant[:] = u_route.to(dtype=source_encoding.dtype)
+        raw_invariant[:] = u_inv.to(dtype=source_encoding.dtype)
+        memory_augmented_invariant[:] = u_mem.to(dtype=source_encoding.dtype)
+        memory_loss = memory_state.loss.to(dtype=source_encoding.dtype)
+        memory_updated = bool(memory_state.updated)
+
+        # B17 FIX: normalize accumulated losses by total samples
+        # prevents bias when group sizes are uneven across domain pairs
+        total_samples = max(batch_size, 1)
+        memory_loss = memory_loss / total_samples
+        router_loss = router_loss / total_samples
+        z_loss = z_loss / total_samples
+
+        invariant = self.training_inv_head(exported_invariant).to(
+            dtype=source_encoding.dtype
+        )
         aux_state = self._build_aux_state(
             raw_invariant=raw_invariant,
             memory_augmented_invariant=memory_augmented_invariant,

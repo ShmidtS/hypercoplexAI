@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from typing import Any, Dict, List, Optional, Tuple
+from torch.utils.checkpoint import checkpoint
 
 from .hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from .domain_operators import DomainRotationOperator, InvariantExtractor, sandwich_transfer
@@ -172,6 +173,20 @@ class HDIMPipeline(nn.Module):
             expert_dim=clifford_dim * 2,
             top_k=top_k,
         )
+        self.memory_gate = nn.Sequential(
+            nn.Linear(clifford_dim, clifford_dim // 4),
+            nn.ReLU(),
+            nn.Linear(clifford_dim // 4, 1),
+        )
+        self._use_gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing on memory and MoE forward paths."""
+        self._use_gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing."""
+        self._use_gradient_checkpointing = False
 
     def encode_domain(
         self,
@@ -210,7 +225,10 @@ class HDIMPipeline(nn.Module):
             u_inv,
             update_memory=update_memory and memory_mode == "update",
         )
-        return u_inv + memory_state.retrieved, memory_state
+        gate = torch.sigmoid(self.memory_gate(u_inv))
+        # Gradient isolation: memory.retrieved doesn't backprop through memory weights
+        retrieved = memory_state.retrieved.detach() if self.training else memory_state.retrieved
+        return u_inv + gate * retrieved, memory_state
 
     def transfer(
         self,
@@ -236,7 +254,13 @@ class HDIMPipeline(nn.Module):
             update_memory=update_memory,
             memory_mode=memory_mode,
         )
-        u_route, router_state = self.moe(u_mem)
+        if self._use_gradient_checkpointing and self.training:
+            u_route, router_state = checkpoint(
+                self.moe, u_mem,
+                use_reentrant=False,
+            )
+        else:
+            u_route, router_state = self.moe(u_mem)
         r_source = self.domain_rotors[source_domain]
         r_target = self.domain_rotors[target_domain]
         if input_is_invariant:

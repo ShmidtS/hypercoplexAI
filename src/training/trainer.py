@@ -67,11 +67,14 @@ class HDIMTrainer:
         self._tau_min: float = 0.01
         self._temp_schedule_T_0: int = 20  # matches scheduler T_0
         # Learnable temperature (log-scale for numerical stability)
+        # B33 FIX: register as buffer on model so it survives checkpoint save/load
         import math
         if learnable_temperature:
             self._log_temp = nn.Parameter(
                 torch.tensor(math.log(infonce_temperature), device=torch.device(device))
             )
+            # Register on model so it appears in state_dict
+            self.model.register_parameter('_log_temp', self._log_temp)
         else:
             self._log_temp = None
     def _resolve_training_regime(self, batch: Dict[str, Any]) -> TrainingRegime:

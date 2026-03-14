@@ -1,24 +1,39 @@
 #!/usr/bin/env python
 """
-HDIM Auto-Tuner — автоматический подбор гиперпараметров через Optuna.
+HDIM Auto-Tuner v21 — Optuna hyperparameter search for Phase 21 SOTA config.
 
 Запуск:
   python scripts/auto_tune.py                        # 20 trials, 30 эпох каждый
   python scripts/auto_tune.py --n_trials 50          # 50 trials
   python scripts/auto_tune.py --epochs 50 --n_trials 30
   python scripts/auto_tune.py --resume               # продолжить прерванное исследование
+  python scripts/auto_tune.py --data v8 --n_trials 30 # использовать v8 данные (330 пар)
+  python scripts/auto_tune.py --phase quick           # быстрый 15-эпох прогон
+  python scripts/auto_tune.py --phase deep            # глубокий 60-эпох прогон
+
+Phase 21 SOTA improvements (all active):
+  - Gated Memory Fusion (learned gate before memory addition)
+  - Expert Dropout (0.1) in MoE experts
+  - Similarity-Preserving Router (ICLR 2026)
+  - Gradient Isolation for Memory (.detach() on retrieved)
+  - Precomputed Clifford signs (performance fix)
+  - DCL + Uniformity + Alignment losses
+  - Focal-InfoNCE (gamma)
+  - Router Z-Loss (lambda_z >= 0.005)
+  - Learnable temperature with checkpoint persistence
 
 Optuna подбирает:
   - lr, batch_size, lambda_pair, lambda_angle, lambda_sts
   - lambda_dcl, lambda_uniformity, lambda_z
+  - lambda_iso, lambda_routing, lambda_memory
   - infonce_temperature, focal_gamma
-  - augment_factor
+  - augment_factor, warmup_epochs
+  - data_version (v5 vs v8)
 
-Зафиксировано (из экспериментов):
+Зафиксировано:
   - hidden_dim=256, num_experts=4 (Phase8e рекорд)
-  - pretrained_encoder, soft_router
-  - simple MLP (не менять архитектуру)
-  - data=v5 (рекордные данные)
+  - pretrained_encoder, soft_router, t_mult=2
+  - simple MLP projection (рекордная архитектура)
 """
 from __future__ import annotations
 
@@ -31,79 +46,157 @@ import time
 from pathlib import Path
 
 import optuna
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
 TRAIN_SCRIPT = str(REPO_ROOT / "scripts" / "gpu_train.py")
 STUDY_DB = str(REPO_ROOT / "artifacts" / "optuna_study.db")
-STUDY_NAME = "hdim_autotune_v1"
+STUDY_NAME = "hdim_autotune"
+
+# Phase presets
+PHASE_PRESETS = {
+    "quick": {"epochs": 15, "eval_every": 5, "early_stop": 10},
+    "standard": {"epochs": 30, "eval_every": 5, "early_stop": 15},
+    "deep": {"epochs": 60, "eval_every": 5, "early_stop": 25},
+}
+
+DATA_VERSIONS = {
+    "v5": "data/real_pairs_v5.json",  # 175 пар — Phase8e рекорд
+    "v7": "data/real_pairs_v7.json",  # 232 пары
+    "v8": "data/real_pairs_v8.json",  # 330 пар — 35.8% neg, все домены
+}
 
 
-def objective(trial: optuna.Trial, epochs: int = 30) -> float:
+def objective(trial: optuna.Trial, epochs: int = 30, data_version: str = "v5") -> float:
     """Один trial: запустить обучение с предложенными параметрами, вернуть score."""
 
+    # === Данные ===
+    data_file = DATA_VERSIONS.get(data_version, DATA_VERSIONS["v5"])
+
     # === Параметры для подбора ===
-    lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True)
-    batch_size = trial.suggest_categorical("batch_size", [32, 64, 96])
-    augment_factor = trial.suggest_int("augment_factor", 10, 50, step=10)
 
-    # Loss weights
-    lambda_pair = trial.suggest_float("lambda_pair", 0.2, 0.6, step=0.1)
-    lambda_angle = trial.suggest_float("lambda_angle", 0.1, 0.5, step=0.1)
-    lambda_sts = trial.suggest_float("lambda_sts", 0.0, 0.3, step=0.1)
-    lambda_dcl = trial.suggest_float("lambda_dcl", 0.0, 0.5, step=0.1)
-    lambda_uniformity = trial.suggest_float("lambda_uniformity", 0.0, 0.3, step=0.05)
-    # lambda_z >= 0.005 обязателен для предотвращения MoE collapse
-    lambda_z = trial.suggest_float("lambda_z", 0.005, 0.02, step=0.005)
+    # Learning rate — лог-шкала
+    lr = trial.suggest_float("lr", 5e-5, 2e-3, log=True)
 
-    # Temperature
-    temperature = trial.suggest_float("infonce_temperature", 0.05, 0.2, log=True)
-    focal_gamma = trial.suggest_float("focal_gamma", 0.3, 1.0, step=0.1)
+    # Batch size — 32 рекорд, но пробуем больше
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 48, 64])
 
-    # Scheduler
-    # t_mult=1 исключён — Phase 12 anti-pattern (score деградация на каждом цикле)
+    # Augment factor — v5 рекорд=30, но зависит от данных
+    max_augment = 50 if data_version == "v5" else 30
+    augment_factor = trial.suggest_int("augment_factor", 5, max_augment, step=5)
+
+    # === Loss weights (Phase 21 SOTA) ===
+
+    # Pair loss — основной contrastive signal
+    lambda_pair = trial.suggest_float("lambda_pair", 0.2, 0.6, step=0.05)
+
+    # AnglE loss — угол между векторами
+    lambda_angle = trial.suggest_float("lambda_angle", 0.1, 0.5, step=0.05)
+
+    # STS export loss — STS benchmark alignment
+    lambda_sts = trial.suggest_float("lambda_sts", 0.05, 0.35, step=0.05)
+
+    # Isomorphism loss — domain invariant extraction
+    lambda_iso = trial.suggest_float("lambda_iso", 0.05, 0.2, step=0.025)
+
+    # Routing loss — MoE load balancing
+    lambda_routing = trial.suggest_float("lambda_routing", 0.02, 0.1, step=0.01)
+
+    # Memory loss — Titans memory regularization
+    lambda_memory = trial.suggest_float("lambda_memory", 0.005, 0.03, step=0.005)
+
+    # DCL — Decoupled Contrastive Loss (NeurIPS 2022)
+    lambda_dcl = trial.suggest_float("lambda_dcl", 0.0, 0.5, step=0.05)
+
+    # Uniformity + Alignment (Wang & Isola 2020)
+    lambda_uniformity = trial.suggest_float("lambda_uniformity", 0.0, 0.3, step=0.025)
+
+    # Router Z-Loss — ОБЯЗАТЕЛЬНО >= 0.005 для num_experts=4
+    lambda_z = trial.suggest_float("lambda_z", 0.005, 0.03, step=0.005)
+
+    # === Temperature & Focal ===
+    temperature = trial.suggest_float("infonce_temperature", 0.05, 0.25, log=True)
+    focal_gamma = trial.suggest_float("focal_gamma", 0.2, 1.0, step=0.1)
+
+    # === Scheduler ===
+    # t_mult=1 исключён — Phase 12 anti-pattern (деградация на каждом рестарте)
     t_mult = trial.suggest_categorical("t_mult", [2])
+    warmup_epochs = trial.suggest_int("warmup_epochs", 2, 5)
 
-    out_dir = REPO_ROOT / "artifacts" / f"optuna_trial_{trial.number:04d}"
+    # === Output ===
+    out_dir = REPO_ROOT / "artifacts" / f"optuna_{trial.number:04d}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    eval_every = max(1, epochs // 4)
+    early_stop = max(5, epochs // 2)
+
     cmd = [
-        PYTHON, TRAIN_SCRIPT,
-        "--epochs", str(epochs),
-        "--hidden_dim", "256",
-        "--num_experts", "4",
-        "--num_domains", "4",
+        PYTHON,
+        TRAIN_SCRIPT,
+        "--epochs",
+        str(epochs),
+        "--hidden_dim",
+        "256",
+        "--num_experts",
+        "4",
+        "--num_domains",
+        "4",
         "--pretrained_encoder",
         "--soft_router",
-        "--real_pairs", str(REPO_ROOT / "data" / "real_pairs_v5.json"),
-        "--augment_factor", str(augment_factor),
-        "--lambda_pair", str(lambda_pair),
-        "--lambda_angle", str(lambda_angle),
-        "--lambda_sts", str(lambda_sts),
-        "--lambda_iso", "0.1",
-        "--lambda_routing", "0.05",
-        "--lambda_memory", "0.01",
-        "--lambda_z", str(lambda_z),
-        "--lambda_dcl", str(lambda_dcl),
-        "--lambda_uniformity", str(lambda_uniformity),
+        "--real_pairs",
+        str(REPO_ROOT / data_file),
+        "--augment_factor",
+        str(augment_factor),
+        "--lambda_pair",
+        str(lambda_pair),
+        "--lambda_angle",
+        str(lambda_angle),
+        "--lambda_sts",
+        str(lambda_sts),
+        "--lambda_iso",
+        str(lambda_iso),
+        "--lambda_routing",
+        str(lambda_routing),
+        "--lambda_memory",
+        str(lambda_memory),
+        "--lambda_z",
+        str(lambda_z),
+        "--lambda_dcl",
+        str(lambda_dcl),
+        "--lambda_uniformity",
+        str(lambda_uniformity),
         "--use_infonce",
-        "--infonce_temperature", str(temperature),
+        "--infonce_temperature",
+        str(temperature),
         "--learnable_temperature",
-        "--focal_gamma", str(focal_gamma),
-        # early_stopping_patience set above dynamically
-        "--lr", str(lr),
-        "--seed", "42",
-        "--batch_size", str(batch_size),
-        "--scheduler_type", "cosine_restarts",
-        "--t_mult", str(t_mult),
-        "--warmup_epochs", "3",
-        "--eval_every", str(max(1, epochs // 3)),
-        "--early_stopping_patience", str(max(5, epochs // 2)),
-        "--save_every", "100",
-        "--output_dir", str(out_dir),
-        "--results_json", str(out_dir / "results.json"),
-        "--device", "auto",
+        "--focal_gamma",
+        str(focal_gamma),
+        "--lr",
+        str(lr),
+        "--seed",
+        "42",
+        "--batch_size",
+        str(batch_size),
+        "--scheduler_type",
+        "cosine_restarts",
+        "--t_mult",
+        str(t_mult),
+        "--warmup_epochs",
+        str(warmup_epochs),
+        "--eval_every",
+        str(eval_every),
+        "--early_stopping_patience",
+        str(early_stop),
+        "--save_every",
+        "100",
+        "--output_dir",
+        str(out_dir),
+        "--results_json",
+        str(out_dir / "results.json"),
+        "--device",
+        "auto",
         "--amp",
     ]
 
@@ -111,11 +204,11 @@ def objective(trial: optuna.Trial, epochs: int = 30) -> float:
     log_file = out_dir / "trial.log"
     try:
         env = os.environ.copy()
-        env["HDIM_NUM_WORKERS"] = "0"  # отключаем DataLoader workers (RAM)
+        # num_workers=0 для autotune чтобы не плодить процессы
+        env["HDIM_NUM_WORKERS"] = "0"
         with open(log_file, "w", encoding="utf-8") as logf:
             result = subprocess.run(
-                cmd, stdout=logf, stderr=logf,
-                timeout=epochs * 200, env=env
+                cmd, stdout=logf, stderr=logf, timeout=epochs * 300, env=env
             )
     except subprocess.TimeoutExpired:
         print(f"  Trial {trial.number}: TIMEOUT")
@@ -128,8 +221,8 @@ def objective(trial: optuna.Trial, epochs: int = 30) -> float:
     if not results_file.exists():
         print(f"  Trial {trial.number}: NO RESULTS (returncode={result.returncode})")
         if log_file.exists():
-            tail = log_file.read_text(encoding="utf-8", errors="ignore")[-400:]
-            print("  LOG tail:", tail)
+            tail = log_file.read_text(encoding="utf-8", errors="ignore")[-500:]
+            print("  LOG tail:", tail[-300:])
         return 0.0
 
     try:
@@ -139,30 +232,61 @@ def objective(trial: optuna.Trial, epochs: int = 30) -> float:
         print(f"  Trial {trial.number}: PARSE ERROR {e}")
         return 0.0
 
-    pair_margin = data.get("quality", {}).get("pair_margin", 0)
-    sts = data.get("quality", {}).get("STS_exported", 0)
+    quality = data.get("quality", {})
+    pair_margin = quality.get("pair_margin", 0)
+    sts = quality.get("STS_exported", 0)
     best_epoch = data.get("training_summary", {}).get("best_epoch", 0)
+
+    # Report to Optuna for pruning
+    trial.set_user_attr("pair_margin", pair_margin)
+    trial.set_user_attr("STS_exported", sts)
+    trial.set_user_attr("best_epoch", best_epoch)
+    trial.set_user_attr("elapsed_s", elapsed)
 
     print(
         f"  Trial {trial.number:3d}: score={score:.4f} "
         f"margin={pair_margin:.4f} STS={sts:.4f} "
         f"ep={best_epoch} t={elapsed:.0f}s "
-        f"lr={lr:.5f} bs={batch_size} dcl={lambda_dcl:.2f} uni={lambda_uniformity:.2f}"
+        f"lr={lr:.5f} bs={batch_size} dcl={lambda_dcl:.2f} "
+        f"z={lambda_z:.3f} aug={augment_factor}"
     )
     return score
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HDIM Auto-Tuner (Optuna)")
-    parser.add_argument("--n_trials", type=int, default=20,
-                        help="Количество trials (default: 20)")
-    parser.add_argument("--epochs", type=int, default=30,
-                        help="Эпох на один trial (default: 30)")
-    parser.add_argument("--resume", action="store_true",
-                        help="Продолжить существующее исследование")
+    parser = argparse.ArgumentParser(description="HDIM Auto-Tuner v21 (Optuna + SOTA)")
+    parser.add_argument(
+        "--n_trials", type=int, default=20, help="Количество trials (default: 20)"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=30, help="Эпох на один trial (default: 30)"
+    )
+    parser.add_argument(
+        "--resume", action="store_true", help="Продолжить существующее исследование"
+    )
     parser.add_argument("--study_name", type=str, default=STUDY_NAME)
     parser.add_argument("--db", type=str, default=STUDY_DB)
+    parser.add_argument(
+        "--data",
+        type=str,
+        default="v5",
+        choices=["v5", "v7", "v8"],
+        help="Версия данных (default: v5 — рекордная)",
+    )
+    parser.add_argument(
+        "--phase",
+        type=str,
+        default=None,
+        choices=["quick", "standard", "deep"],
+        help="Preset фазы: quick=15ep, standard=30ep, deep=60ep",
+    )
     args = parser.parse_args()
+
+    # Phase preset override
+    if args.phase:
+        preset = PHASE_PRESETS[args.phase]
+        args.epochs = preset["epochs"]
+        print(f"Phase preset '{args.phase}': {preset['epochs']} epochs")
 
     Path(args.db).parent.mkdir(parents=True, exist_ok=True)
     storage = f"sqlite:///{args.db}"
@@ -181,32 +305,51 @@ def main():
             load_if_exists=True,
         )
 
-    print(f"HDIM Auto-Tuner | n_trials={args.n_trials} | epochs={args.epochs}/trial")
+    data_info = {
+        "v5": "175 pairs (Phase8e record)",
+        "v7": "232 pairs",
+        "v8": "330 pairs, 35.8% neg, all domains",
+    }[args.data]
+
+    print(
+        f"HDIM Auto-Tuner v21 | n_trials={args.n_trials} | epochs={args.epochs}/trial"
+    )
     print(f"Study: {args.study_name} | DB: {args.db}")
-    print(f"Fixed: hidden=256, experts=4, v5 data, simple MLP, frozen SBERT")
-    print(f"Tuning: lr, batch_size, augment, lambdas, temperature, focal_gamma")
+    print(f"Data: {args.data} — {data_info}")
+    print(f"Fixed: hidden=256, experts=4, t_mult=2, simple MLP, frozen SBERT")
+    print(
+        f"SOTA: gated_memory, expert_dropout(0.1), sim_preserving_router, grad_isolation"
+    )
+    print(f"Tuning: lr, bs, augment, 9 loss lambdas, temp, focal_gamma, warmup")
     print()
 
     study.optimize(
-        lambda trial: objective(trial, epochs=args.epochs),
+        lambda trial: objective(trial, epochs=args.epochs, data_version=args.data),
         n_trials=args.n_trials,
         show_progress_bar=False,
     )
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("BEST TRIAL:")
     best = study.best_trial
     print(f"  Score: {best.value:.4f}")
+    print(f"  Data: {args.data}")
     print(f"  Params:")
     for k, v in best.params.items():
-        print(f"    {k}: {v}")
+        if isinstance(v, float):
+            print(f"    {k}: {v:.6f}")
+        else:
+            print(f"    {k}: {v}")
 
     # Сохраняем лучшую конфигурацию как .bat
     best_bat = REPO_ROOT / "scripts" / "best_autotune.bat"
-    params = best.params
+    p = best.params
+    data_path = DATA_VERSIONS[args.data].replace("/", "\\")
+
     bat_content = f"""@echo off
-REM Auto-tuned config (Optuna, score={best.value:.4f})
+REM Auto-tuned config v21 (Optuna, score={best.value:.4f}, data={args.data})
 REM Generated by scripts/auto_tune.py
+REM Phase 21 SOTA: Gated Memory + Expert Dropout + Sim-Preserving Router
 
 cd /d E:\\hypercoplexAI
 call .venv\\Scripts\\activate.bat
@@ -218,28 +361,28 @@ python scripts\\gpu_train.py ^
     --num_domains 4 ^
     --pretrained_encoder ^
     --soft_router ^
-    --real_pairs data\\real_pairs_v5.json ^
-    --augment_factor {params['augment_factor']} ^
-    --lambda_pair {params['lambda_pair']} ^
-    --lambda_angle {params['lambda_angle']} ^
-    --lambda_sts {params['lambda_sts']} ^
-    --lambda_iso 0.1 ^
-    --lambda_routing 0.05 ^
-    --lambda_memory 0.01 ^
-    --lambda_z {params['lambda_z']} ^
-    --lambda_dcl {params['lambda_dcl']} ^
-    --lambda_uniformity {params['lambda_uniformity']} ^
+    --real_pairs {data_path} ^
+    --augment_factor {p['augment_factor']} ^
+    --lambda_pair {p['lambda_pair']} ^
+    --lambda_angle {p['lambda_angle']} ^
+    --lambda_sts {p['lambda_sts']} ^
+    --lambda_iso {p['lambda_iso']} ^
+    --lambda_routing {p['lambda_routing']} ^
+    --lambda_memory {p['lambda_memory']} ^
+    --lambda_z {p['lambda_z']} ^
+    --lambda_dcl {p['lambda_dcl']} ^
+    --lambda_uniformity {p['lambda_uniformity']} ^
     --use_infonce ^
-    --infonce_temperature {params['infonce_temperature']:.5f} ^
+    --infonce_temperature {p['infonce_temperature']:.5f} ^
     --learnable_temperature ^
-    --focal_gamma {params['focal_gamma']} ^
+    --focal_gamma {p['focal_gamma']} ^
     --early_stopping_patience 40 ^
-    --lr {params['lr']:.6f} ^
+    --lr {p['lr']:.6f} ^
     --seed 42 ^
-    --batch_size {params['batch_size']} ^
+    --batch_size {p['batch_size']} ^
     --scheduler_type cosine_restarts ^
-    --t_mult {params['t_mult']} ^
-    --warmup_epochs 3 ^
+    --t_mult {p['t_mult']} ^
+    --warmup_epochs {p['warmup_epochs']} ^
     --eval_every 5 ^
     --save_every 25 ^
     --output_dir artifacts\\best_autotune ^
@@ -256,14 +399,32 @@ pause
     all_results = []
     for t in sorted(study.trials, key=lambda x: x.value or 0, reverse=True):
         if t.value is not None:
-            all_results.append({"trial": t.number, "score": t.value, **t.params})
+            entry = {"trial": t.number, "score": t.value, **t.params}
+            entry.update(t.user_attrs)
+            all_results.append(entry)
 
     results_file = REPO_ROOT / "artifacts" / "optuna_results.json"
     results_file.write_text(json.dumps(all_results, indent=2), encoding="utf-8")
     print(f"All results saved to: {results_file}")
+
     print(f"\nTop 5 trials:")
     for r in all_results[:5]:
-        print(f"  Trial {r['trial']:3d}: score={r['score']:.4f} lr={r['lr']:.5f} bs={r['batch_size']}")
+        margin = r.get("pair_margin", 0)
+        sts = r.get("STS_exported", 0)
+        print(
+            f"  Trial {r['trial']:3d}: score={r['score']:.4f} "
+            f"margin={margin:.4f} STS={sts:.4f} "
+            f"lr={r['lr']:.5f} bs={r['batch_size']}"
+        )
+
+    # Генерация сравнительного отчёта
+    print(f"\n=== Parameter Importance (top 5) ===")
+    try:
+        importances = optuna.importance.get_param_importances(study)
+        for i, (param, imp) in enumerate(list(importances.items())[:5]):
+            print(f"  {i+1}. {param}: {imp:.4f}")
+    except Exception:
+        print("  (not available)")
 
 
 if __name__ == "__main__":

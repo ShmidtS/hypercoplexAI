@@ -253,9 +253,14 @@ def _build_scheduler(optimizer, args, total_steps: int):
     epochs = args.epochs
 
     if stype == "cosine_restarts":
+        # T_0 in STEPS — Phase 8e record: T_0=20 epochs * steps_per_epoch
+        # Cycles: 20ep -> 40ep -> 80ep. Best score on cycle 3 (ep45-60).
+        steps_per_epoch = max(1, total_steps // max(1, epochs))
+        T_0_epochs = max(getattr(args, "warmup_epochs", 20), 15)
+        T_0 = T_0_epochs * steps_per_epoch
         return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
-            T_0=max(getattr(args, "warmup_epochs", 3) * 3, 20),
+            T_0=T_0,
             T_mult=getattr(args, "t_mult", 2),
             eta_min=lr * 1e-3,
         ), False  # (scheduler, needs_score)
@@ -295,6 +300,14 @@ def run_gpu_training(
 
     model = _build_model(cfg, args)
     model = model.to(device)
+
+    # Enable gradient checkpointing if requested
+    if getattr(args, 'gradient_checkpointing', False):
+        if hasattr(model, 'enable_gradient_checkpointing'):
+            model.enable_gradient_checkpointing()
+            print("Gradient checkpointing: ENABLED (memory + MoE paths)")
+        else:
+            print("WARNING: gradient_checkpointing flag set but model doesn't support it")
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
@@ -498,6 +511,17 @@ def run_gpu_training(
                     raise
 
         train_loss = epoch_loss / max(n_batches, 1)
+
+        # Log loss breakdown if available from trainer
+        loss_breakdown = getattr(trainer, '_last_loss_components', None)
+        if loss_breakdown and epoch % args.eval_every == 0:
+            breakdown_str = " | ".join(
+                f"{k}={v:.4f}" for k, v in loss_breakdown.items()
+                if isinstance(v, (int, float)) and v != 0
+            )
+            if breakdown_str:
+                print(f"  Loss breakdown: {breakdown_str}")
+
         if scheduler_needs_score:
             # ReduceLROnPlateau: нужен score (лучше вызывать после eval)
             _sched_score = compute_primary_score(quality_metrics) if quality_metrics.get("pair_margin", 0) > 0 else 0.0
@@ -596,11 +620,14 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--warmup_epochs", type=int, default=20,
+                        help="T_0 for cosine_restarts in epochs (default: 20, Phase8e record)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to reduce activation memory")
     # Model arch
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_experts", type=int, default=4)

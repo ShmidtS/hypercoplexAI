@@ -77,20 +77,35 @@ class SoftMoERouter(nn.Module):
         self.temperature = temperature
         self.num_slots = num_experts * slots_per_expert
         self.z_loss_weight = z_loss_weight
+        self.use_similarity_balance = False  # ICLR 2026 Similarity-Preserving Router
 
         # Dispatch parameter matrix: (input_dim, num_slots)
         self.dispatch_proj = nn.Linear(input_dim, self.num_slots, bias=False)
         nn.init.normal_(self.dispatch_proj.weight, std=0.02)
 
-        # Expert networks
+        # Expert networks — kept for parameter registration and state_dict compat
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(input_dim, expert_dim),
                 nn.GELU(),
+                nn.Dropout(0.1),
                 nn.Linear(expert_dim, input_dim),
             )
             for _ in range(num_experts)
         ])
+
+        # Stacked expert weights for batched einsum execution.
+        # These ARE the trainable parameters; the individual expert Linear
+        # weights are frozen to avoid duplicate-parameter divergence.
+        self.W1_stack = nn.Parameter(torch.stack([e[0].weight for e in self.experts]))
+        self.b1_stack = nn.Parameter(torch.stack([e[0].bias for e in self.experts]))
+        self.W2_stack = nn.Parameter(torch.stack([e[3].weight for e in self.experts]))
+        self.b2_stack = nn.Parameter(torch.stack([e[3].bias for e in self.experts]))
+
+        # Freeze original expert params — stacked params are the source of truth
+        for e in self.experts:
+            for p in e.parameters():
+                p.requires_grad_(False)
 
         # R3-style EMA train scores (for API compatibility)
         self.register_buffer(
@@ -152,16 +167,16 @@ class SoftMoERouter(nn.Module):
         # Shape: (num_slots, D)
         slot_inputs = dispatch.T @ x_flat  # (num_slots, D)
 
-        # Apply each expert to its slot(s)
-        # C3 FIX: use torch.cat instead of in-place slice assignment
-        # (in-place assignment breaks torch.compile and gradient checkpointing)
-        expert_outs = []
-        for expert_idx in range(self.num_experts):
-            slot_start = expert_idx * self.slots_per_expert
-            slot_end = slot_start + self.slots_per_expert
-            expert_input = slot_inputs[slot_start:slot_end]  # (slots_per_expert, D)
-            expert_outs.append(self.experts[expert_idx](expert_input))  # (slots_per_expert, D)
-        slot_outputs = torch.cat(expert_outs, dim=0)  # (num_slots, D)
+        # Batched expert execution via stacked weights + einsum
+        # Avoids per-expert GPU kernel launches from the sequential for-loop
+        x_exp = slot_inputs.view(self.num_experts, self.slots_per_expert, -1)  # (E, S, D)
+        # Expert layer 1: (E, S, D) × (E, H, D) → (E, S, H)
+        h = torch.einsum('esd,ehd->esh', x_exp, self.W1_stack) + self.b1_stack.unsqueeze(1)
+        h = F.gelu(h)
+        h = F.dropout(h, p=0.1, training=self.training)
+        # Expert layer 2: (E, S, H) × (E, D, H) → (E, S, D)
+        out = torch.einsum('esh,edh->esd', h, self.W2_stack) + self.b2_stack.unsqueeze(1)
+        slot_outputs = out.reshape(-1, slot_inputs.shape[-1])  # (E*S, D)
 
         # Combine: y = combine @ slot_outputs
         # Shape: (T, D)
@@ -176,7 +191,10 @@ class SoftMoERouter(nn.Module):
                 self.train_scores.mul_(0.9).add_(0.1 * expert_load)
 
         # Router loss: entropy regularization для равномерного использования
-        router_loss = self._entropy_load_balance_loss(combine)
+        if self.use_similarity_balance:
+            router_loss = self._similarity_preserving_loss(x_flat, dispatch)
+        else:
+            router_loss = self._entropy_load_balance_loss(combine)
 
         # Build topk indices для совместимости API
         # Используем combine weights для нахождения top-k экспертов на токен
@@ -229,3 +247,24 @@ class SoftMoERouter(nn.Module):
         f_e = dispatch_per_expert.mean(0).detach()  # (E,) — stop-gradient on fraction
         mean_usage = expert_weights.mean(0)  # (E,) — gradient flows here
         return self.num_experts * (f_e * mean_usage).sum()
+
+    def _similarity_preserving_loss(
+        self,
+        tokens: torch.Tensor,
+        dispatch: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Similarity-Preserving Router (Omi et al., ICLR 2026)
+        Encourages similar tokens to route to similar experts.
+        L = -Σ_i Σ_j sim(x_i, x_j) * sim(r_i, r_j)
+        """
+        # Normalize tokens for cosine similarity
+        tokens_norm = F.normalize(tokens, dim=-1)
+        token_sim = torch.mm(tokens_norm, tokens_norm.t())  # (T, T)
+
+        # Routing probability vectors (dispatch shape: T, num_slots)
+        route_norm = F.normalize(dispatch, dim=-1)
+        route_sim = torch.mm(route_norm, route_norm.t())  # (T, T)
+
+        # Negative correlation (minimize = maximize correlation)
+        return -torch.sum(token_sim * route_sim) / (tokens.shape[0] ** 2)

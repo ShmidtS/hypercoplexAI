@@ -37,6 +37,7 @@ class CliffordAlgebra(nn.Module):
         self.dim = 2 ** self.n
         self._build_metric()
         self._build_cayley_table()
+        self._build_sign_buffers()
 
     def _build_metric(self):
         """Строит метрический тензор подписи (p, q, r)."""
@@ -133,29 +134,32 @@ class CliffordAlgebra(nn.Module):
         result = torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
         return torch.clamp(result, min=-1e3, max=1e3)
 
+    def _build_sign_buffers(self):
+        """Precompute involute and reverse sign vectors as buffers."""
+        inv_signs = torch.ones(self.dim)
+        rev_signs = torch.ones(self.dim)
+        for i in range(self.dim):
+            grade = bin(i).count('1')
+            if grade % 2 == 1:
+                inv_signs[i] = -1.0
+            if grade % 4 in [2, 3]:
+                rev_signs[i] = -1.0
+        self.register_buffer('_involute_signs', inv_signs)
+        self.register_buffer('_reverse_signs', rev_signs)
+
     def involute(self, x: torch.Tensor) -> torch.Tensor:
         """
         Главная инволюция: меняет знак у нечётных k-векторов.
         x̂ = Σ (-1)^k <x>_k
         """
-        signs = torch.ones(self.dim, device=x.device)
-        for i in range(self.dim):
-            grade = bin(i).count('1')
-            if grade % 2 == 1:
-                signs[i] = -1.0
-        return x * signs
+        return x * self._involute_signs.to(device=x.device)
 
     def reverse(self, x: torch.Tensor) -> torch.Tensor:
         """
         Реверс (реверсия): меняет знак у k-векторов с k ≡ 2,3 (mod 4).
         x̃ = Σ (-1)^{k(k-1)/2} <x>_k
         """
-        signs = torch.ones(self.dim, device=x.device)
-        for i in range(self.dim):
-            grade = bin(i).count('1')
-            if grade % 4 in [2, 3]:
-                signs[i] = -1.0
-        return x * signs
+        return x * self._reverse_signs.to(device=x.device)
 
     def norm(self, x: torch.Tensor) -> torch.Tensor:
         """

@@ -151,15 +151,19 @@ def model_from_experiment_config(
         or getattr(exp, "pretrained_encoder", False)
     )
 
+    z_loss_weight = getattr(exp, 'z_loss_weight', 0.0)
+
     if needs_text:
         if getattr(exp, "pretrained_encoder", False):
             return build_sbert_hdim_model(
                 cfg,
                 soft_router=exp.soft_router,
+                z_loss_weight=z_loss_weight,
             )
         return build_text_hdim_model(
             cfg,
             soft_router=exp.soft_router,
+            z_loss_weight=z_loss_weight,
         )
 
     return HDIMModel(cfg)
