@@ -57,6 +57,11 @@ class TitansMemoryModule(nn.Module):
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, 0.5)  # начальные значения ~0.5
 
+        # Phase 22: gradient-based surprise + adaptive forgetting
+        self.use_gradient_surprise: bool = False
+        self.use_adaptive_forgetting: bool = False
+        self._last_surprise: float = 0.0
+
     def retrieve(
         self,
         k: torch.Tensor,
@@ -65,6 +70,19 @@ class TitansMemoryModule(nn.Module):
         retrieved = self.memory(k)
         loss_memory = F.mse_loss(retrieved, v.detach())
         return MemoryState(retrieved=retrieved, loss=loss_memory, updated=False)
+
+    def _compute_surprise(self, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Gradient norm as surprise metric (Titans, NeurIPS 2025)."""
+        k32 = k.detach().float().requires_grad_(True)
+        pred = self.memory(k32)
+        loss = F.mse_loss(pred, v.detach().float())
+        grad = torch.autograd.grad(loss, k32, retain_graph=False)[0]
+        return grad.norm(dim=-1).mean()  # scalar surprise
+
+    def _adaptive_alpha(self, surprise: torch.Tensor, base_alpha: torch.Tensor) -> torch.Tensor:
+        """High surprise → less forgetting."""
+        surprise_norm = torch.sigmoid(surprise - 1.0)  # centered sigmoid
+        return base_alpha * (1.0 - 0.5 * surprise_norm)  # 50-100% of base alpha
 
     # Максимальная норма весов памяти — предотвращает TTT взрыв
     _MEMORY_MAX_NORM: float = 5.0
@@ -106,7 +124,14 @@ class TitansMemoryModule(nn.Module):
         if momentum_norm > self._MEMORY_MAX_NORM:
             new_momentum = new_momentum * (self._MEMORY_MAX_NORM / (momentum_norm + 1e-8))
         self.momentum_S.copy_(new_momentum.to(self.momentum_S.dtype))
-        new_weight = (1 - alpha) * mem_w.detach() + new_momentum
+        # Phase 22: gradient-based surprise + adaptive forgetting
+        effective_alpha = alpha
+        if self.use_gradient_surprise:
+            surprise = self._compute_surprise(k32, v32)
+            self._last_surprise = surprise.item()
+            if self.use_adaptive_forgetting:
+                effective_alpha = self._adaptive_alpha(surprise, alpha)
+        new_weight = (1 - effective_alpha) * mem_w.detach() + new_momentum
         # Max-norm constraint: prevent memory weight from exploding
         weight_norm = new_weight.norm()
         if weight_norm > self._MEMORY_MAX_NORM:

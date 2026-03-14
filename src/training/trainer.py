@@ -39,6 +39,7 @@ class HDIMTrainer:
         learnable_temperature: bool = False,
         lambda_dcl: float = 0.0,
         lambda_uniformity: float = 0.0,
+        use_sc_temperature: bool = False,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -57,6 +58,8 @@ class HDIMTrainer:
         self.lambda_z = lambda_z
         self.lambda_dcl = lambda_dcl
         self.lambda_uniformity = lambda_uniformity
+        self.use_sc_temperature = use_sc_temperature
+        self._last_cluster_temp: float | None = None
         self._step: int = 0
         # Focal-InfoNCE gamma (Hou & Li, EMNLP 2023)
         self._focal_gamma: float = 1.0  # 1.0 = standard InfoNCE, <1 = focal
@@ -344,6 +347,20 @@ class HDIMTrainer:
             fraction = epoch_in_cycle / max(T_0, 1)
             return self._tau_max - (self._tau_max - self._tau_min) * fraction
         return self.infonce_temperature
+
+    def _cluster_scaled_temperature(self, embeddings: torch.Tensor, base_temp: float) -> float:
+        """SC-InfoNCE: scale temperature based on cluster tightness (Cheng et al., Nov 2025).
+
+        Tighter clusters → lower temperature (sharper distribution).
+        Looser clusters → higher temperature (softer distribution).
+        """
+        if embeddings.numel() == 0:
+            return base_temp
+        cluster_var = embeddings.var(dim=0).mean()
+        scale = torch.exp(-cluster_var)
+        scaled = base_temp * scale.clamp(0.5, 2.0)
+        self._last_cluster_temp = float(scaled.item())
+        return self._last_cluster_temp
 
     def _compute_angle_loss(
         self,
@@ -707,6 +724,8 @@ class HDIMTrainer:
         # InfoNCE path (use_infonce=True by default via ranking_margin <= 0)
         if getattr(self, 'use_infonce', True):
             temp = self._effective_temperature()
+            if getattr(self, 'use_sc_temperature', False):
+                temp = self._cluster_scaled_temperature(exported_invariant, temp)
             use_focal = self._focal_gamma < 1.0
             # Hard negative mining: используем hardest negatives в batche
             use_hard_neg = getattr(self, 'use_hard_negatives', False)

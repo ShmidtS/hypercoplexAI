@@ -384,6 +384,29 @@ def run_gpu_training(
     trainer.use_hard_negatives = getattr(args, 'use_hard_negatives', False)
     if trainer.use_hard_negatives:
         print("Hard Negative Mining: ENABLED")
+    # Phase 22: SC-InfoNCE cluster temperature
+    if getattr(args, 'sc_temperature', False):
+        trainer.use_sc_temperature = True
+        print("SC-InfoNCE cluster temperature: ENABLED")
+    # Phase 22: Enable model-level flags
+    _p22_flags = []
+    if getattr(args, 'gradient_surprise', False) and hasattr(model, 'enable_gradient_surprise'):
+        model.enable_gradient_surprise()
+        _p22_flags.append("gradient_surprise")
+    if getattr(args, 'adaptive_forgetting', False) and hasattr(model, 'enable_adaptive_forgetting'):
+        model.enable_adaptive_forgetting()
+        _p22_flags.append("adaptive_forgetting")
+    if getattr(args, 'router_calibration', False) and hasattr(model, 'enable_router_calibration'):
+        model.enable_router_calibration()
+        _p22_flags.append("router_calibration")
+    if getattr(args, 'adaptive_expert_dropout', False) and hasattr(model, 'enable_adaptive_expert_dropout'):
+        model.enable_adaptive_expert_dropout()
+        _p22_flags.append("adaptive_expert_dropout")
+    if getattr(args, 'learnable_metric', False) and hasattr(model, 'enable_learnable_metric'):
+        model.enable_learnable_metric()
+        _p22_flags.append("learnable_metric")
+    if _p22_flags:
+        print(f"Phase 22 features: {', '.join(_p22_flags)}")
     # Add learnable temperature to optimizer (must be before scheduler)
     if getattr(args, 'learnable_temperature', False) and trainer._log_temp is not None:
         optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * 0.1})
@@ -694,6 +717,22 @@ def main() -> None:
     # Focal-InfoNCE (Hou & Li, EMNLP 2023)
     parser.add_argument("--focal_gamma", type=float, default=1.0,
                         help="Focal-InfoNCE gamma (1.0=standard, 0.5=moderate, <1=focus on hard negatives)")
+    # Phase 22: Gradient-based surprise memory (Titans, NeurIPS 2025)
+    parser.add_argument("--gradient_surprise", action="store_true", default=False,
+                        help="Use gradient-based surprise metric in Titans memory (Titans 2025)")
+    parser.add_argument("--adaptive_forgetting", action="store_true", default=False,
+                        help="Adaptive forgetting based on surprise (high surprise = less forgetting)")
+    # Phase 22: Test-time router calibration (R2-T2, ICML 2025)
+    parser.add_argument("--router_calibration", action="store_true", default=False,
+                        help="Enable R2-T2 test-time router calibration head")
+    parser.add_argument("--adaptive_expert_dropout", action="store_true", default=False,
+                        help="Adaptive expert dropout based on usage statistics")
+    # Phase 22: Learnable Clifford metric (CliffordNet, 2026)
+    parser.add_argument("--learnable_metric", action="store_true", default=False,
+                        help="Learnable per-blade metric scaling in Clifford algebra")
+    # Phase 22: SC-InfoNCE cluster temperature (Cheng et al., Nov 2025)
+    parser.add_argument("--sc_temperature", action="store_true", default=False,
+                        help="SC-InfoNCE cluster-aware temperature scaling")
     # Temperature scheduling
     parser.add_argument("--temp_schedule", type=str, default="none",
                         choices=["none", "warm_restart"],

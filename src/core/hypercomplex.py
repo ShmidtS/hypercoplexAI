@@ -47,6 +47,13 @@ class CliffordAlgebra(nn.Module):
         # r нильпотентные остаются 0
         self.metric = metric  # shape: (n,)
 
+        # Learnable metric scaling (CliffordNet, 2026) — Phase 22
+        # Instead of rebuilding Cayley table, learn a per-blade scaling
+        self.learnable_metric = nn.Parameter(torch.ones(self.dim))  # one per blade
+        self.use_learnable_metric = False  # off by default
+
+        self.signature_str = f"Cl({self.p},{self.q},{self.r})"
+
     def _blade_sign(self, a_idx: int, b_idx: int) -> Tuple[float, int]:
         """
         Вычисляет знак и индекс результата перестановки базисных элементов.
@@ -132,7 +139,13 @@ class CliffordAlgebra(nn.Module):
         result.scatter_add_(-1, flat_indices.expand(*a.shape[:-1], D * D), flat_weighted)
         # nan_to_num prevents NaN propagation; clamp prevents gradient explosion
         result = torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
-        return torch.clamp(result, min=-1e3, max=1e3)
+        result = torch.clamp(result, min=-1e3, max=1e3)
+
+        # Learnable metric scaling (CliffordNet, 2026) — Phase 22
+        if self.use_learnable_metric:
+            result = result * self.learnable_metric
+
+        return result
 
     def _build_sign_buffers(self):
         """Precompute involute and reverse sign vectors as buffers."""

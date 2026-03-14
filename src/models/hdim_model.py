@@ -591,6 +591,27 @@ class HDIMModel(nn.Module):
         """Disable gradient checkpointing on the pipeline."""
         self.pipeline.disable_gradient_checkpointing()
 
+    # ── Phase 22 feature flags ──────────────────────────────────────
+    def enable_gradient_surprise(self) -> None:
+        """Enable gradient-based surprise metric in Titans memory (Titans, NeurIPS 2025)."""
+        self.pipeline.memory.use_gradient_surprise = True
+
+    def enable_adaptive_forgetting(self) -> None:
+        """Enable adaptive forgetting based on surprise (high surprise = less forgetting)."""
+        self.pipeline.memory.use_adaptive_forgetting = True
+
+    def enable_router_calibration(self) -> None:
+        """Enable R2-T2 test-time router calibration head (ICML 2025)."""
+        self.pipeline.moe.use_calibration = True
+
+    def enable_adaptive_expert_dropout(self) -> None:
+        """Enable adaptive expert dropout based on usage statistics."""
+        self.pipeline.moe.use_adaptive_dropout = True
+
+    def enable_learnable_metric(self) -> None:
+        """Enable learnable per-blade metric scaling in Clifford algebra (CliffordNet, 2026)."""
+        self.pipeline.clifford.use_learnable_metric = True
+
     def reset_memory(self, strategy: str = "geometric") -> None:
         """Reset stateful HDIM memory and router replay state.
 

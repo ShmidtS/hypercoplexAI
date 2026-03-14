@@ -79,6 +79,18 @@ class SoftMoERouter(nn.Module):
         self.z_loss_weight = z_loss_weight
         self.use_similarity_balance = False  # ICLR 2026 Similarity-Preserving Router
 
+        # Test-time router calibration (R2-T2, ICML 2025)
+        self.use_calibration = False
+        self.calibration_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 4),
+            nn.ReLU(),
+            nn.Linear(input_dim // 4, num_experts),
+        )
+
+        # Adaptive expert dropout
+        self.use_adaptive_dropout = False
+        self.base_dropout = 0.1
+
         # Dispatch parameter matrix: (input_dim, num_slots)
         self.dispatch_proj = nn.Linear(input_dim, self.num_slots, bias=False)
         nn.init.normal_(self.dispatch_proj.weight, std=0.02)
@@ -126,12 +138,17 @@ class SoftMoERouter(nn.Module):
         # logits: (T, num_slots)
         logits = self.dispatch_proj(x) / self.temperature
 
+        # Test-time calibration offset (R2-T2, ICML 2025)
+        if self.use_calibration:
+            cal_offset = self.calibration_head(x.mean(0, keepdim=True))  # (1, num_experts)
+            cal_offset = cal_offset.repeat_interleave(self.slots_per_expert, dim=-1)  # (1, num_slots)
+            logits = logits + cal_offset
+
         # Router z-loss (ST-MoE): penalize large logit magnitudes
         if self.z_loss_weight > 0:
-            z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+            self._z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
         else:
-            z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
-        self._z_loss = z_loss
+            self._z_loss = None
 
         T = x.shape[0]
         # C1 FIX: guard for T=1 — dim=0 softmax with single row returns all-ones
@@ -167,38 +184,48 @@ class SoftMoERouter(nn.Module):
         # Shape: (num_slots, D)
         slot_inputs = dispatch.T @ x_flat  # (num_slots, D)
 
+        # Adaptive expert dropout (uses dispatch for load measurement)
+        if self.use_adaptive_dropout and self.training:
+            # Reshape dispatch to (T, E, S) once, reuse for dropout and EMA
+            dispatch_reshaped = dispatch.reshape(T, self.num_experts, self.slots_per_expert)
+            expert_load_dispatch = dispatch_reshaped.mean(-1).mean(0)  # (E,)
+            dropout_mask = self._adaptive_dropout_mask(expert_load_dispatch)
+            slot_dropout = dropout_mask.repeat_interleave(self.slots_per_expert)
+            slot_inputs = slot_inputs * slot_dropout.unsqueeze(-1)
+        else:
+            dispatch_reshaped = None
+
         # Batched expert execution via stacked weights + einsum
-        # Avoids per-expert GPU kernel launches from the sequential for-loop
         x_exp = slot_inputs.view(self.num_experts, self.slots_per_expert, -1)  # (E, S, D)
-        # Expert layer 1: (E, S, D) × (E, H, D) → (E, S, H)
         h = torch.einsum('esd,ehd->esh', x_exp, self.W1_stack) + self.b1_stack.unsqueeze(1)
         h = F.gelu(h)
         h = F.dropout(h, p=0.1, training=self.training)
-        # Expert layer 2: (E, S, H) × (E, D, H) → (E, S, D)
         out = torch.einsum('esh,edh->esd', h, self.W2_stack) + self.b2_stack.unsqueeze(1)
         slot_outputs = out.reshape(-1, slot_inputs.shape[-1])  # (E*S, D)
 
-        # Combine: y = combine @ slot_outputs
-        # Shape: (T, D)
-        output = combine @ slot_outputs
+        output = combine @ slot_outputs  # (T, D)
+
+        # Compute expert_weights once from combine
+        if dispatch_reshaped is not None:
+            # Reuse dispatch_reshaped for combine reshaping
+            combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
+        else:
+            combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
+        expert_weights = combine_reshaped.mean(-1)  # (T, E) — computed once
 
         # Update EMA train scores (для R3 совместимости)
         if self.training:
             with torch.no_grad():
-                # Используем среднюю нагрузку каждого эксперта как прокси
-                expert_load = combine.reshape(T, self.num_experts, self.slots_per_expert)
-                expert_load = expert_load.sum(-1).mean(0)  # (num_experts,)
+                expert_load = combine_reshaped.sum(-1).mean(0)  # (num_experts,)
                 self.train_scores.mul_(0.9).add_(0.1 * expert_load)
 
-        # Router loss: entropy regularization для равномерного использования
+        # Router loss: entropy regularization
         if self.use_similarity_balance:
             router_loss = self._similarity_preserving_loss(x_flat, dispatch)
         else:
             router_loss = self._entropy_load_balance_loss(combine)
 
         # Build topk indices для совместимости API
-        # Используем combine weights для нахождения top-k экспертов на токен
-        expert_weights = combine.reshape(T, self.num_experts, self.slots_per_expert).mean(-1)
         topk_weights, topk_idx = expert_weights.topk(self.top_k, dim=-1)  # (T, top_k)
         topk_weights_norm = topk_weights / topk_weights.sum(-1, keepdim=True).clamp_min(1e-8)
 
@@ -211,8 +238,9 @@ class SoftMoERouter(nn.Module):
         routing_entropy = -(gate_weights * (gate_weights + 1e-8).log()).sum(dim=-1).mean()
 
         # Add z_loss to router loss for stability
-        z_loss = getattr(self, '_z_loss', torch.zeros((), device=x.device, dtype=x.dtype))
-        router_loss = router_loss + self.z_loss_weight * z_loss
+        z_loss = self._z_loss if self._z_loss is not None else torch.zeros((), device=x.device, dtype=x.dtype)
+        if self.z_loss_weight > 0 and self._z_loss is not None:
+            router_loss = router_loss + self.z_loss_weight * z_loss
 
         router_state: Dict[str, Any] = {
             "loss": router_loss,
@@ -268,3 +296,11 @@ class SoftMoERouter(nn.Module):
 
         # Negative correlation (minimize = maximize correlation)
         return -torch.sum(token_sim * route_sim) / (tokens.shape[0] ** 2)
+
+    def _adaptive_dropout_mask(self, expert_usage: torch.Tensor) -> torch.Tensor:
+        """Higher dropout for overused experts, lower for underused."""
+        usage_normalized = expert_usage / expert_usage.mean().clamp(min=1e-8)
+        adaptive_p = self.base_dropout * (1.0 + 0.5 * (usage_normalized - 1.0))
+        adaptive_p = adaptive_p.clamp(0.05, 0.3)
+        mask = torch.bernoulli(1.0 - adaptive_p)
+        return mask
