@@ -601,12 +601,12 @@ class HDIMModel(nn.Module):
         self.pipeline.memory.use_adaptive_forgetting = True
 
     def enable_router_calibration(self) -> None:
-        """Enable R2-T2 test-time router calibration head (ICML 2025)."""
-        self.pipeline.moe.use_calibration = True
+        """No-op: router calibration was removed (Phase 26 refactor)."""
+        pass
 
     def enable_adaptive_expert_dropout(self) -> None:
-        """Enable adaptive expert dropout based on usage statistics."""
-        self.pipeline.moe.use_adaptive_dropout = True
+        """No-op: adaptive expert dropout was removed (Phase 26 refactor)."""
+        pass
 
     def enable_learnable_metric(self) -> None:
         """Enable learnable per-blade metric scaling in Clifford algebra (CliffordNet, 2026)."""

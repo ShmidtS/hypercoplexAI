@@ -68,6 +68,7 @@ class HDIMTrainer:
         self.lambda_dcl = lambda_dcl
         self.lambda_uniformity = lambda_uniformity
         self.use_sc_temperature = use_sc_temperature
+        self.use_hard_negatives: bool = False
         self._last_cluster_temp: float | None = None
         self._step: int = 0
         # Focal-InfoNCE gamma (Hou & Li, EMNLP 2023)

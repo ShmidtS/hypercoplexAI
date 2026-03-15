@@ -21,23 +21,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 from typing import Any, Dict, Tuple
-
-
-@dataclass
-class SoftRouterState:
-    """Typed state для SoftMoERouter — совместим с R3MoERouter RouterState API."""
-    loss: torch.Tensor
-    router_loss: torch.Tensor
-    scores: torch.Tensor
-    topk_idx: torch.Tensor
-    gate_weights: torch.Tensor
-    train_scores_snapshot: torch.Tensor
-    topk_gate_weights: torch.Tensor
-    expert_usage: torch.Tensor
-    routing_entropy: torch.Tensor
-    dispatch_weights: torch.Tensor   # Soft MoE specific: полные dispatch weights
 
 
 class SoftMoERouter(nn.Module):
@@ -83,47 +67,22 @@ class SoftMoERouter(nn.Module):
         self.temperature = temperature
         self.num_slots = num_experts * slots_per_expert
         self.z_loss_weight = z_loss_weight
-        self.use_similarity_balance = False  # ICLR 2026 Similarity-Preserving Router
-
-        # Test-time router calibration (R2-T2, ICML 2025)
-        self.use_calibration = False
-        self.calibration_head = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 4),
-            nn.ReLU(),
-            nn.Linear(input_dim // 4, num_experts),
-        )
-
-        # Adaptive expert dropout
-        self.use_adaptive_dropout = False
-        self.base_dropout = 0.1
 
         # Dispatch parameter matrix: (input_dim, num_slots)
         self.dispatch_proj = nn.Linear(input_dim, self.num_slots, bias=False)
         nn.init.normal_(self.dispatch_proj.weight, std=0.02)
 
-        # Expert networks — kept for parameter registration and state_dict compat
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, expert_dim),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(expert_dim, input_dim),
-            )
-            for _ in range(num_experts)
-        ])
-
         # Stacked expert weights for batched einsum execution.
-        # These ARE the trainable parameters; the individual expert Linear
-        # weights are frozen to avoid duplicate-parameter divergence.
-        self.W1_stack = nn.Parameter(torch.stack([e[0].weight for e in self.experts]))
-        self.b1_stack = nn.Parameter(torch.stack([e[0].bias for e in self.experts]))
-        self.W2_stack = nn.Parameter(torch.stack([e[3].weight for e in self.experts]))
-        self.b2_stack = nn.Parameter(torch.stack([e[3].bias for e in self.experts]))
-
-        # Freeze original expert params — stacked params are the source of truth
-        for e in self.experts:
-            for p in e.parameters():
-                p.requires_grad_(False)
+        W1 = torch.stack([nn.Linear(input_dim, expert_dim).weight for _ in range(num_experts)])
+        b1 = torch.zeros(num_experts, expert_dim)
+        W2 = torch.stack([nn.Linear(expert_dim, input_dim).weight for _ in range(num_experts)])
+        b2 = torch.zeros(num_experts, input_dim)
+        nn.init.kaiming_uniform_(W1.reshape(-1, input_dim))
+        nn.init.kaiming_uniform_(W2.reshape(-1, expert_dim))
+        self.W1_stack = nn.Parameter(W1)
+        self.b1_stack = nn.Parameter(b1)
+        self.W2_stack = nn.Parameter(W2)
+        self.b2_stack = nn.Parameter(b2)
 
         # R3-style EMA train scores (for API compatibility)
         self.register_buffer(
@@ -169,12 +128,6 @@ class SoftMoERouter(nn.Module):
             bias_expanded = bias.repeat_interleave(self.slots_per_expert)  # (num_slots,)
             logits = logits + bias_expanded.unsqueeze(0)  # broadcast over batch
 
-        # Test-time calibration offset (R2-T2, ICML 2025)
-        if self.use_calibration:
-            cal_offset = self.calibration_head(x.mean(0, keepdim=True))  # (1, num_experts)
-            cal_offset = cal_offset.repeat_interleave(self.slots_per_expert, dim=-1)  # (1, num_slots)
-            logits = logits + cal_offset
-
         # Router z-loss (ST-MoE): penalize large logit magnitudes
         if self.z_loss_weight > 0:
             self._z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
@@ -215,17 +168,6 @@ class SoftMoERouter(nn.Module):
         # Shape: (num_slots, D)
         slot_inputs = dispatch.T @ x_flat  # (num_slots, D)
 
-        # Adaptive expert dropout (uses dispatch for load measurement)
-        if self.use_adaptive_dropout and self.training:
-            # Reshape dispatch to (T, E, S) once, reuse for dropout and EMA
-            dispatch_reshaped = dispatch.reshape(T, self.num_experts, self.slots_per_expert)
-            expert_load_dispatch = dispatch_reshaped.mean(-1).mean(0)  # (E,)
-            dropout_mask = self._adaptive_dropout_mask(expert_load_dispatch)
-            slot_dropout = dropout_mask.repeat_interleave(self.slots_per_expert)
-            slot_inputs = slot_inputs * slot_dropout.unsqueeze(-1)
-        else:
-            dispatch_reshaped = None
-
         # Batched expert execution via stacked weights + einsum
         x_exp = slot_inputs.view(self.num_experts, self.slots_per_expert, -1)  # (E, S, D)
         h = torch.einsum('esd,ehd->esh', x_exp, self.W1_stack) + self.b1_stack.unsqueeze(1)
@@ -241,12 +183,7 @@ class SoftMoERouter(nn.Module):
             shared_out = self._shared_expert(x_flat)
             output = output + shared_out
 
-        # Compute expert_weights once from combine
-        if dispatch_reshaped is not None:
-            # Reuse dispatch_reshaped for combine reshaping
-            combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
-        else:
-            combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
+        combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
         expert_weights = combine_reshaped.mean(-1)  # (T, E) — computed once
 
         # Update EMA train scores (для R3 совместимости)
@@ -260,11 +197,8 @@ class SoftMoERouter(nn.Module):
                     delta = torch.sign(expert_load - self._target_load)
                     self._expert_bias.data -= self._aux_lr * delta
 
-        # Router loss: entropy regularization
-        if self.use_similarity_balance:
-            router_loss = self._similarity_preserving_loss(x_flat, dispatch)
-        else:
-            router_loss = self._entropy_load_balance_loss(combine)
+        # Router loss: load balance
+        router_loss = self._entropy_load_balance_loss(combine)
 
         # Build topk indices для совместимости API
         topk_weights, topk_idx = expert_weights.topk(self.top_k, dim=-1)  # (T, top_k)
@@ -316,35 +250,6 @@ class SoftMoERouter(nn.Module):
         f_e = dispatch_per_expert.mean(0).detach()  # (E,) — stop-gradient on fraction
         mean_usage = expert_weights.mean(0)  # (E,) — gradient flows here
         return self.num_experts * (f_e * mean_usage).sum()
-
-    def _similarity_preserving_loss(
-        self,
-        tokens: torch.Tensor,
-        dispatch: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Similarity-Preserving Router (Omi et al., ICLR 2026)
-        Encourages similar tokens to route to similar experts.
-        L = -Σ_i Σ_j sim(x_i, x_j) * sim(r_i, r_j)
-        """
-        # Normalize tokens for cosine similarity
-        tokens_norm = F.normalize(tokens, dim=-1)
-        token_sim = torch.mm(tokens_norm, tokens_norm.t())  # (T, T)
-
-        # Routing probability vectors (dispatch shape: T, num_slots)
-        route_norm = F.normalize(dispatch, dim=-1)
-        route_sim = torch.mm(route_norm, route_norm.t())  # (T, T)
-
-        # Negative correlation (minimize = maximize correlation)
-        return -torch.sum(token_sim * route_sim) / (tokens.shape[0] ** 2)
-
-    def _adaptive_dropout_mask(self, expert_usage: torch.Tensor) -> torch.Tensor:
-        """Higher dropout for overused experts, lower for underused."""
-        usage_normalized = expert_usage / expert_usage.mean().clamp(min=1e-8)
-        adaptive_p = self.base_dropout * (1.0 + 0.5 * (usage_normalized - 1.0))
-        adaptive_p = adaptive_p.clamp(0.05, 0.3)
-        mask = torch.bernoulli(1.0 - adaptive_p)
-        return mask
 
     def expert_orthogonalization_loss(self) -> torch.Tensor:
         """Phase 26: Expert Orthogonalization loss (arXiv:2505.22323).
