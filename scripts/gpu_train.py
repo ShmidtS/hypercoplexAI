@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.hdim_model import HDIMConfig
 from src.models.metrics import compute_all_metrics
-from src.models.model_factory import build_hdim_model, build_text_hdim_model, build_sbert_hdim_model
+from src.models.model_factory import build_hdim_model, build_text_hdim_model, build_sbert_hdim_model, build_modernbert_hdim_model
 from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
@@ -114,20 +114,45 @@ def detect_device(requested: str) -> torch.device:
 
 def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
     """Собирает модель через model_factory — единственный источник истины."""
+    if getattr(args, 'modernbert_encoder', False):
+        matryoshka_dims = None
+        _mkr_str = getattr(args, 'modernbert_matryoshka_dims', None)
+        if _mkr_str:
+            matryoshka_dims = [int(d.strip()) for d in _mkr_str.split(',') if d.strip()]
+        model = build_modernbert_hdim_model(
+            cfg,
+            soft_router=args.soft_router,
+            modernbert_model_name=getattr(args, 'modernbert_model_name', 'answerdotai/ModernBERT-base'),
+            freeze_modernbert=getattr(args, 'freeze_modernbert', True),
+            use_cls_pooling=getattr(args, 'modernbert_use_cls_pooling', True),
+            max_length=getattr(args, 'modernbert_max_length', 512),
+            matryoshka_dims=matryoshka_dims,
+        )
+        print("Components: ModernBERT(answerdotai/ModernBERT-base) + Linear Projection")
+        if matryoshka_dims:
+            print(f"  + Matryoshka dims: {matryoshka_dims}")
+        if args.soft_router:
+            print("  + SoftMoERouter")
+        return model
+
     if getattr(args, 'pretrained_encoder', False):
         unfreeze_layers = None
         _unfreeze_str = getattr(args, 'unfreeze_sbert_layers', None)
         if _unfreeze_str:
             unfreeze_layers = [s.strip() for s in _unfreeze_str.split(',') if s.strip()]
+        _freeze_frac = getattr(args, 'freeze_sbert_bottom_frac', None)
         model = build_sbert_hdim_model(
             cfg,
             soft_router=args.soft_router,
             unfreeze_layers=unfreeze_layers,
+            freeze_bottom_frac=_freeze_frac,
             projection_hidden=getattr(args, 'sbert_projection_hidden', None),
         )
         print("Components: SBERT(paraphrase-multilingual-mpnet-base-v2) + SimpleMLP")
         if unfreeze_layers:
             print(f"  + Partial SBERT unfreeze: {unfreeze_layers}")
+        if _freeze_frac is not None:
+            print(f"  + Freeze bottom {_freeze_frac*100:.0f}% SBERT layers")
         if args.soft_router:
             print("  + SoftMoERouter")
         return model
@@ -290,6 +315,42 @@ def _build_scheduler(optimizer, args, total_steps: int):
         raise ValueError(f"Unknown scheduler_type: {stype}")
 
 
+def freeze_sbert_bottom_half(model):
+    """Freeze bottom 50% of SBERT encoder layers."""
+    sbert = None
+    for name, module in model.named_modules():
+        if hasattr(module, 'encoder') and hasattr(module.encoder, 'layer'):
+            sbert = module
+            break
+        elif 'sbert' in name.lower() or 'text_encoder' in name.lower():
+            sbert = module
+            break
+    
+    if sbert is None:
+        print("WARNING: Could not find SBERT encoder for freezing")
+        return
+    
+    # Freeze embeddings
+    if hasattr(sbert, 'embeddings'):
+        for param in sbert.embeddings.parameters():
+            param.requires_grad = False
+    
+    # Freeze bottom 50% of transformer layers
+    if hasattr(sbert.encoder, 'layer'):
+        total_layers = len(sbert.encoder.layer)
+        freeze_layers = total_layers // 2
+        print(f"Freezing bottom {freeze_layers}/{total_layers} SBERT layers")
+        
+        for i in range(freeze_layers):
+            for param in sbert.encoder.layer[i].parameters():
+                param.requires_grad = False
+    
+    # Count trainable params
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model: {total_params:,} total, {trainable_params:,} trainable ({trainable_params/total_params*100:.1f}%)")
+
+
 def run_gpu_training(
     cfg: HDIMConfig,
     args: argparse.Namespace,
@@ -300,6 +361,10 @@ def run_gpu_training(
 
     model = _build_model(cfg, args)
     model = model.to(device)
+    
+    # Freeze bottom 50% SBERT encoder if requested
+    if getattr(args, 'freeze_sbert', False):
+        freeze_sbert_bottom_half(model)
 
     # Enable gradient checkpointing if requested
     if getattr(args, 'gradient_checkpointing', False):
@@ -314,22 +379,23 @@ def run_gpu_training(
 
     # Build param groups: separate LR for unfrozen SBERT layers
     _unfreeze_str = getattr(args, 'unfreeze_sbert_layers', None)
+    _freeze_frac = getattr(args, 'freeze_sbert_bottom_frac', None)
     _sbert_lr = getattr(args, 'sbert_lr', 1e-5)
-    if _unfreeze_str and hasattr(model, 'text_encoder') and hasattr(model.text_encoder, '_sbert'):
+    _has_sbert = hasattr(model, 'text_encoder') and hasattr(model.text_encoder, '_sbert')
+    if _has_sbert and (_unfreeze_str or _freeze_frac is not None):
         sbert_params = []
         other_params = []
-        sbert_encoder = model.text_encoder
-        unfreeze_layers = [s.strip() for s in _unfreeze_str.split(',') if s.strip()]
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'text_encoder._sbert' in name and any(layer in name for layer in unfreeze_layers):
+            if 'text_encoder._sbert' in name:
                 sbert_params.append(param)
             else:
                 other_params.append(param)
+        wd = getattr(args, 'weight_decay', 1e-4)
         param_groups = [
-            {'params': other_params, 'lr': args.lr, 'weight_decay': 1e-4},
-            {'params': sbert_params, 'lr': _sbert_lr, 'weight_decay': 1e-2},
+            {'params': other_params, 'lr': args.lr, 'weight_decay': wd},
+            {'params': sbert_params, 'lr': _sbert_lr, 'weight_decay': wd * 100},
         ]
         print(f"Optimizer: {len(other_params)} HDIM params (lr={args.lr}), {len(sbert_params)} SBERT params (lr={_sbert_lr})")
     else:
@@ -337,7 +403,7 @@ def run_gpu_training(
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=args.lr,
-        weight_decay=1e-4,
+        weight_decay=getattr(args, 'weight_decay', 1e-4),
         betas=(0.9, 0.999),
     )
 
@@ -407,6 +473,17 @@ def run_gpu_training(
         _p22_flags.append("learnable_metric")
     if _p22_flags:
         print(f"Phase 22 features: {', '.join(_p22_flags)}")
+    # Phase 21/23: Similarity-Preserving Router
+    if getattr(args, 'similarity_preserving_router', False):
+        # Enable on the MoE router
+        moe = getattr(model, 'pipeline', None)
+        if moe is not None:
+            moe = getattr(moe, 'moe', None)
+        if moe is not None and hasattr(moe, 'use_similarity_balance'):
+            moe.use_similarity_balance = True
+            print("Similarity-Preserving Router: ENABLED (ICLR 2026)")
+        else:
+            print("WARNING: similarity_preserving_router flag set but MoE router not found or missing attribute")
     # Add learnable temperature to optimizer (must be before scheduler)
     if getattr(args, 'learnable_temperature', False) and trainer._log_temp is not None:
         optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * 0.1})
@@ -488,6 +565,12 @@ def run_gpu_training(
                         except Exception:
                             pass
             encoder.precompute_cache(all_texts)
+            # Phase 25: log cache size after precomputation
+            _cache = getattr(encoder, '_embedding_cache', None)
+            if _cache is not None:
+                print(f"SBERT cache active: {len(_cache)} embeddings preloaded", flush=True)
+            else:
+                print(f"SBERT cache precomputed for {len(all_texts)} texts", flush=True)
 
     monitor = GPUTrainingMonitor(
         device,
@@ -643,6 +726,10 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help="Weight decay for AdamW optimizer (default: 1e-4)")
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Override model dropout probability (default: use HDIMConfig default)")
     parser.add_argument("--warmup_epochs", type=int, default=20,
                         help="T_0 for cosine_restarts in epochs (default: 20, Phase8e record)")
     parser.add_argument("--device", default="auto")
@@ -678,6 +765,20 @@ def main() -> None:
     parser.add_argument("--soft_router", action="store_true")
     parser.add_argument("--pretrained_encoder", action="store_true",
                         help="Use frozen SBERT encoder (paraphrase-multilingual-mpnet-base-v2)")
+    parser.add_argument("--modernbert_encoder", action="store_true",
+                        help="Use ModernBERT encoder (answerdotai/ModernBERT-base)")
+    parser.add_argument("--modernbert_model_name", type=str, default="answerdotai/ModernBERT-base",
+                        help="ModernBERT model name (default: answerdotai/ModernBERT-base)")
+    parser.add_argument("--freeze_modernbert", action="store_true", default=True,
+                        help="Freeze ModernBERT weights (default: True)")
+    parser.add_argument("--no_freeze_modernbert", dest="freeze_modernbert", action="store_false",
+                        help="Allow ModernBERT fine-tuning")
+    parser.add_argument("--modernbert_use_cls_pooling", action="store_true", default=True,
+                        help="Use CLS token pooling for ModernBERT (default: True)")
+    parser.add_argument("--modernbert_max_length", type=int, default=512,
+                        help="Max sequence length for ModernBERT tokenizer (default: 512)")
+    parser.add_argument("--modernbert_matryoshka_dims", type=str, default=None,
+                        help="Comma-separated Matryoshka output dims (e.g. '64,128,256,768')")
     parser.add_argument("--unfreeze_sbert_layers", type=str, default=None,
                         help="Comma-separated SBERT layer names to unfreeze (e.g. '10,11,pooling')")
     parser.add_argument("--sbert_projection_hidden", type=int, default=None,
@@ -686,6 +787,10 @@ def main() -> None:
                         help="Enable online hard negative mining in InfoNCE loss")
     parser.add_argument("--sbert_lr", type=float, default=1e-5,
                         help="LR for unfrozen SBERT layers (default: 1e-5)")
+    parser.add_argument("--freeze_sbert_bottom_frac", type=float, default=None,
+                        help="Freeze bottom N%% of SBERT transformer layers (e.g. 0.5 = freeze bottom 50%%)")
+    parser.add_argument("--freeze_sbert", action="store_true",
+                        help="Freeze bottom 50%% of SBERT encoder (standalone freezing without build_sbert)")
     # Loss
     parser.add_argument("--lambda_sts", type=float, default=0.0,
                         help="STS regularization weight (cosine similarity preservation, default 0=off)")
@@ -733,6 +838,9 @@ def main() -> None:
     # Phase 22: SC-InfoNCE cluster temperature (Cheng et al., Nov 2025)
     parser.add_argument("--sc_temperature", action="store_true", default=False,
                         help="SC-InfoNCE cluster-aware temperature scaling")
+    # Phase 21/23: Similarity-Preserving Router (ICLR 2026)
+    parser.add_argument("--similarity_preserving_router", action="store_true", default=False,
+                        help="Enable Similarity-Preserving Router loss (ICLR 2026)")
     # Temperature scheduling
     parser.add_argument("--temp_schedule", type=str, default="none",
                         choices=["none", "warm_restart"],
@@ -762,11 +870,15 @@ def main() -> None:
 
     device = detect_device(args.device)
 
+    _dropout_override = getattr(args, 'dropout', None)
     cfg = HDIMConfig(
         hidden_dim=args.hidden_dim,
         num_experts=args.num_experts,
         num_domains=args.num_domains,
+        dropout=_dropout_override if _dropout_override is not None else 0.1,
     )
+    if _dropout_override is not None:
+        print(f"Override dropout: {_dropout_override}")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

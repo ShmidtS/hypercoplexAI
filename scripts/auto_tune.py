@@ -1,17 +1,18 @@
 #!/usr/bin/env python
 """
-HDIM Auto-Tuner v21 — Optuna hyperparameter search for Phase 21 SOTA config.
+HDIM Auto-Tuner v22 — Optuna hyperparameter search for Phase 22 ModernBERT config.
 
 Запуск:
-  python scripts/auto_tune.py                        # 20 trials, 30 эпох каждый
-  python scripts/auto_tune.py --n_trials 50          # 50 trials
-  python scripts/auto_tune.py --epochs 50 --n_trials 30
+  python scripts/auto_tune.py                        # 20 trials, 30 эпох каждый (SBERT)
+  python scripts/auto_tune.py --modernbert_encoder    # 20 trials с ModernBERT
+  python scripts/auto_tune.py --modernbert_encoder --n_trials 50 --epochs 50
   python scripts/auto_tune.py --resume               # продолжить прерванное исследование
   python scripts/auto_tune.py --data v8 --n_trials 30 # использовать v8 данные (330 пар)
   python scripts/auto_tune.py --phase quick           # быстрый 15-эпох прогон
   python scripts/auto_tune.py --phase deep            # глубокий 60-эпох прогон
 
-Phase 21 SOTA improvements (all active):
+Phase 22 ModernBERT improvements (all active):
+  - ModernBERT encoder (替代 SBERT)
   - Gated Memory Fusion (learned gate before memory addition)
   - Expert Dropout (0.1) in MoE experts
   - Similarity-Preserving Router (ICLR 2026)
@@ -21,6 +22,7 @@ Phase 21 SOTA improvements (all active):
   - Focal-InfoNCE (gamma)
   - Router Z-Loss (lambda_z >= 0.005)
   - Learnable temperature with checkpoint persistence
+  - Matryoshka Representation Learning (MRL)
 
 Optuna подбирает:
   - lr, batch_size, lambda_pair, lambda_angle, lambda_sts
@@ -29,10 +31,13 @@ Optuna подбирает:
   - infonce_temperature, focal_gamma
   - augment_factor, warmup_epochs
   - data_version (v5 vs v8)
+  - modernbert_model_name, modernbert_pooling
+  - modernbert_max_length, modernbert_matryoshka_dims
+  - hidden_dim (64 vs 128 vs 256)
 
 Зафиксировано:
-  - hidden_dim=256, num_experts=4 (Phase8e рекорд)
-  - pretrained_encoder, soft_router, t_mult=2
+  - num_experts=4 (Phase8e рекорд)
+  - soft_router, t_mult=2
   - simple MLP projection (рекордная архитектура)
 """
 from __future__ import annotations
@@ -57,7 +62,8 @@ STUDY_NAME = "hdim_autotune"
 
 # Phase presets
 PHASE_PRESETS = {
-    "quick": {"epochs": 15, "eval_every": 5, "early_stop": 10},
+    "micro": {"epochs": 5, "eval_every": 2, "early_stop": 3},
+    "quick": {"epochs": 10, "eval_every": 3, "early_stop": 5},
     "standard": {"epochs": 30, "eval_every": 5, "early_stop": 15},
     "deep": {"epochs": 60, "eval_every": 5, "early_stop": 25},
 }
@@ -69,7 +75,12 @@ DATA_VERSIONS = {
 }
 
 
-def objective(trial: optuna.Trial, epochs: int = 30, data_version: str = "v5") -> float:
+def objective(
+    trial: optuna.Trial,
+    epochs: int = 30,
+    data_version: str = "v5",
+    modernbert: bool = False,
+) -> float:
     """Один trial: запустить обучение с предложенными параметрами, вернуть score."""
 
     # === Данные ===
@@ -87,7 +98,7 @@ def objective(trial: optuna.Trial, epochs: int = 30, data_version: str = "v5") -
     max_augment = 50 if data_version == "v5" else 30
     augment_factor = trial.suggest_int("augment_factor", 5, max_augment, step=5)
 
-    # === Loss weights (Phase 21 SOTA) ===
+    # === Loss weights (Phase 22 ModernBERT / Phase 21 SOTA) ===
 
     # Pair loss — основной contrastive signal
     lambda_pair = trial.suggest_float("lambda_pair", 0.2, 0.6, step=0.05)
@@ -125,6 +136,42 @@ def objective(trial: optuna.Trial, epochs: int = 30, data_version: str = "v5") -
     t_mult = trial.suggest_categorical("t_mult", [2])
     warmup_epochs = trial.suggest_int("warmup_epochs", 2, 5)
 
+    # === ModernBERT-specific parameters ===
+    if modernbert:
+        # Model name — выбор между размерами ModernBERT
+        modernbert_model_name = trial.suggest_categorical(
+            "modernbert_model_name",
+            ["answerdotai/ModernBERT-base", "answerdotai/ModernBERT-large"],
+        )
+        # Pooling strategy
+        modernbert_pooling = trial.suggest_categorical(
+            "modernbert_pooling", ["cls", "mean"]
+        )
+        # Max sequence length
+        modernbert_max_length = trial.suggest_categorical(
+            "modernbert_max_length", [128, 256, 512, 1024]
+        )
+        # Matryoshka dimensions (comma-separated)
+        use_matryoshka = trial.suggest_categorical("use_matryoshka", [True, False])
+        if use_matryoshka:
+            matryoshka_dims = trial.suggest_categorical(
+                "modernbert_matryoshka_dims", ["64,128,256", "128,256,512"]
+            )
+        else:
+            matryoshka_dims = None
+        # Freeze ModernBERT encoder
+        freeze_modernbert = True  # Замораживаем для скорости
+        # Hidden dim — ModernBERT может работать с меньшими hidden_dim
+        hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256])
+    else:
+        # SBERT defaults
+        modernbert_model_name = None
+        modernbert_pooling = None
+        modernbert_max_length = None
+        matryoshka_dims = None
+        freeze_modernbert = False
+        hidden_dim = 256  # Phase8e рекорд
+
     # === Output ===
     out_dir = REPO_ROOT / "artifacts" / f"optuna_{trial.number:04d}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -138,12 +185,11 @@ def objective(trial: optuna.Trial, epochs: int = 30, data_version: str = "v5") -
         "--epochs",
         str(epochs),
         "--hidden_dim",
-        "256",
+        str(hidden_dim),
         "--num_experts",
         "4",
         "--num_domains",
         "4",
-        "--pretrained_encoder",
         "--soft_router",
         "--real_pairs",
         str(REPO_ROOT / data_file),
@@ -200,6 +246,23 @@ def objective(trial: optuna.Trial, epochs: int = 30, data_version: str = "v5") -
         "--amp",
     ]
 
+    # Добавляем ModernBERT флаги если нужно
+    if modernbert:
+        cmd.append("--modernbert_encoder")
+        if modernbert_model_name:
+            cmd.extend(["--modernbert_model_name", modernbert_model_name])
+        if modernbert_pooling:
+            cmd.extend(["--modernbert_pooling", modernbert_pooling])
+        if modernbert_max_length:
+            cmd.extend(["--modernbert_max_length", str(modernbert_max_length)])
+        if matryoshka_dims:
+            cmd.extend(["--modernbert_matryoshka_dims", matryoshka_dims])
+        if freeze_modernbert:
+            cmd.append("--freeze_modernbert")
+    else:
+        # SBERT encoder
+        cmd.append("--pretrained_encoder")
+
     start = time.time()
     log_file = out_dir / "trial.log"
     try:
@@ -242,19 +305,30 @@ def objective(trial: optuna.Trial, epochs: int = 30, data_version: str = "v5") -
     trial.set_user_attr("STS_exported", sts)
     trial.set_user_attr("best_epoch", best_epoch)
     trial.set_user_attr("elapsed_s", elapsed)
+    trial.set_user_attr("hidden_dim", hidden_dim)
+    if modernbert:
+        trial.set_user_attr("modernbert_model_name", modernbert_model_name)
+        trial.set_user_attr("modernbert_pooling", modernbert_pooling)
+        trial.set_user_attr("modernbert_max_length", modernbert_max_length)
+        trial.set_user_attr("freeze_modernbert", freeze_modernbert)
+        trial.set_user_attr("use_matryoshka", use_matryoshka)
+        trial.set_user_attr("freeze_modernbert", freeze_modernbert)
 
     print(
         f"  Trial {trial.number:3d}: score={score:.4f} "
         f"margin={pair_margin:.4f} STS={sts:.4f} "
         f"ep={best_epoch} t={elapsed:.0f}s "
         f"lr={lr:.5f} bs={batch_size} dcl={lambda_dcl:.2f} "
-        f"z={lambda_z:.3f} aug={augment_factor}"
+        f"z={lambda_z:.3f} aug={augment_factor} "
+        f"hidden={hidden_dim} modernbert={modernbert}"
     )
     return score
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HDIM Auto-Tuner v21 (Optuna + SOTA)")
+    parser = argparse.ArgumentParser(
+        description="HDIM Auto-Tuner v22 (Optuna + ModernBERT)"
+    )
     parser.add_argument(
         "--n_trials", type=int, default=20, help="Количество trials (default: 20)"
     )
@@ -277,8 +351,13 @@ def main():
         "--phase",
         type=str,
         default=None,
-        choices=["quick", "standard", "deep"],
+        choices=["micro", "quick", "standard", "deep"],
         help="Preset фазы: quick=15ep, standard=30ep, deep=60ep",
+    )
+    parser.add_argument(
+        "--modernbert_encoder",
+        action="store_true",
+        help="Использовать ModernBERT encoder вместо SBERT",
     )
     args = parser.parse_args()
 
@@ -311,20 +390,35 @@ def main():
         "v8": "330 pairs, 35.8% neg, all domains",
     }[args.data]
 
+    encoder_info = "ModernBERT" if args.modernbert_encoder else "SBERT"
+
     print(
-        f"HDIM Auto-Tuner v21 | n_trials={args.n_trials} | epochs={args.epochs}/trial"
+        f"HDIM Auto-Tuner v22 | n_trials={args.n_trials} | epochs={args.epochs}/trial"
     )
     print(f"Study: {args.study_name} | DB: {args.db}")
     print(f"Data: {args.data} — {data_info}")
-    print(f"Fixed: hidden=256, experts=4, t_mult=2, simple MLP, frozen SBERT")
+    print(f"Encoder: {encoder_info}")
+    if args.modernbert_encoder:
+        print(f"Fixed: experts=4, t_mult=2, simple MLP, ModernBERT encoder")
+    else:
+        print(f"Fixed: hidden=256, experts=4, t_mult=2, simple MLP, frozen SBERT")
     print(
         f"SOTA: gated_memory, expert_dropout(0.1), sim_preserving_router, grad_isolation"
     )
     print(f"Tuning: lr, bs, augment, 9 loss lambdas, temp, focal_gamma, warmup")
+    if args.modernbert_encoder:
+        print(
+            f"ModernBERT tuning: model_name, pooling, max_length, matryoshka, freeze, hidden_dim"
+        )
     print()
 
     study.optimize(
-        lambda trial: objective(trial, epochs=args.epochs, data_version=args.data),
+        lambda trial: objective(
+            trial,
+            epochs=args.epochs,
+            data_version=args.data,
+            modernbert=args.modernbert_encoder,
+        ),
         n_trials=args.n_trials,
         show_progress_bar=False,
     )
@@ -334,6 +428,7 @@ def main():
     best = study.best_trial
     print(f"  Score: {best.value:.4f}")
     print(f"  Data: {args.data}")
+    print(f"  Encoder: {encoder_info}")
     print(f"  Params:")
     for k, v in best.params.items():
         if isinstance(v, float):
@@ -346,20 +441,53 @@ def main():
     p = best.params
     data_path = DATA_VERSIONS[args.data].replace("/", "\\")
 
+    # Формируем ModernBERT параметры
+    modernbert_block = ""
+    if args.modernbert_encoder:
+        modernbert_params = []
+        if p.get("modernbert_model_name"):
+            modernbert_params.append(
+                f"    --modernbert_model_name {p['modernbert_model_name']}"
+            )
+        if p.get("modernbert_pooling"):
+            modernbert_params.append(
+                f"    --modernbert_pooling {p['modernbert_pooling']}"
+            )
+        if p.get("modernbert_max_length"):
+            modernbert_params.append(
+                f"    --modernbert_max_length {p['modernbert_max_length']}"
+            )
+        if p.get("use_matryoshka") and p.get("modernbert_matryoshka_dims"):
+            modernbert_params.append(
+                f"    --modernbert_matryoshka_dims {p['modernbert_matryoshka_dims']}"
+            )
+        if p.get("freeze_modernbert"):
+            modernbert_params.append(f"    --freeze_modernbert")
+
+        if modernbert_params:
+            modernbert_block = "\n".join(modernbert_params) + " ^"
+
+        encoder_flag = "    --modernbert_encoder ^"
+        hidden_dim = p.get("hidden_dim", 256)
+    else:
+        encoder_flag = "    --pretrained_encoder ^"
+        hidden_dim = 256
+
     bat_content = f"""@echo off
-REM Auto-tuned config v21 (Optuna, score={best.value:.4f}, data={args.data})
+REM Auto-tuned config v22 (Optuna, score={best.value:.4f}, data={args.data}, encoder={encoder_info})
 REM Generated by scripts/auto_tune.py
-REM Phase 21 SOTA: Gated Memory + Expert Dropout + Sim-Preserving Router
+REM Phase 22 ModernBERT: {encoder_info} + Gated Memory + Expert Dropout + Sim-Preserving Router
 
 cd /d E:\\hypercoplexAI
 call .venv\\Scripts\\activate.bat
 
 python scripts\\gpu_train.py ^
     --epochs 200 ^
-    --hidden_dim 256 ^
+    --hidden_dim {hidden_dim} ^
     --num_experts 4 ^
     --num_domains 4 ^
-    --pretrained_encoder ^
+{encoder_flag}
+{modernbert_block}
     --soft_router ^
     --real_pairs {data_path} ^
     --augment_factor {p['augment_factor']} ^

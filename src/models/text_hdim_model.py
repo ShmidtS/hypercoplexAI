@@ -252,6 +252,27 @@ class TextHDIMModel(nn.Module):
     def reset_memory(self, strategy: str = 'geometric') -> None:
         self.core_model.reset_memory(strategy=strategy)
 
+    def enable_gradient_checkpointing(self) -> None:
+        self.core_model.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self) -> None:
+        self.core_model.disable_gradient_checkpointing()
+
+    def enable_gradient_surprise(self) -> None:
+        self.core_model.enable_gradient_surprise()
+
+    def enable_adaptive_forgetting(self) -> None:
+        self.core_model.enable_adaptive_forgetting()
+
+    def enable_router_calibration(self) -> None:
+        self.core_model.enable_router_calibration()
+
+    def enable_adaptive_expert_dropout(self) -> None:
+        self.core_model.enable_adaptive_expert_dropout()
+
+    def enable_learnable_metric(self) -> None:
+        self.core_model.enable_learnable_metric()
+
     def encode_texts(
         self,
         texts: Sequence[str],
@@ -264,6 +285,31 @@ class TextHDIMModel(nn.Module):
         if device is None:
             device = next(self.core_model.parameters()).device
         return self.text_encoder(texts, device=device, dtype=dtype)
+
+    def encode_texts_matryoshka(
+        self,
+        texts: Sequence[str],
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor] | None]:
+        """Encode texts with Matryoshka multi-scale output.
+
+        Returns:
+            (full_encoding, scales_dict) where scales_dict maps dim→embedding
+            or (full_encoding, None) if encoder doesn't support Matryoshka.
+        """
+        if dtype is None:
+            dtype = next(self.core_model.parameters()).dtype
+        if device is None:
+            device = next(self.core_model.parameters()).device
+
+        raw = self.text_encoder(texts, device=device, dtype=dtype)
+        if isinstance(raw, dict):
+            max_dim = max(raw.keys())
+            full = raw[max_dim]
+            return full, raw
+        return raw, None
 
     def forward_texts(
         self,

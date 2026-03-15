@@ -39,6 +39,7 @@ class SBERTEncoder(nn.Module):
         dropout: float = 0.1,
         freeze: bool = True,
         unfreeze_layers: Optional[list] = None,
+        freeze_bottom_frac: Optional[float] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -60,7 +61,9 @@ class SBERTEncoder(nn.Module):
             for param in _sbert_model.parameters():
                 param.requires_grad = False
             # Partial unfreezing: re-enable specific layers
-            if self.unfreeze_layers:
+            # Also needs registry when freeze_bottom_frac will unfreeze some params
+            _needs_registry = bool(self.unfreeze_layers) or (freeze_bottom_frac is not None and 0.0 < freeze_bottom_frac < 1.0)
+            if _needs_registry:
                 for name, param in _sbert_model.named_parameters():
                     if any(layer in name for layer in self.unfreeze_layers):
                         param.requires_grad = True
@@ -79,6 +82,12 @@ class SBERTEncoder(nn.Module):
             self._sbert_on_cpu = False
             object.__setattr__(self, '_embedding_cache', None)
 
+        # freeze_bottom_frac: freeze bottom N% of transformer layers
+        # e.g. freeze_bottom_frac=0.5 freezes layers 0..N//2-1, unfreezes N//2..N-1
+        self.freeze_bottom_frac = freeze_bottom_frac
+        if freeze_bottom_frac is not None and 0.0 < freeze_bottom_frac < 1.0:
+            self._freeze_bottom_layers(_sbert_model, freeze_bottom_frac)
+
         # Trainable projection SBERT_DIM → output_dim (simple MLP, Phase 9 рекорд)
         phidden = projection_hidden or max(output_dim, self._sbert_dim // 2)
         self.projection = nn.Sequential(
@@ -93,6 +102,67 @@ class SBERTEncoder(nn.Module):
         nn.init.zeros_(self.projection[0].bias)
         nn.init.normal_(self.projection[4].weight, std=0.02)
         nn.init.zeros_(self.projection[4].bias)
+
+    @staticmethod
+    def _freeze_bottom_layers(sbert_model, frac: float) -> int:
+        """Freeze the bottom `frac` fraction of transformer layers.
+
+        Returns the number of layers that were frozen.
+        """
+        # SBERT wraps a HF transformer in ._first_module().auto_model
+        try:
+            auto_model = sbert_model._first_module().auto_model
+        except AttributeError:
+            # Fallback: try direct access
+            auto_model = getattr(sbert_model, 'auto_model', None)
+            if auto_model is None:
+                # Try to find encoder layers in the model tree
+                for module in sbert_model.modules():
+                    if hasattr(module, 'encoder') and hasattr(module.encoder, 'layer'):
+                        auto_model = module
+                        break
+            if auto_model is None:
+                print("[WARN] Could not find transformer layers in SBERT model, skipping freeze_bottom_frac")
+                return 0
+
+        # Get encoder layers — works for BERT, RoBERTa, MPNet, etc.
+        encoder = getattr(auto_model, 'encoder', None)
+        if encoder is None:
+            print("[WARN] Could not find encoder in auto_model, skipping freeze_bottom_frac")
+            return 0
+
+        layers = getattr(encoder, 'layer', None)
+        if layers is None:
+            # RoBERTa uses 'layer' too, but some models might differ
+            layers = getattr(encoder, 'layers', None)
+        if layers is None:
+            print("[WARN] Could not find encoder layers, skipping freeze_bottom_frac")
+            return 0
+
+        num_layers = len(layers)
+        freeze_until = int(num_layers * frac)
+
+        frozen_count = 0
+        for i in range(freeze_until):
+            for param in layers[i].parameters():
+                param.requires_grad = False
+            frozen_count += 1
+
+        # Unfreeze top layers (after __init__ set ALL to False)
+        unfrozen_count = 0
+        for i in range(freeze_until, num_layers):
+            for param in layers[i].parameters():
+                param.requires_grad = True
+            unfrozen_count += 1
+
+        # Freeze embeddings
+        embeddings = getattr(auto_model, 'embeddings', None)
+        if embeddings is not None:
+            for param in embeddings.parameters():
+                param.requires_grad = False
+
+        print(f"SBERT freeze_bottom_frac={frac}: froze {frozen_count}/{num_layers} layers + embeddings, unfroze top {unfrozen_count} layers")
+        return frozen_count
 
     def _encode_with_sbert(
         self, texts: Sequence[str], device: Optional[torch.device] = None

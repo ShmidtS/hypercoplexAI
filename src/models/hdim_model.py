@@ -102,7 +102,7 @@ class HDIMConfig:
     num_domains: int = 4
     num_experts: int = 4
     dropout: float = 0.1
-    clifford_p: int = 3
+    clifford_p: int = 4  # Phase 25: Cl(4,1,0) dim=32 vs old Cl(3,1,0) dim=16
     clifford_q: int = 1
     clifford_r: int = 0
     top_k: int = 2
@@ -459,7 +459,7 @@ class HDIMModel(nn.Module):
         for batch_domain_idx in domain_id.unique(sorted=True):
             mask = domain_id == batch_domain_idx
             group_route, group_router_state = pipeline.moe(u_mem[mask])
-            u_route[mask] = group_route
+            u_route[mask] = group_route.to(dtype=u_route.dtype)
 
             # Scatter per-group router state into batch tensors
             routing_weights[mask] = group_router_state["gate_weights"].to(dtype=x.dtype)
@@ -745,7 +745,7 @@ class HDIMModel(nn.Module):
             src_idx, tgt_idx = int(pair[0].item()), int(pair[1].item())
             mask = (source_domain_id == src_idx) & (target_domain_id == tgt_idx)
             group_route, group_router_state = pipeline.moe(u_mem[mask])
-            u_route[mask] = group_route
+            u_route[mask] = group_route.to(dtype=u_route.dtype)
 
             routing_weights[mask] = group_router_state["gate_weights"].to(
                 dtype=source_encoding.dtype

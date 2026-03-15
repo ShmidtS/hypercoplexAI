@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 21.0 | Дата: 2026-03-14 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 21: Similarity-Preserving Router + Expert Dropout + Gated Memory Fusion + Gradient Isolation | README: обновлён*
+*Версия: 23.0 | Дата: 2026-03-14 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 22: Router Calibration + Gradient Surprise + Adaptive Forgetting + ModernBERT + Learnable Metric + SC-InfoNCE | Phase 23: SOTA Optimal Config (training ep11, score=0.483@ep5) | Phase 24: ModernBERT + Matryoshka [64,128,256,768] (config ready)*
 
 ---
 
@@ -51,9 +51,11 @@ $$L_{balance} = -\sum_i \sum_j sim(x_i, x_j) \cdot sim(r_i, r_j)$$
 
 ## 4. Архитектура
 
-### Пайплайн (Phase 21)
+### Пайплайн (Phase 23)
 ```
-Текст → SBERT(frozen) → SimpleMLP(768→384→256) → InvariantExtractor → TitansMemory → GatedMemoryFusion → SoftMoERouter (Expert Dropout + Similarity-Preserving) → DecoupledDecoder
+Текст → SBERT(frozen, paraphrase-mpnet-v2) → SimpleMLP(768→384→256) → InvariantExtractor → TitansMemory(Gradient Surprise + Adaptive Forgetting) → GatedMemoryFusion → SoftMoERouter (Expert Dropout 0.1 + Similarity-Preserving ICLR 2026 + Z-loss) → DecoupledDecoder → CliffordNet(Learnable Metric)
+
+[Phase 24] ModernBERT(frozen) → MatryoshkaProjection(768→[64,128,256,768]) → Multi-Scale InfoNCE Loss → same core pipeline
 ```
 
 **Важно:** GatedProjection (Phase 10) показал **регрессию** — 0.9347 << 1.1370. Оптимальная проекция: simple MLP (Linear→LayerNorm→GELU→Dropout→Linear).
@@ -89,6 +91,48 @@ $$L_{balance} = -\sum_i \sum_j sim(x_i, x_j) \cdot sim(r_i, r_j)$$
 | Simple MLP projection | ✅ **ОПТИМАЛЬНЫЙ** | Рекорд 1.1370 |
 
 **Вывод:** Simple MLP (Linear→LayerNorm→GELU→Dropout→Linear) стабильно лучше всех сложных вариантов.
+
+### Текстовые энкодеры (Phase 22)
+
+**Текущий:** SimpleTextEncoder (character/word-level, trainable)
+
+**Новые опции (src/models/modern_text_encoder.py):**
+
+| Архитектура | Описание | Использование |
+|-------------|----------|---------------|
+| `ModernBertEncoder` | Pre-trained ModernBERT (8K context) | Замороженный + projection |
+| `GatedMLPEncoder` | Lightweight trainable MLP | Обучение с нуля |
+| `HybridEncoder` | Attention + GatedMLP layers | Баланс accuracy/speed |
+| `MatryoshkaProjection` | Multi-scale embeddings | Clifford dimension alignment |
+
+**Matryoshka Representation Learning** (Kusupati et al., NeurIPS 2022):
+- Один энкодер → несколько размерностей [64, 128, 256, 768]
+- Каждая размерность сохраняет семантическую информацию
+- Идеально для HDIM: clifford_dim (16), hidden_dim (64/256), full_dim (768)
+- Loss: `L_matryoshka = Σ_d InfoNCE(emb_d) / n_dims`
+
+```python
+from src.models.modern_text_encoder import ModernEncoderConfig, build_modern_encoder
+
+# ModernBERT с Matryoshка
+config = ModernEncoderConfig(
+    encoder_type="modernbert",
+    pretrained_model="answerdotai/ModernBERT-base",
+    freeze_pretrained=True,
+    use_matryoshka=True,
+    matryoshka_dims=[64, 128, 256, 768],
+)
+encoder = build_modern_encoder(output_dim=256, config=config)
+
+# Lightweight GatedMLP для доменного текста
+config = ModernEncoderConfig(
+    encoder_type="gated_mlp",
+    mlp_hidden_dim=256,
+    mlp_num_layers=6,
+    mlp_use_glu=True,
+)
+encoder = build_modern_encoder(output_dim=256, config=config)
+```
 
 ### Модульность экспертов (unlimited)
 ```python
@@ -156,6 +200,9 @@ total:   55  159   66   50   330
 | **14** | **TBD** | — | — | — | **hidden=512, experts=8, Focal-InfoNCE(gamma=0.5), cosine_decay, v8, 687K (в процессе)** |
 | **16** | 0.378 | — | — | ep25 | hidden=128, experts=4, T=0.07 — **ДЕГРАДАЦИЯ**: memory drift + MoE collapse (score 0.181 к ep30) |
 | **17** | **TBD** | — | — | — | **7×P0 + 5×P1 исправлений, hidden=128, experts=4, T=0.15, reset_memory, z-loss=0.01 (в процессе)** |
+| **22** | **TBD** | — | — | — | **Phase 22: ModernBERT + Gradient Surprise + Router Calibration + SC-InfoNCE + Learnable Metric + Adaptive Forgetting** |
+| **23** | **0.483** | 0.371 | 0.372 | ep5 | **Phase 23: SOTA Optimal Config — lr=3e-4, batch=64, v8 data, DCL+Uniform, cosine_restarts T_0=25, gradient checkpointing, sim-preserving router** |
+| **24** | **TBD** | — | — | — | **Phase 24: ModernBERT frozen + Matryoshka [64,128,256,768] + Multi-Scale InfoNCE** |
 
 ---
 
@@ -468,6 +515,14 @@ ep30-45: score стагнирует ~0.18    (все токены → 1 эксп
 | **Gated Memory Fusion** | learnable gate for memory | ✅ Реализовано (Phase 21) | устраняет memory drift |
 | **Gradient Isolation для Memory** | stop-gradient для стабильности | ✅ Реализовано (Phase 21) | предотвращает градиентный конфликт memory vs main |
 | **Precomputed Clifford signs** | hypercomplex.py оптимизация | ✅ Реализовано (Phase 21) | ~15% ускорение forward pass |
+| **Router Calibration (R2-T2)** | ICML 2025 (Chen et al.) | ✅ Реализовано (Phase 22) | test-time calibration для роутера |
+| **Gradient Surprise** | Titans, NeurIPS 2025 | ✅ Реализовано (Phase 22) | adaptive memory update на основе surprise |
+| **Adaptive Forgetting** | Titans, NeurIPS 2025 | ✅ Реализовано (Phase 22) | high surprise → less forgetting |
+| **Learnable Clifford Metric** | CliffordNet, 2026 | ✅ Реализовано (Phase 22) | per-blade metric scaling |
+| **SC-InfoNCE** | Cheng et al., Nov 2025 | ✅ Реализовано (Phase 22) | cluster-aware temperature |
+| **ModernBERT Encoder** | Warner et al., 2024 | ✅ Реализовано (Phase 22) | 16x контекст, быстрее SBERT |
+| **Matryoshka Projection** | Kusupati et al., NeurIPS 2022 | ✅ Реализовано (Phase 22) | multi-scale embeddings [16,64,128,256] |
+| **Optimal Hyperparameters** | Research synthesis 2026 | ✅ Внедрено (Phase 23) | lr=3e-4, batch=64, balanced losses |
 
 **Router Z-Loss** — critical при num_experts > 4:
 ```python
@@ -617,7 +672,153 @@ python scripts/gpu_train.py \
 
 ---
 
-## 12. Индекс файлов
+## 12. Phase 22 — ModernBERT + SOTA Memory + Router Calibration
+
+### Нововведения Phase 22
+
+**1. Router Calibration (R2-T2, ICML 2025)**
+- Small calibration head на основе mean-pooled входа
+- Корректирует dispatch logits при inference (test-time)
+- Активируется через `model.enable_router_calibration()`
+- `SoftMoERouter.calibration_head`: Linear→ReLU→Linear(num_experts)
+
+**2. Gradient-Based Surprise (Titans, NeurIPS 2025)**
+- Surprise = норма градиента по ключу при retrieval loss
+- `TitansMemoryModule._compute_surprise()`: fp32 градиентный шаг
+- Используется для adaptive forgetting (high surprise → less forgetting)
+
+**3. Adaptive Forgetting (Titans, NeurIPS 2025)**
+- `α_effective = α_base * (1 - 0.5 * sigmoid(surprise - 1.0))`
+- Высокий surprise → меньше забывания → сохранение важных ассоциаций
+- Активируется через `model.enable_adaptive_forgetting()`
+
+**4. Learnable Clifford Metric (CliffordNet, 2026)**
+- `CliffordAlgebra.use_learnable_metric = True`
+- Per-blade scaling parameters для геометрического произведения
+- Активируется через `model.enable_learnable_metric()`
+
+**5. SC-InfoNCE (Cheng et al., Nov 2025)**
+- Cluster-aware temperature scaling
+- Temperature адаптируется на основе кластерной структуры батча
+- Активируется через `--sc_temperature` флаг
+
+**6. ModernBERT Encoder (Warner et al., 2024)**
+- `answerdotai/ModernBERT-base` — 149M params, 8192 контекст
+- Frozen + Simple MLP projection (768→256)
+- CLI: `--modernbert_encoder --freeze_modernbert`
+- Factory: `build_modernbert_hdim_model()`
+
+**7. Matryoshka Projection (Kusupati et al., NeurIPS 2022)**
+- Multi-scale embeddings: [16, 64, 128, 256, 768]
+- Один энкодер → полезные представления на нескольких размерностях
+- `MatryoshkaProjection` в `src/models/modern_text_encoder.py`
+
+### Запуск Phase 22
+
+```bash
+python scripts/gpu_train.py \
+  --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4 \
+  --batch_size 64 --lr 3e-4 \
+  --modernbert_encoder --freeze_modernbert \
+  --soft_router \
+  --real_pairs data/real_pairs_v8.json --augment_factor 30 \
+  --lambda_pair 0.35 --lambda_sts 0.2 --lambda_angle 0.25 \
+  --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.015 \
+  --lambda_z 0.01 --lambda_dcl 0.25 --lambda_uniformity 0.08 \
+  --use_infonce --infonce_temperature 0.15 --learnable_temperature \
+  --focal_gamma 0.5 \
+  --gradient_surprise --adaptive_forgetting \
+  --router_calibration --sc_temperature \
+  --learnable_metric \
+  --scheduler_type cosine_restarts --t_mult 2 --warmup_epochs 5 \
+  --early_stopping_patience 40 --eval_every 5 --save_every 25 \
+  --output_dir artifacts/phase22_sota --amp --seed 42
+```
+
+---
+
+## 13. Phase 23 — SOTA Optimal Configuration
+
+### Гиперпараметры (исследование 2024-2026)
+
+Фаза 23 объединяет все SOTA улучшения с оптимальными гиперпараметрами, выведенными из анализа 12+ исследований:
+
+| Параметр | Phase 8e (рекорд) | Phase 23 (оптимальный) | Источник |
+|---|---|---|---|
+| lr | 0.0005 | 3e-4 | Research synthesis 2026 |
+| batch_size | 32 | 64 | InfoNCE: больше негативов |
+| T_0 (warmup) | 20 | 25 | Longer initial cycle |
+| T_mult | 2 | 2 | Stable cycles |
+| lambda_pair | 0.4 | 0.35 | Баланс с DCL |
+| lambda_dcl | 0.0 | 0.25 | Decoupled Contrastive |
+| lambda_uniformity | 0.0 | 0.08 | Uniformity+Alignment |
+| lambda_memory | 0.01 | 0.015 | Увеличен для стабильности |
+| lambda_z | 0.01 | 0.01 | Anti-collapse |
+| focal_gamma | 1.0 | 0.5 | Focal-InfoNCE |
+| temperature | 0.1 (fixed) | 0.15 (learnable) | Адаптивная |
+| gradient_checkpointing | No | Yes | Экономия VRAM |
+| similarity_router | No | Yes | ICLR 2026 |
+
+### Запуск Phase 23
+
+```bash
+scripts/phase23_train.bat
+```
+
+Или вручную:
+```bash
+python scripts/gpu_train.py \
+  --epochs 200 --hidden_dim 256 --num_experts 4 --num_domains 4 \
+  --batch_size 64 --lr 3e-4 \
+  --pretrained_encoder --soft_router \
+  --real_pairs data/real_pairs_v8.json --augment_factor 30 \
+  --lambda_pair 0.35 --lambda_sts 0.2 --lambda_angle 0.25 \
+  --lambda_iso 0.1 --lambda_routing 0.05 --lambda_memory 0.015 \
+  --lambda_z 0.01 --lambda_dcl 0.25 --lambda_uniformity 0.08 \
+  --use_infonce --infonce_temperature 0.15 --learnable_temperature \
+  --focal_gamma 0.5 \
+  --scheduler_type cosine_restarts --t_mult 2 --warmup_epochs 5 \
+  --gradient_checkpointing \
+  --similarity_preserving_router \
+  --early_stopping_patience 40 --eval_every 5 --save_every 25 \
+  --output_dir artifacts/phase23_optimal --amp --seed 42
+```
+
+**Цель:** score > 1.15 (новый рекорд), pair_margin > 0.92, STS > 0.79
+
+### Прогресс Phase 23 (в процессе)
+| Эпоха | train_loss | score | pair_margin | STS | loss_memory | loss_routing | Notes |
+|-------|-----------|-------|-------------|-----|-------------|--------------|-------|
+| ep5 | 1.341 | 0.483 | 0.371 | 0.372 | 0.0064 | -0.0596 | Первый eval, sim-router работает |
+| ep10 | 1.141 | 0.403 | 0.309 | 0.315 | 0.0061 | -0.0592 | Val-train gap растёт (early overfit?) |
+
+---
+
+## 14. Phase 24 — ModernBERT + Matryoshka Multi-Scale
+
+### Концепция
+Phase 24 добавляет ModernBERT frozen encoder с Matryoshka Representation Learning — multi-scale InfoNCE loss на размерностях [64, 128, 256, 768]. Ожидаемый прирост: +0.02-0.04 score.
+
+### Ключевые изменения
+- **ModernBertEncoder** (`modern_text_encoder.py`): frozen ModernBERT-base + MatryoshkaProjection
+- **Matryoshka Loss** (`trainer.py`): InfoNCE на каждом масштабе, усреднённый
+- **Batch injection**: `matryoshka_source` / `matryoshka_target` / `matryoshka_embeddings` добавляются в batch
+- **TextHDIMModel.encode_texts_matryoshka()**: возвращает `(full_encoding, scales_dict)` или `(full_encoding, None)`
+- Исправлен баг: `ModernBertEncoder` не устанавливал `self.use_matryoshka = True`
+
+### Запуск Phase 24
+```bash
+scripts/phase24_modernbert.bat
+```
+
+### Ожидаемый путь
+1. Phase 23 завершить (SBERT baseline → score > 1.0)
+2. Phase 24 запустить с ModernBERT + Matryoshka
+3. Если Matryoshka даст +0.03, комбинировать с Phase 23 hyperparams
+
+---
+
+## 15. Индекс файлов
 
 ```
 src/core/
@@ -632,7 +833,8 @@ src/models/
   hdim_model.py           — HDIMModel (batch API, domain-aware)
   text_hdim_model.py      — TextHDIMModel (text wrapper, encode_texts)
   sbert_encoder.py        — SBERTEncoder + SimpleMLP 768→384→hidden
-  model_factory.py        — build_hdim_model, build_text_hdim_model, build_sbert_hdim_model
+  model_factory.py        — build_hdim_model, build_text_hdim_model, build_sbert_hdim_model, build_modernbert_hdim_model
+  modern_text_encoder.py  — ModernBertEncoder, GatedMLPEncoder, HybridEncoder, MatryoshkaProjection
   metrics.py              — compute_all_metrics, PRIMARY_SCORE, AFR, DRS
 
 src/training/

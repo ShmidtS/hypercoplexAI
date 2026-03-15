@@ -92,11 +92,9 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
             update_memory=False,
             memory_mode="retrieve",
         )
-        sts_exported = F.cosine_similarity(
-            state.exported_invariant,
-            state.memory_augmented_invariant,
-            dim=-1,
-        )
+        src_norm = F.normalize(state.exported_invariant, dim=-1)
+        tgt_norm = F.normalize(state.memory_augmented_invariant, dim=-1)
+        sts_exported = (src_norm * tgt_norm).sum(dim=-1)
         sts_training = F.cosine_similarity(
             state.training_invariant,
             model.training_inv_head(state.memory_augmented_invariant),
@@ -125,11 +123,9 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
     )
     negative_pair_indices = _compute_negative_pair_indices(batch)
 
-    sts_exported = F.cosine_similarity(
-        src_state.exported_invariant,
-        tgt_state.exported_invariant,
-        dim=-1,
-    )
+    src_norm = F.normalize(src_state.exported_invariant, dim=-1)
+    tgt_norm = F.normalize(tgt_state.exported_invariant, dim=-1)
+    sts_exported = (src_norm * tgt_norm).sum(dim=-1)
     sts_training = F.cosine_similarity(
         src_state.training_invariant,
         tgt_state.training_invariant,

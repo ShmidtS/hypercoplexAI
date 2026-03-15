@@ -9,6 +9,7 @@ Public API
 build_hdim_model(cfg)                    -> HDIMModel
 build_text_hdim_model(cfg, ...)          -> TextHDIMModel
 build_sbert_hdim_model(cfg, ...)         -> TextHDIMModel (with frozen SBERT encoder)
+build_modernbert_hdim_model(cfg, ...)    -> TextHDIMModel (with ModernBERT encoder)
 model_from_experiment_config(exp)        -> TextHDIMModel | HDIMModel
 """
 from __future__ import annotations
@@ -55,6 +56,7 @@ def _patch_sbert_encoder(
     freeze: bool = True,
     dropout: float = 0.1,
     unfreeze_layers: list | None = None,
+    freeze_bottom_frac: float | None = None,
     projection_hidden: int | None = None,
 ) -> None:
     """Replace text_model.text_encoder with SBERTEncoder in-place."""
@@ -67,7 +69,32 @@ def _patch_sbert_encoder(
         freeze=freeze,
         dropout=dropout,
         unfreeze_layers=unfreeze_layers,
+        freeze_bottom_frac=freeze_bottom_frac,
         projection_hidden=projection_hidden,
+    )
+    text_model.text_encoder = new_encoder  # type: ignore[assignment]
+
+
+def _patch_modernbert_encoder(
+    text_model: TextHDIMModel,
+    *,
+    model_name: str = "answerdotai/ModernBERT-base",
+    freeze: bool = True,
+    use_cls_pooling: bool = True,
+    max_length: int = 512,
+    matryoshka_dims: list[int] | None = None,
+) -> None:
+    """Replace text_model.text_encoder with ModernBertEncoder in-place."""
+    from src.models.modern_text_encoder import ModernBertEncoder
+
+    core_cfg = text_model.core_model.config
+    new_encoder = ModernBertEncoder(
+        output_dim=core_cfg.hidden_dim,
+        pretrained_model=model_name,
+        freeze_pretrained=freeze,
+        use_cls_pooling=use_cls_pooling,
+        max_length=max_length,
+        matryoshka_dims=matryoshka_dims,
     )
     text_model.text_encoder = new_encoder  # type: ignore[assignment]
 
@@ -106,6 +133,7 @@ def build_sbert_hdim_model(
     freeze_sbert: bool = True,
     sbert_dropout: float = 0.1,
     unfreeze_layers: list | None = None,
+    freeze_bottom_frac: float | None = None,
     projection_hidden: int | None = None,
     z_loss_weight: float = 0.0,
 ) -> TextHDIMModel:
@@ -123,7 +151,39 @@ def build_sbert_hdim_model(
         freeze=freeze_sbert,
         dropout=sbert_dropout,
         unfreeze_layers=unfreeze_layers,
+        freeze_bottom_frac=freeze_bottom_frac,
         projection_hidden=projection_hidden,
+    )
+
+    return text_model
+
+
+def build_modernbert_hdim_model(
+    cfg: HDIMConfig,
+    *,
+    soft_router: bool = False,
+    modernbert_model_name: str = "answerdotai/ModernBERT-base",
+    freeze_modernbert: bool = True,
+    use_cls_pooling: bool = True,
+    max_length: int = 512,
+    matryoshka_dims: list[int] | None = None,
+    z_loss_weight: float = 0.0,
+) -> TextHDIMModel:
+    """Build a TextHDIMModel with ModernBERT encoder and optional SoftMoERouter."""
+    core_model = HDIMModel(cfg)
+
+    if soft_router:
+        _patch_soft_router(core_model, z_loss_weight=z_loss_weight)
+
+    text_model = TextHDIMModel(core_model)
+
+    _patch_modernbert_encoder(
+        text_model,
+        model_name=modernbert_model_name,
+        freeze=freeze_modernbert,
+        use_cls_pooling=use_cls_pooling,
+        max_length=max_length,
+        matryoshka_dims=matryoshka_dims,
     )
 
     return text_model
@@ -149,11 +209,18 @@ def model_from_experiment_config(
         exp.text_mode
         or exp.soft_router
         or getattr(exp, "pretrained_encoder", False)
+        or getattr(exp, "modernbert_encoder", False)
     )
 
     z_loss_weight = getattr(exp, 'z_loss_weight', 0.0)
 
     if needs_text:
+        if getattr(exp, "modernbert_encoder", False):
+            return build_modernbert_hdim_model(
+                cfg,
+                soft_router=exp.soft_router,
+                z_loss_weight=z_loss_weight,
+            )
         if getattr(exp, "pretrained_encoder", False):
             return build_sbert_hdim_model(
                 cfg,

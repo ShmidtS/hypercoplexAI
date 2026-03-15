@@ -71,6 +71,7 @@ class ExperimentConfig:
     advanced_encoder: bool = False
     hierarchical_memory: bool = False
     soft_router: bool = False
+    modernbert_encoder: bool = False
 
     # ------------------------------------------------------------------ #
     # Misc extras                                                         #

@@ -40,6 +40,13 @@ class HDIMTrainer:
         lambda_dcl: float = 0.0,
         lambda_uniformity: float = 0.0,
         use_sc_temperature: bool = False,
+        lambda_matryoshka: float = 0.1,
+        # Temperature scheduling parameters (exposed for configurability)
+        temp_schedule: str = "none",
+        tau_max: float = 0.1,
+        tau_min: float = 0.01,
+        temp_schedule_T_0: int = 20,
+        focal_gamma: float = 1.0,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -62,13 +69,13 @@ class HDIMTrainer:
         self._last_cluster_temp: float | None = None
         self._step: int = 0
         # Focal-InfoNCE gamma (Hou & Li, EMNLP 2023)
-        self._focal_gamma: float = 1.0  # 1.0 = standard InfoNCE, <1 = focal
-        # Temperature scheduling
+        self._focal_gamma: float = focal_gamma  # 1.0 = standard InfoNCE, <1 = focal
+        # Temperature scheduling (now configurable)
         self._current_epoch: int = 0
-        self._temp_schedule: str = "none"  # "none" | "warm_restart"
-        self._tau_max: float = 0.1
-        self._tau_min: float = 0.01
-        self._temp_schedule_T_0: int = 20  # matches scheduler T_0
+        self._temp_schedule: str = temp_schedule  # "none" | "warm_restart"
+        self._tau_max: float = tau_max
+        self._tau_min: float = tau_min
+        self._temp_schedule_T_0: int = temp_schedule_T_0  # matches scheduler T_0
         # Learnable temperature (log-scale for numerical stability)
         # B33 FIX: register as buffer on model so it survives checkpoint save/load
         import math
@@ -107,8 +114,21 @@ class HDIMTrainer:
             raise KeyError(f"Batch key '{key}' must contain a sequence of raw texts")
         return [str(text) for text in texts]
 
-    def _encode_texts(self, texts: Sequence[str]) -> torch.Tensor:
-        return self.model.encode_texts(texts, device=self.device)
+    def _encode_texts(
+        self,
+        texts: Sequence[str],
+        *,
+        collect_matryoshka: bool = False,
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor] | None] | torch.Tensor:
+        if collect_matryoshka and hasattr(self.model, 'encode_texts_matryoshka'):
+            full_enc, scales = self.model.encode_texts_matryoshka(
+                texts, device=self.device,
+            )
+            return full_enc, scales
+        enc = self.model.encode_texts(texts, device=self.device)
+        if collect_matryoshka:
+            return enc, None
+        return enc
 
     def _extract_iso_targets(
         self, batch: Dict[str, Any], aux_state: HDIMAuxState
@@ -844,6 +864,70 @@ class HDIMTrainer:
             batch,
         )
 
+    def _compute_matryoshka_loss(
+        self,
+        matryoshka_embs: Dict[int, torch.Tensor],
+        batch: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Matryoshka Representation Learning loss.
+        
+        Trains the encoder to produce meaningful embeddings at multiple dimensions.
+        Each scale contributes equally to the total loss.
+        
+        Ref: Kusupati et al., NeurIPS 2022
+        
+        For HDIM: we compute contrastive loss at each Matryoshka scale,
+        encouraging all dimensionalities to preserve semantic structure.
+        """
+        if not matryoshka_embs:
+            return self._zero_loss(next(iter(batch.values())))
+        
+        # Need pair info for contrastive loss at each scale
+        pair_relation_label = batch.get("pair_relation_label")
+        if pair_relation_label is None:
+            # No pairs - can't compute Matryoshka contrastive loss
+            return self._zero_loss(next(iter(matryoshka_embs.values())))
+        
+        pair_weight = batch.get("pair_weight")
+        if pair_weight is None:
+            pair_weight = torch.ones_like(pair_relation_label)
+        
+        # For Matryoshka, we need both source and target embeddings at each scale
+        # The batch should contain "matryoshka_source" and "matryoshka_target" dicts
+        matryoshka_source = batch.get("matryoshka_source", matryoshka_embs)
+        matryoshka_target = batch.get("matryoshka_target", matryoshka_embs)
+        
+        if not matryoshka_source or not matryoshka_target:
+            return self._zero_loss(next(iter(matryoshka_embs.values())))
+        
+        total_loss = self._zero_loss(next(iter(matryoshka_source.values())))
+        n_scales = 0
+        
+        # Compute contrastive loss at each scale
+        for dim in matryoshka_source.keys():
+            if dim not in matryoshka_target:
+                continue
+                
+            src_emb = matryoshka_source[dim]
+            tgt_emb = matryoshka_target[dim]
+            
+            # Use InfoNCE at each scale
+            scale_loss = self._compute_infonce_loss(
+                src_emb,
+                tgt_emb,
+                pair_relation_label,
+                pair_weight,
+                temperature=self._effective_temperature(),
+            )
+            total_loss = total_loss + scale_loss
+            n_scales += 1
+        
+        # Average across scales
+        if n_scales > 0:
+            total_loss = total_loss / n_scales
+        
+        return total_loss
+    
     def _compute_pair_loss_terms(
         self,
         aux_state: HDIMAuxState,
@@ -921,8 +1005,13 @@ class HDIMTrainer:
                 )
                 # For negative pairs: recon_target = source encoding
                 _prl = batch.get("pair_relation_label")
-                _src_enc = self._encode_texts(texts)
-                _tgt_enc = self._encode_texts(pair_texts)
+                _src_enc, _src_scales = self._encode_texts(texts, collect_matryoshka=True)
+                _tgt_enc, _tgt_scales = self._encode_texts(pair_texts, collect_matryoshka=True)
+                if _src_scales is not None and _tgt_scales is not None:
+                    batch["matryoshka_source"] = _src_scales
+                    batch["matryoshka_target"] = _tgt_scales
+                    # Use max-dim dict for matryoshka_embeddings
+                    batch["matryoshka_embeddings"] = _src_scales
                 if _prl is not None:
                     _pos_mask = (_prl.to(self.device) > 0.5).unsqueeze(-1).expand_as(_src_enc)
                     recon_target = torch.where(_pos_mask, _tgt_enc, _src_enc)
@@ -990,6 +1079,13 @@ class HDIMTrainer:
         if self._has_pairs(batch) and pair_relation_label is not None:
             loss_diversity = self._compute_diversity_loss(aux_state.exported_invariant)
 
+        # Matryoshka multi-scale loss (if encoder returns dict of scales)
+        loss_matryoshka = self._zero_loss(training_invariant)
+        # Check if batch has matryoshka embeddings
+        matryoshka_embs = batch.get("matryoshka_embeddings")
+        if matryoshka_embs is not None and isinstance(matryoshka_embs, dict):
+            loss_matryoshka = self._compute_matryoshka_loss(matryoshka_embs, batch)
+        
         loss_total = (
             loss_recon
             + self.lambda_iso * loss_iso
@@ -999,6 +1095,7 @@ class HDIMTrainer:
             + self.lambda_sts * loss_sts
             + self.lambda_z * loss_z
             + loss_diversity
+            + loss_matryoshka
         )
         batch_losses = {
             "loss_total": loss_total,
@@ -1008,6 +1105,7 @@ class HDIMTrainer:
             "loss_routing": loss_routing,
             "loss_memory": loss_memory,
             "loss_diversity": loss_diversity,
+            "loss_matryoshka": loss_matryoshka,
             "routing_weights": routing_weights,
             "invariant": invariant,
             "raw_invariant": aux_state.raw_invariant,
@@ -1071,6 +1169,7 @@ class HDIMTrainer:
             "loss_routing": 0.0,
             "loss_memory": 0.0,
             "loss_diversity": 0.0,
+            "loss_matryoshka": 0.0,
             "loss_total": 0.0,
         }
         n_batches = 0
@@ -1088,8 +1187,15 @@ class HDIMTrainer:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         checkpoint = {
             "step": self._step,
+            "current_epoch": self._current_epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            # Temperature scheduling config
+            "temp_schedule": self._temp_schedule,
+            "tau_max": self._tau_max,
+            "tau_min": self._tau_min,
+            "temp_schedule_T_0": self._temp_schedule_T_0,
+            "focal_gamma": self._focal_gamma,
         }
         if scaler is not None:
             checkpoint["scaler_state_dict"] = scaler.state_dict()
@@ -1100,5 +1206,12 @@ class HDIMTrainer:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self._step = checkpoint.get("step", 0)
+        self._current_epoch = checkpoint.get("current_epoch", 0)
+        # Restore temperature scheduling config
+        self._temp_schedule = checkpoint.get("temp_schedule", "none")
+        self._tau_max = checkpoint.get("tau_max", 0.1)
+        self._tau_min = checkpoint.get("tau_min", 0.01)
+        self._temp_schedule_T_0 = checkpoint.get("temp_schedule_T_0", 20)
+        self._focal_gamma = checkpoint.get("focal_gamma", 1.0)
         if scaler is not None and "scaler_state_dict" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
