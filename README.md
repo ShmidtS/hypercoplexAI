@@ -5,8 +5,8 @@
 [License: MIT](LICENSE)
 [Status: Research]()
 
-> **Best score: 1.1370** (Phase 8e, ep45) — `pair_margin=0.906`, `STS=0.770`
-> **Current:** Phase 19 running (ep11, score=0.489) | Phase 20 prepared (DCL + Uniformity)
+> **Best score: 1.1542** (Phase 26c, ep15) — `pair_margin=0.993`, `STS=0.537`
+> **Current:** Phase 26 complete | DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho
 
 ---
 
@@ -64,9 +64,12 @@ structural topology.
 │  ┌────────┴────────┬─────────────────┬─────────────────┐                │
 │  │ CliffordAlgebra │ InvariantExtr.  │ TitansMemory    │                │
 │  └─────────────────┴─────────────────┴─────────────────┘                │
-│  ┌────────┴────────┬─────────────────┐                                  │
-│  │ SoftMoERouter   │  HDIMPipeline   │                                  │
-│  └─────────────────┴─────────────────┘                                  │
+│  ┌────────┴────────┬─────────────────┬─────────────────┐                │
+│  │ SoftMoERouter   │ DomainExpertPool│  HDIMPipeline   │                │
+│  │ (SharedExpert,  │ (4 SBERT frozen │                 │                │
+│  │  AuxLossFree,   │  + projection)  │                 │                │
+│  │  ExpertOrtho)   │                 │                 │                │
+│  └─────────────────┴─────────────────┴─────────────────┘                │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,6 +87,10 @@ strips domain signature, exposing pure structural topology
 multivector from invariant
 - **Titans Memory (TTT)** — `[TitansMemoryModule](src/core/titans_memory.py:30)` with fp32-safe AMP path
 - **Soft MoE Routing** — `[SoftMoERouter](src/core/soft_moe_router.py:43)`, Puigcerver et al. ICLR 2024
+- **Domain Expert Pool** — `[DomainExpertPool](src/core/domain_expert_pool.py:20)` — 4 frozen SBERT experts (MiniLM family) with trainable projections
+- **Shared Expert (DeepSeek-V3)** — always-on FFN processing all inputs regardless of routing
+- **Auxiliary-Loss-Free Balancing (DeepSeek-V3)** — bias-based load balancing instead of auxiliary loss
+- **Expert Orthogonalization** — `[expert_orthogonalization_loss](src/core/soft_moe_router.py:183)` (arXiv:2505.22323)
 - **Focal-InfoNCE** — Phase 17 fix: gamma applied only to denominator
 - **DCL + Uniformity+Alignment** — Phase 20 additions
 - **Frozen SBERT + trainable MLP** — `[paraphrase-multilingual-mpnet-base-v2](src/models/sbert_encoder.py:20)`
@@ -100,7 +107,8 @@ hypercoplexAI/
 │   │   ├── domain_operators.py   # DomainRotationOperator, InvariantExtractor
 │   │   ├── hdim_pipeline.py      # HDIMPipeline orchestrator
 │   │   ├── titans_memory.py      # TitansMemoryModule (TTT)
-│   │   └── soft_moe_router.py    # SoftMoERouter (DEFAULT)
+│   │   ├── soft_moe_router.py    # SoftMoERouter (DEFAULT, Phase 26)
+│   │   └── domain_expert_pool.py # DomainExpertPool, SharedExpert (Phase 26)
 │   ├── models/
 │   │   ├── hdim_model.py         # HDIMModel, HDIMConfig
 │   │   ├── text_hdim_model.py    # TextHDIMModel
@@ -112,7 +120,9 @@ hypercoplexAI/
 │       └── real_dataset.py       # RealPairsDataset
 ├── scripts/
 │   ├── gpu_train.py              # PRIMARY training script
-│   └── auto_tune.py              # Hyperparameter search
+│   ├── auto_tune.py              # Hyperparameter search (v26, Optuna)
+│   ├── autoresearch_loop.py      # Automated research with IncumbentTracker
+│   └── phase25_train.bat         # Phase 25b training config
 ├── docs/
 │   ├── ARCHITECTURE.md           # Full architecture docs
 │   └── DIAGRAMS.md               # Mermaid diagrams
@@ -260,8 +270,9 @@ config = HDIMConfig(
 | `loss_routing`    | 0.05   | 7     | Routing entropy         |
 | `router_z_loss`   | 0.01   | 9     | MoE anti-collapse       |
 | `loss_memory`     | 0.05   | 6     | Titans memory MSE       |
-| `loss_dcl`        | 0.2    | 20    | Decoupled Contrastive   |
-| `loss_uniformity` | 0.1    | 20    | Uniformity+Alignment    |
+| `loss_dcl`            | 0.2    | 20    | Decoupled Contrastive      |
+| `loss_uniformity`     | 0.1    | 20    | Uniformity+Alignment        |
+| `loss_expert_ortho`   | 0.02   | 26    | Expert Orthogonalization    |
 
 
 **📊 См. [docs/ARCHITECTURE.md#5-training-layer](docs/ARCHITECTURE.md#5-training-layer) для детального описания losses.**
@@ -272,7 +283,7 @@ config = HDIMConfig(
 PRIMARY_SCORE = pair_margin × 1.0 + STS_exported × 0.3
 ```
 
-**Best achieved:** 1.1370 (Phase 8e, ep45)
+**Best achieved:** 1.1542 (Phase 26c, ep15): `pair_margin=0.993`, `STS=0.537`
 
 ---
 
@@ -288,6 +299,8 @@ PRIMARY_SCORE = pair_margin × 1.0 + STS_exported × 0.3
 | `InvariantExtractor`     | `[domain_operators.py:54](src/core/domain_operators.py:54)`   | ✅ Stable |
 | `TitansMemoryModule`     | `[titans_memory.py:30](src/core/titans_memory.py:30)`         | ✅ Stable |
 | `SoftMoERouter`          | `[soft_moe_router.py:43](src/core/soft_moe_router.py:43)`     | ✅ Stable |
+| `DomainExpertPool`       | `[domain_expert_pool.py:20](src/core/domain_expert_pool.py:20)` | ✅ Stable |
+| `SharedExpert`           | `[domain_expert_pool.py:115](src/core/domain_expert_pool.py:115)` | ✅ Stable |
 | `HDIMPipeline`           | `[hdim_pipeline.py:128](src/core/hdim_pipeline.py:128)`       | ✅ Stable |
 | `HDIMModel`              | `[hdim_model.py:117](src/models/hdim_model.py:117)`           | ✅ Stable |
 | `TextHDIMModel`          | `[text_hdim_model.py:191](src/models/text_hdim_model.py:191)` | ✅ Stable |
@@ -374,4 +387,4 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
-*Generated: 2026-03-13 | Research prototype — API may change between phases*
+*Generated: 2026-03-15 | Research prototype — API may change between phases*

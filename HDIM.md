@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 23.0 | Дата: 2026-03-14 | Рекорд: score=1.1370 (Phase 8e, ep45) | Phase 22: Router Calibration + Gradient Surprise + Adaptive Forgetting + ModernBERT + Learnable Metric + SC-InfoNCE | Phase 23: SOTA Optimal Config (training ep11, score=0.483@ep5) | Phase 24: ModernBERT + Matryoshka [64,128,256,768] (config ready)*
+*Версия: 26.0 | Дата: 2026-03-15 | Рекорд: score=1.1542 (Phase 26c, ep15, margin=0.993, STS=0.537) | Phase 26: DomainExpertPool + SharedExpert (DeepSeek-V3) + AuxLossFree + ExpertOrtho + dead code removal*
 
 ---
 
@@ -37,7 +37,7 @@ $$U_{inv} = R_A^{-1} \otimes G_A \otimes R_A$$
 $$G_B = R_B \otimes U \otimes R_B^{-1}$$
 
 ### Loss функция
-$$L_{total} = L_{recon} + \lambda_{iso} L_{iso} + \lambda_{pair} L_{pair} + \lambda_{routing} L_{routing} + \lambda_z L_z + L_{memory}$$
+$$L_{total} = L_{recon} + \lambda_{iso} L_{iso} + \lambda_{pair} L_{pair} + \lambda_{routing} L_{routing} + \lambda_z L_z + L_{memory} + \lambda_{expert\_ortho} L_{expert\_ortho} + \lambda_{dcl} L_{dcl} + \lambda_{uniformity} L_{uniformity}$$
 
 Где $L_{pair}$ = Focal-InfoNCE/InfoNCE + AnglE + SupCon (при наличии family labels).
 $L_z = (\log\sum_j e^{z_j})^2$ — Router Z-Loss для стабильности MoE (ST-MoE, Zoph et al. 2022).
@@ -203,6 +203,10 @@ total:   55  159   66   50   330
 | **22** | **TBD** | — | — | — | **Phase 22: ModernBERT + Gradient Surprise + Router Calibration + SC-InfoNCE + Learnable Metric + Adaptive Forgetting** |
 | **23** | **0.483** | 0.371 | 0.372 | ep5 | **Phase 23: SOTA Optimal Config — lr=3e-4, batch=64, v8 data, DCL+Uniform, cosine_restarts T_0=25, gradient checkpointing, sim-preserving router** |
 | **24** | **TBD** | — | — | — | **Phase 24: ModernBERT frozen + Matryoshka [64,128,256,768] + Multi-Scale InfoNCE** |
+| **25** | **—** | — | — | — | **Phase 25: freeze_sbert_bottom_frac + weight_decay для SBERT + data v10 (1036 pairs) + SBERT cache** |
+| **26a** | **1.1063** | — | — | ep45 | **Phase 26a: DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho, augment=3, no sts/dcl** |
+| **26b** | **1.1513** | — | — | ep15 | **Phase 26b: +sts=0.15, dcl=0.2, learnable_temp, augment=5** |
+| **26c** | **1.1542** | 0.993 | 0.537 | ep15 | **Phase 26c: +uniformity=0.1, sts=0.3 — NEW RECORD** |
 
 ---
 
@@ -854,9 +858,236 @@ data/
   real_pairs_v6.json      — 213 пар (legacy)
   real_pairs_v5.json      — 175 пар (Phase 9 рекорд)
 
+  phase25_train.bat       — Phase 25b: freeze_sbert_bottom_frac + weight_decay + v10 data
+  auto_tune.py            — Auto-Tuner v26 (Optuna, study hdim_autotune_v26)
+  autoresearch_loop.py    — Automated research with IncumbentTracker
+
+data/
+  real_pairs_v10.json     — 1036 пар (636+ / 400-) — АКТУАЛЬНЫЙ (Phase 26)
+  real_pairs_v8.json      — 330 пар (212+ / 118-) — legacy
+  real_pairs_v7.json      — 232 пары (legacy)
+  real_pairs_v6.json      — 213 пар (legacy)
+  real_pairs_v5.json      — 175 пар (Phase 9 рекорд)
+
 artifacts/
-  phase8e_soft_eval5/     — РЕКОРД: score=1.1370 (ep45, hidden=256, 4 experts)
+  phase8e_soft_eval5/     — РЕКОРД (legacy): score=1.1370 (ep45, hidden=256, 4 experts)
   phase13_scaled/         — Phase 13: best=0.696 (ep15, LR restart проблема)
   phase14_sota/           — Phase 14: Focal-InfoNCE + cosine_decay + v8 (в процессе)
   phase17/                — Phase 17: 7×P0 + 5×P1 fixes, hidden=128, T=0.15 (в процессе)
+  best_autotune/          — РЕКОРД: score=1.1542 (Phase 26c, ep15, hidden=256, 4 experts)
+  optuna_study_v26.db     — Optuna study database v26
+  optuna_results_v26.json — All Optuna trial results
+
+---
+
+## 15. Phase 25 — SBERT Freezing + Data v10
+
+Phase 25 подготовил базу для Phase 26:
+
+- `freeze_sbert_bottom_frac`: заморозка нижних N% слоёв SBERT трансформера
+- `weight_decay` для SBERT слоёв: `lr * 100` (агрессивная регуляризация необучаемых слоёв)
+- `real_pairs_v10.json`: 1036 пар (636 положительных / 400 отрицательных)
+- SBERT embeddings cache: предвычисление embeddings для frozen encoder (ускорение 3-5x)
+
+### Phase 25 конфигурация
+
+```batch
+@echo off
+REM Phase 25b: freeze_sbert_bottom_frac + weight_decay + v10
+cd /d E:\hypercoplexAI
+call .venv\Scripts\activate.bat
+
+python scripts\gpu_train.py ^
+    --epochs 60 ^
+    --hidden_dim 256 ^
+    --num_experts 4 ^
+    --num_domains 4 ^
+    --pretrained_encoder ^
+    --soft_router ^
+    --freeze_sbert_bottom_frac 0.5 ^
+    --weight_decay 0.01 ^
+    --real_pairs data\real_pairs_v10.json ^
+    --augment_factor 5 ^
+    --lambda_pair 0.5 ^
+    --lambda_sts 0.15 ^
+    --lambda_dcl 0.2 ^
+    --lambda_iso 0.1 ^
+    --lambda_routing 0.02 ^
+    --lambda_memory 0.01 ^
+    --lambda_z 0.01 ^
+    --use_infonce ^
+    --infonce_temperature 0.15 ^
+    --learnable_temperature ^
+    --lr 0.0003 ^
+    --seed 42 ^
+    --batch_size 48 ^
+    --scheduler_type cosine_restarts ^
+    --t_mult 2 ^
+    --warmup_epochs 20 ^
+    --eval_every 5 ^
+    --save_every 25 ^
+    --output_dir artifacts\phase25b ^
+    --device auto ^
+    --amp
+```
+
+---
+
+## 16. Phase 26 — DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho
+
+### 16.1 Новые компоненты
+
+#### DomainExpertPool (`src/core/domain_expert_pool.py`)
+
+Пул из 4 frozen SBERT-энкодеров (MiniLM family) с обучаемыми projection heads:
+
+| ID | Модель | Параметры | Назначение |
+|----|--------|-----------|------------|
+| 0 | `all-MiniLM-L6-v2` | 22M frozen | General semantics |
+| 1 | `paraphrase-MiniLM-L3-v2` | 17M frozen | Paraphrase/structural similarity |
+| 2 | `multi-qa-MiniLM-L6-cos-v1` | 22M frozen | QA/domain-crossing |
+| 3 | `all-MiniLM-L12-v2` | 33M frozen | Deep semantic analysis |
+
+- **Общий footprint:** ~94M frozen params + ~100K trainable per expert (projection head)
+- **Архитектура projection:** `Linear → LayerNorm → GELU → Dropout(0.1) → Linear`
+- **SBERT на CPU** для экономии VRAM, только projection на GPU
+
+#### SharedExpert (DeepSeek-V3)
+
+Always-on FFN, обрабатывает ВСЕ входы независимо от routing:
+
+```python
+class SharedExpert(nn.Module):
+    def __init__(self, input_dim, hidden_dim=256):
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, input_dim),
+        )
+```
+
+Добавляется к выходу MoE: `output = moe_output + shared_expert(input)`
+
+#### Auxiliary-Loss-Free Balancing (DeepSeek-V3)
+
+Per-expert bias terms вместо auxiliary loss для балансировки нагрузки:
+
+```python
+# Вместо loss: динамическая коррекция bias
+if self.use_aux_loss_free:
+    delta = torch.sign(expert_load - self._target_load)
+    self._expert_bias.data -= self._aux_lr * delta  # aux_lr=0.001
+```
+
+#### Expert Orthogonalization (arXiv:2505.22323)
+
+Штрафует сходство весовых матриц экспертов:
+
+```python
+def expert_orthogonalization_loss(self):
+    """L_o = ||W1 @ W1^T - I||^2 + ||W2 @ W2^T - I||^2"""
+    w1_norm = F.normalize(self.W1_stack.reshape(E, -1), dim=-1)
+    gram1 = w1_norm @ w1_norm.T
+    loss1 = ((gram1 - I) ** 2).mean()
+    # аналогично для W2
+    return (loss1 + loss2) * 0.5
+```
+
+### 16.2 Удалённый мёртвый код
+
+| Удалено | Причина |
+|---------|---------|
+| `SoftRouterState` | Dict вместо dataclass — не нужен отдельный класс |
+| `calibration_head` | Не использовался после Phase 22 |
+| `adaptive_dropout` | Не давал значимого прироста |
+| `similarity_preserving_loss` | Убран в пользу AuxLossFree |
+| `experts ModuleList` | Заменён на batched einsum со stacked weights |
+| CLI: `--router_calibration` | Удалён |
+| CLI: `--adaptive_expert_dropout` | Удалён |
+| CLI: `--similarity_preserving_router` | Удалён |
+| Phantom: `clifford_dim` | Вычисляется из `clifford_p/q/r` |
+| Phantom: `text_mode` | Всегда True при text encoder |
+| Phantom: `advanced_encoder` | Не используется |
+| Phantom: `hierarchical_memory` | Не реализован |
+
+### 16.3 Phase 26 CLI флаги (gpu_train.py)
+
+```batch
+--shared_expert          # Enable DeepSeek-V3 always-on shared expert
+--aux_loss_free          # Enable Auxiliary-Loss-Free load balancing
+--aux_lr 0.001           # Bias adjustment rate для aux_loss_free
+--expert_ortho           # Enable expert orthogonalization loss
+--lambda_expert_ortho 0.02  # Weight for expert ortho loss
+```
+
+### 16.4 Auto-Tuner v26 (`scripts/auto_tune.py`)
+
+- **Optuna** с TPE sampler (seed=42, n_startup_trials=5)
+- **Study name:** `hdim_autotune_v26`
+- **Warm-start** с историческими SOTA seeds (Phase 26b и 26c configs)
+- **Фиксировано:** hidden_dim=256, num_experts=4, soft_router, pretrained_encoder, shared_expert, aux_loss_free, expert_ortho, learnable_temperature, data=v10
+- **Оптимизирует:** lr, batch_size, augment_factor, все lambda веса, focal_gamma, warmup_epochs
+
+### 16.5 Autoresearch Loop (`scripts/autoresearch_loop.py`)
+
+Автоматический исследовательский цикл:
+- **IncumbentTracker**: отслеживает лучший результат
+- **Failure taxonomy**: crash_nan, crash_oom, metric_regression
+- **Retry logic**: автоматический перезапуск при failure
+
+### 16.6 Результаты Phase 26
+
+| Run | Score | Margin | STS | Epoch | Конфигурация |
+|-----|-------|--------|-----|-------|-------------|
+| 26a | 1.1063 | — | — | ep45 | augment=3, no sts/dcl |
+| 26b | 1.1513 | — | — | ep15 | augment=5, sts=0.15, dcl=0.2, learnable_temp |
+| **26c** | **1.1542** | 0.993 | 0.537 | ep15 | augment=5, sts=0.3, uniformity=0.1 |
+
+**Новый рекорд: 1.1542** (vs предыдущий 1.1370 Phase 8e — улучшение на 1.5%)
+
+### 16.7 Phase 26 конфигурация (SOTA)
+
+```batch
+@echo off
+REM Phase 26c: DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho
+cd /d E:\hypercoplexAI
+call .venv\Scripts\activate.bat
+
+python scripts\gpu_train.py ^
+    --epochs 60 ^
+    --hidden_dim 256 ^
+    --num_experts 4 ^
+    --num_domains 4 ^
+    --pretrained_encoder ^
+    --soft_router ^
+    --shared_expert ^
+    --aux_loss_free ^
+    --expert_ortho ^
+    --learnable_temperature ^
+    --real_pairs data\real_pairs_v10.json ^
+    --augment_factor 5 ^
+    --lambda_pair 0.5 ^
+    --lambda_sts 0.3 ^
+    --lambda_iso 0.1 ^
+    --lambda_routing 0.02 ^
+    --lambda_memory 0.01 ^
+    --lambda_z 0.01 ^
+    --lambda_dcl 0.2 ^
+    --lambda_uniformity 0.1 ^
+    --lambda_expert_ortho 0.02 ^
+    --use_infonce ^
+    --focal_gamma 1.0 ^
+    --lr 0.0003 ^
+    --seed 42 ^
+    --batch_size 48 ^
+    --scheduler_type cosine_restarts ^
+    --t_mult 2 ^
+    --warmup_epochs 20 ^
+    --eval_every 5 ^
+    --save_every 25 ^
+    --output_dir artifacts\best_autotune ^
+    --device auto ^
+    --amp
+```
 ```

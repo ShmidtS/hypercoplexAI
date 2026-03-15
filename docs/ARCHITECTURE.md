@@ -1,7 +1,7 @@
 # HDIM Architecture Documentation
 
-> **Дата:** 2026-03-13  
-> **Версия:** Research Prototype  
+> **Дата:** 2026-03-15
+> **Версия:** Research Prototype (Phase 26)
 > **Источники:** Исследовательские отчёты в `[.omc/research/](../.omc/research/)`
 
 ---
@@ -43,7 +43,7 @@
 | PRIMARY score     | `pair_margin × 1.0 + STS_exported × 0.3` | Целевая метрика                   |
 
 
-**Лучший результат:** 1.1370 (Phase 8e, ep45): `pair_margin=0.906`, `STS=0.770`
+**Лучший результат:** 1.1542 (Phase 26c, ep15): `pair_margin=0.993`, `STS=0.537`
 
 ---
 
@@ -89,11 +89,13 @@
 │  │  Quaternion)    │ InvariantExtr.) │                 │                │
 │  └─────────────────┴─────────────────┴─────────────────┘                │
 │           │                                                             │
-│  ┌────────┴────────┬─────────────────┐                                  │
-│  │ soft_moe_router │  hdim_pipeline  │                                  │
-│  │ (SoftMoE)       │  (HDIMEncoder,  │                                  │
-│  │                 │   HDIMDecoder)  │                                  │
-│  └─────────────────┴─────────────────┘                                  │
+│  ┌────────┴────────┬─────────────────┬─────────────────┐                │
+│  │ soft_moe_router │domain_expert_pool│  hdim_pipeline  │               │
+│  │ (SoftMoE,       │ (4 frozen SBERT │  (HDIMEncoder,  │                │
+│  │  SharedExpert,  │  + projection)  │   HDIMDecoder)  │                │
+│  │  AuxLossFree,   │                 │                 │                │
+│  │  ExpertOrtho)   │                 │                 │                │
+│  └─────────────────┴─────────────────┴─────────────────┘                │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -124,7 +126,10 @@
 |                                                                | `InvariantExtractor`       | Извлечение U_inv = R⁻¹GR     | **Stable**   |
 |                                                                | `DomainRegistry`           | Реестр доменов               | **Stable**   |
 | `[titans_memory.py](../src/core/titans_memory.py)`             | `TitansMemoryModule`       | Test-Time Training память    | **Stable**   |
-| `[soft_moe_router.py](../src/core/soft_moe_router.py)`         | `SoftMoERouter`            | Soft Mixture-of-Experts      | **Stable**   |
+| `[soft_moe_router.py](../src/core/soft_moe_router.py)`         | `SoftMoERouter`            | Soft Mixture-of-Experts (Phase 26: SharedExpert, AuxLossFree, ExpertOrtho) | **Stable**   |
+| `[domain_expert_pool.py](../src/core/domain_expert_pool.py)`   | `DomainExpertPool`         | Пул из 4 frozen SBERT экспертов с trainable projections | **Stable**   |
+|                                                                | `SharedExpert`             | Always-on FFN (DeepSeek-V3)  | **Stable**   |
+|                                                                | `ExpertProjection`         | Trainable projection head    | **Stable**   |
 | `[hdim_pipeline.py](../src/core/hdim_pipeline.py)`             | `HDIMPipeline`             | Главный orchestrator         | **Stable**   |
 |                                                                | `HDIMEncoder`              | Кодирование → мультивектор   | **Stable**   |
 |                                                                | `HDIMDecoder`              | Мультивектор → выход         | **Stable**   |
@@ -236,12 +241,24 @@ memory.weight = (1-α) * M + momentum_S
 
 ```python
 logits = dispatch_proj(x) / temperature
+
+# Phase 26: AuxLossFree — добавить per-expert bias
+if self.use_aux_loss_free:
+    logits = logits + self._expert_bias.unsqueeze(0)
+
 dispatch = softmax(logits, dim=0)   # нормализация по токенам
 combine = softmax(logits, dim=-1)   # нормализация по слотам
 
 slot_inputs = dispatch.T @ x        # агрегация токенов в слоты
-slot_outputs = [expert(slot_input) for expert in experts]
+# Batched expert execution via stacked weights + einsum
+h = einsum('esd,ehd->esh', slot_inputs, W1_stack) + b1
+h = GELU(h)
+slot_outputs = einsum('esh,edh->esd', h, W2_stack) + b2
 output = combine @ slot_outputs     # агрегация выходов
+
+# Phase 26: Shared Expert — всегда-включённый FFN
+if self.use_shared_expert:
+    output = output + self._shared_expert(x)
 ```
 
 **Ключевое отличие от Hard MoE:**
@@ -250,7 +267,54 @@ output = combine @ slot_outputs     # агрегация выходов
 - Нет token dropping при перегрузке
 - Полностью дифференцируемый routing
 
-### 3.7 HDIMPipeline
+**Phase 26 нововведения:**
+
+| Фича | Описание | Включение |
+|------|----------|-----------|
+| Shared Expert (DeepSeek-V3) | Always-on FFN обрабатывает ВСЕ входы | `enable_shared_expert()` |
+| AuxLoss-Free Balancing (DeepSeek-V3) | Per-expert bias для динамической балансировки | `enable_aux_loss_free(lr=0.001)` |
+| Expert Orthogonalization | `L_o = \|\|W1 @ W1^T - I\|\|^2 + \|\|W2 @ W2^T - I\|\|^2` | `enable_expert_ortho()` |
+
+**Phase 26 удаления:**
+
+- `SoftRouterState` dataclass — заменён на plain dict
+- `calibration_head`, `adaptive_dropout` — не использовались
+- `similarity_preserving_loss` — заменён на AuxLossFree
+- `experts` ModuleList — заменён на batched einsum со stacked weights (`W1_stack`, `W2_stack`, `b1_stack`, `b2_stack`)
+
+### 3.7 DomainExpertPool
+
+**Файл:** `[src/core/domain_expert_pool.py:20](../src/core/domain_expert_pool.py:20)`
+
+**Назначение:** Пул из 4 frozen SBERT-энкодеров (MiniLM family) с обучаемыми projection heads.
+
+| ID | Модель | Параметры | Назначение |
+|----|--------|-----------|------------|
+| 0 | `all-MiniLM-L6-v2` | 22M frozen | General semantics |
+| 1 | `paraphrase-MiniLM-L3-v2` | 17M frozen | Paraphrase/structural similarity |
+| 2 | `multi-qa-MiniLM-L6-cos-v1` | 22M frozen | QA/domain-crossing |
+| 3 | `all-MiniLM-L12-v2` | 33M frozen | Deep semantic analysis |
+
+**Общий footprint:** ~94M frozen params + ~100K trainable per expert.
+
+**Ключевые классы:**
+
+| Класс | Назначение |
+|-------|------------|
+| `DomainExpertPool` | Управление пулом экспертов, forward, routing |
+| `DomainExpert` | Один frozen SBERT + trainable projection |
+| `ExpertProjection` | `Linear → LayerNorm → GELU → Dropout → Linear` |
+| `SharedExpert` | Always-on FFN (DeepSeek-V3 pattern) |
+
+**Ключевые методы:**
+
+| Метод | Описание |
+|-------|----------|
+| `forward_all_experts(texts, device)` | Stack всех экспертов: `(E, B, D)` |
+| `forward_with_routing(texts, weights, device)` | Weighted combination + shared expert |
+| `precompute_cache(texts)` | Предвычисление SBERT embeddings |
+
+### 3.8 HDIMPipeline
 
 **Файл:** `[src/core/hdim_pipeline.py:128](../src/core/hdim_pipeline.py:128)`
 
