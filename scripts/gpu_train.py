@@ -430,6 +430,7 @@ def run_gpu_training(
         lambda_angle=getattr(args, 'lambda_angle', 0.0),
         lambda_supcon=getattr(args, 'lambda_supcon', 0.0),
         lambda_z=getattr(args, 'lambda_z', 0.0),
+        lambda_expert_ortho=getattr(args, 'lambda_expert_ortho', 0.0),
         learnable_temperature=getattr(args, 'learnable_temperature', False),
         lambda_dcl=getattr(args, 'lambda_dcl', 0.0),
         lambda_uniformity=getattr(args, 'lambda_uniformity', 0.0),
@@ -473,6 +474,19 @@ def run_gpu_training(
         _p22_flags.append("learnable_metric")
     if _p22_flags:
         print(f"Phase 22 features: {', '.join(_p22_flags)}")
+    # Phase 26: MoE Expert features
+    _p26_flags = []
+    if getattr(args, 'shared_expert', False) and hasattr(model, 'enable_shared_expert'):
+        model.enable_shared_expert()
+        _p26_flags.append("shared_expert")
+    if getattr(args, 'aux_loss_free', False) and hasattr(model, 'enable_aux_loss_free'):
+        model.enable_aux_loss_free(aux_lr=getattr(args, 'aux_lr', 0.001))
+        _p26_flags.append("aux_loss_free")
+    if getattr(args, 'expert_ortho', False) and hasattr(model, 'enable_expert_ortho'):
+        model.enable_expert_ortho()
+        _p26_flags.append("expert_ortho")
+    if _p26_flags:
+        print(f"Phase 26 features: {', '.join(_p26_flags)}")
     # Phase 21/23: Similarity-Preserving Router
     if getattr(args, 'similarity_preserving_router', False):
         # Enable on the MoE router
@@ -841,6 +855,17 @@ def main() -> None:
     # Phase 21/23: Similarity-Preserving Router (ICLR 2026)
     parser.add_argument("--similarity_preserving_router", action="store_true", default=False,
                         help="Enable Similarity-Preserving Router loss (ICLR 2026)")
+    # Phase 26: MoE Expert features
+    parser.add_argument("--shared_expert", action="store_true", default=False,
+                        help="Enable DeepSeek-V3 always-on shared expert in SoftMoERouter")
+    parser.add_argument("--aux_loss_free", action="store_true", default=False,
+                        help="Enable Auxiliary-Loss-Free load balancing (DeepSeek-V3)")
+    parser.add_argument("--aux_lr", type=float, default=0.001,
+                        help="Bias adjustment rate for auxiliary-loss-free balancing")
+    parser.add_argument("--expert_ortho", action="store_true", default=False,
+                        help="Enable expert orthogonalization loss (arXiv:2505.22323)")
+    parser.add_argument("--lambda_expert_ortho", type=float, default=0.0,
+                        help="Weight for expert orthogonalization loss (try 0.01-0.05)")
     # Temperature scheduling
     parser.add_argument("--temp_schedule", type=str, default="none",
                         choices=["none", "warm_restart"],

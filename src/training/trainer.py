@@ -36,6 +36,7 @@ class HDIMTrainer:
         lambda_angle: float = 0.0,
         lambda_supcon: float = 0.0,
         lambda_z: float = 0.0,
+        lambda_expert_ortho: float = 0.0,
         learnable_temperature: bool = False,
         lambda_dcl: float = 0.0,
         lambda_uniformity: float = 0.0,
@@ -63,6 +64,7 @@ class HDIMTrainer:
         self.lambda_angle = lambda_angle
         self.lambda_supcon = lambda_supcon
         self.lambda_z = lambda_z
+        self.lambda_expert_ortho = lambda_expert_ortho
         self.lambda_dcl = lambda_dcl
         self.lambda_uniformity = lambda_uniformity
         self.use_sc_temperature = use_sc_temperature
@@ -1086,6 +1088,11 @@ class HDIMTrainer:
         if matryoshka_embs is not None and isinstance(matryoshka_embs, dict):
             loss_matryoshka = self._compute_matryoshka_loss(matryoshka_embs, batch)
         
+        # Phase 26: Expert orthogonalization loss
+        loss_expert_ortho = self._zero_loss(loss_recon)
+        if self.lambda_expert_ortho > 0 and hasattr(self.model, 'compute_expert_ortho_loss'):
+            loss_expert_ortho = self.model.compute_expert_ortho_loss()
+
         loss_total = (
             loss_recon
             + self.lambda_iso * loss_iso
@@ -1096,6 +1103,7 @@ class HDIMTrainer:
             + self.lambda_z * loss_z
             + loss_diversity
             + loss_matryoshka
+            + self.lambda_expert_ortho * loss_expert_ortho
         )
         batch_losses = {
             "loss_total": loss_total,
@@ -1106,6 +1114,7 @@ class HDIMTrainer:
             "loss_memory": loss_memory,
             "loss_diversity": loss_diversity,
             "loss_matryoshka": loss_matryoshka,
+            "loss_expert_ortho": loss_expert_ortho,
             "routing_weights": routing_weights,
             "invariant": invariant,
             "raw_invariant": aux_state.raw_invariant,

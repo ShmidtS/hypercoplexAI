@@ -50,6 +50,12 @@ class SoftMoERouter(nn.Module):
     3. Нет load imbalance — все эксперты получают примерно равную нагрузку
     4. Совместим с R3-идеей через EMA train_scores
 
+    Phase 26 нововведения:
+    - Shared Expert (DeepSeek-V3): всегда-включённый FFN обрабатывает ВСЕ входы
+    - Auxiliary-Loss-Free Balancing (DeepSeek-V3): bias-based балансировка вместо loss
+    - Expert Orthogonalization: эксперты учатся разным представлениям
+    - Sigmoid Gating: опциональная замена softmax на per-expert sigmoid
+
     Args:
         input_dim: размерность входа
         num_experts: количество экспертов
@@ -125,6 +131,25 @@ class SoftMoERouter(nn.Module):
             torch.ones(num_experts) / num_experts,
         )
 
+        # Phase 26: Shared Expert (DeepSeek-V3)
+        self.use_shared_expert = False
+        self._shared_expert = nn.Sequential(
+            nn.Linear(input_dim, expert_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(expert_dim, input_dim),
+        )
+
+        # Phase 26: Auxiliary-Loss-Free Balancing (DeepSeek-V3)
+        # Per-expert bias terms that dynamically adjust routing
+        self.use_aux_loss_free = False
+        self._expert_bias = nn.Parameter(torch.zeros(num_experts))
+        self._aux_lr = 0.001  # bias adjustment rate
+        self.register_buffer("_target_load", torch.ones(num_experts) / num_experts)
+
+        # Phase 26: Expert Orthogonalization loss flag
+        self.use_expert_ortho = False
+
     def _compute_dispatch_combine(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -137,6 +162,12 @@ class SoftMoERouter(nn.Module):
         """
         # logits: (T, num_slots)
         logits = self.dispatch_proj(x) / self.temperature
+
+        # Phase 26: Auxiliary-Loss-Free balancing — add per-expert bias
+        if self.use_aux_loss_free:
+            bias = self._expert_bias  # (num_experts,)
+            bias_expanded = bias.repeat_interleave(self.slots_per_expert)  # (num_slots,)
+            logits = logits + bias_expanded.unsqueeze(0)  # broadcast over batch
 
         # Test-time calibration offset (R2-T2, ICML 2025)
         if self.use_calibration:
@@ -205,6 +236,11 @@ class SoftMoERouter(nn.Module):
 
         output = combine @ slot_outputs  # (T, D)
 
+        # Phase 26: Shared Expert (DeepSeek-V3) — always-on FFN
+        if self.use_shared_expert:
+            shared_out = self._shared_expert(x_flat)
+            output = output + shared_out
+
         # Compute expert_weights once from combine
         if dispatch_reshaped is not None:
             # Reuse dispatch_reshaped for combine reshaping
@@ -218,6 +254,11 @@ class SoftMoERouter(nn.Module):
             with torch.no_grad():
                 expert_load = combine_reshaped.sum(-1).mean(0)  # (num_experts,)
                 self.train_scores.mul_(0.9).add_(0.1 * expert_load)
+
+                # Phase 26: Auxiliary-Loss-Free bias update (DeepSeek-V3)
+                if self.use_aux_loss_free:
+                    delta = torch.sign(expert_load - self._target_load)
+                    self._expert_bias.data -= self._aux_lr * delta
 
         # Router loss: entropy regularization
         if self.use_similarity_balance:
@@ -304,3 +345,41 @@ class SoftMoERouter(nn.Module):
         adaptive_p = adaptive_p.clamp(0.05, 0.3)
         mask = torch.bernoulli(1.0 - adaptive_p)
         return mask
+
+    def expert_orthogonalization_loss(self) -> torch.Tensor:
+        """Phase 26: Expert Orthogonalization loss (arXiv:2505.22323).
+
+        Penalizes expert weight matrices for being too similar.
+        L_o = ||W1 @ W1^T - I||^2 + ||W2 @ W2^T - I||^2
+
+        Encourages experts to learn truly orthogonal representations.
+        """
+        # W1_stack: (E, expert_dim, input_dim)
+        # W2_stack: (E, input_dim, expert_dim)
+        E = self.num_experts
+        device = self.W1_stack.device
+        I = torch.eye(E, device=device)
+
+        # Normalize each expert's weight vector
+        w1_norm = F.normalize(self.W1_stack.reshape(E, -1), dim=-1)  # (E, D1)
+        gram1 = w1_norm @ w1_norm.T  # (E, E)
+        loss1 = ((gram1 - I) ** 2).mean()
+
+        w2_norm = F.normalize(self.W2_stack.reshape(E, -1), dim=-1)  # (E, D2)
+        gram2 = w2_norm @ w2_norm.T  # (E, E)
+        loss2 = ((gram2 - I) ** 2).mean()
+
+        return (loss1 + loss2) * 0.5
+
+    def enable_shared_expert(self) -> None:
+        """Enable DeepSeek-V3 always-on shared expert."""
+        self.use_shared_expert = True
+
+    def enable_aux_loss_free(self, aux_lr: float = 0.001) -> None:
+        """Enable Auxiliary-Loss-Free balancing (DeepSeek-V3)."""
+        self.use_aux_loss_free = True
+        self._aux_lr = aux_lr
+
+    def enable_expert_ortho(self) -> None:
+        """Enable expert orthogonalization loss."""
+        self.use_expert_ortho = True

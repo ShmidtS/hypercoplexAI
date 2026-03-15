@@ -273,6 +273,18 @@ class TextHDIMModel(nn.Module):
     def enable_learnable_metric(self) -> None:
         self.core_model.enable_learnable_metric()
 
+    def enable_shared_expert(self) -> None:
+        self.core_model.enable_shared_expert()
+
+    def enable_aux_loss_free(self, aux_lr: float = 0.001) -> None:
+        self.core_model.enable_aux_loss_free(aux_lr=aux_lr)
+
+    def enable_expert_ortho(self) -> None:
+        self.core_model.enable_expert_ortho()
+
+    def compute_expert_ortho_loss(self) -> "torch.Tensor":
+        return self.core_model.compute_expert_ortho_loss()
+
     def encode_texts(
         self,
         texts: Sequence[str],

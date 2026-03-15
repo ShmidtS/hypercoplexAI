@@ -612,6 +612,25 @@ class HDIMModel(nn.Module):
         """Enable learnable per-blade metric scaling in Clifford algebra (CliffordNet, 2026)."""
         self.pipeline.clifford.use_learnable_metric = True
 
+    # ── Phase 26: MoE-Expert features ──────────────────────────────────
+    def enable_shared_expert(self) -> None:
+        """Enable DeepSeek-V3 always-on shared expert in SoftMoERouter."""
+        self.pipeline.moe.enable_shared_expert()
+
+    def enable_aux_loss_free(self, aux_lr: float = 0.001) -> None:
+        """Enable Auxiliary-Loss-Free load balancing (DeepSeek-V3)."""
+        self.pipeline.moe.enable_aux_loss_free(aux_lr=aux_lr)
+
+    def enable_expert_ortho(self) -> None:
+        """Enable expert orthogonalization loss (arXiv:2505.22323)."""
+        self.pipeline.moe.enable_expert_ortho()
+
+    def compute_expert_ortho_loss(self) -> "torch.Tensor":
+        """Compute expert orthogonalization loss if enabled."""
+        if self.pipeline.moe.use_expert_ortho:
+            return self.pipeline.moe.expert_orthogonalization_loss()
+        return torch.zeros((), device=next(self.parameters()).device)
+
     def reset_memory(self, strategy: str = "geometric") -> None:
         """Reset stateful HDIM memory and router replay state.
 
