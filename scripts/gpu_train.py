@@ -843,6 +843,9 @@ def main() -> None:
                         help="Enable expert orthogonalization loss (arXiv:2505.22323)")
     parser.add_argument("--lambda_expert_ortho", type=float, default=0.0,
                         help="Weight for expert orthogonalization loss (try 0.01-0.05)")
+    parser.add_argument("--memory_type", type=str, default="titans",
+                        choices=["titans", "hippocampus", "neocortex", "cls"],
+                        help="Memory module type (default: titans)")
     # Temperature scheduling
     parser.add_argument("--temp_schedule", type=str, default="none",
                         choices=["none", "warm_restart"],
