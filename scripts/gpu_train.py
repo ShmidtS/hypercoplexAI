@@ -461,12 +461,6 @@ def run_gpu_training(
     if getattr(args, 'adaptive_forgetting', False) and hasattr(model, 'enable_adaptive_forgetting'):
         model.enable_adaptive_forgetting()
         _p22_flags.append("adaptive_forgetting")
-    if getattr(args, 'router_calibration', False) and hasattr(model, 'enable_router_calibration'):
-        model.enable_router_calibration()
-        _p22_flags.append("router_calibration")
-    if getattr(args, 'adaptive_expert_dropout', False) and hasattr(model, 'enable_adaptive_expert_dropout'):
-        model.enable_adaptive_expert_dropout()
-        _p22_flags.append("adaptive_expert_dropout")
     if getattr(args, 'learnable_metric', False) and hasattr(model, 'enable_learnable_metric'):
         model.enable_learnable_metric()
         _p22_flags.append("learnable_metric")
@@ -843,11 +837,6 @@ def main() -> None:
                         help="Use gradient-based surprise metric in Titans memory (Titans 2025)")
     parser.add_argument("--adaptive_forgetting", action="store_true", default=False,
                         help="Adaptive forgetting based on surprise (high surprise = less forgetting)")
-    # Phase 22: Test-time router calibration (R2-T2, ICML 2025)
-    parser.add_argument("--router_calibration", action="store_true", default=False,
-                        help="Enable R2-T2 test-time router calibration head")
-    parser.add_argument("--adaptive_expert_dropout", action="store_true", default=False,
-                        help="Adaptive expert dropout based on usage statistics")
     # Phase 22: Learnable Clifford metric (CliffordNet, 2026)
     parser.add_argument("--learnable_metric", action="store_true", default=False,
                         help="Learnable per-blade metric scaling in Clifford algebra")

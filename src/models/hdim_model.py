@@ -600,14 +600,6 @@ class HDIMModel(nn.Module):
         """Enable adaptive forgetting based on surprise (high surprise = less forgetting)."""
         self.pipeline.memory.use_adaptive_forgetting = True
 
-    def enable_router_calibration(self) -> None:
-        """No-op: router calibration was removed (Phase 26 refactor)."""
-        pass
-
-    def enable_adaptive_expert_dropout(self) -> None:
-        """No-op: adaptive expert dropout was removed (Phase 26 refactor)."""
-        pass
-
     def enable_learnable_metric(self) -> None:
         """Enable learnable per-blade metric scaling in Clifford algebra (CliffordNet, 2026)."""
         self.pipeline.clifford.use_learnable_metric = True

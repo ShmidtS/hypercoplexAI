@@ -264,12 +264,6 @@ class TextHDIMModel(nn.Module):
     def enable_adaptive_forgetting(self) -> None:
         self.core_model.enable_adaptive_forgetting()
 
-    def enable_router_calibration(self) -> None:
-        self.core_model.enable_router_calibration()
-
-    def enable_adaptive_expert_dropout(self) -> None:
-        self.core_model.enable_adaptive_expert_dropout()
-
     def enable_learnable_metric(self) -> None:
         self.core_model.enable_learnable_metric()
 
