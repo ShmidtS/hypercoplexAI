@@ -21,7 +21,7 @@ from .hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from .domain_operators import DomainRotationOperator, InvariantExtractor, sandwich_transfer
 from .titans_memory import MemoryState, TitansMemoryModule
 from .soft_moe_router import SoftMoERouter
-from .cls_memory import CLSMemory
+from .cls_memory import CLSMemory, HBMAMemory
 
 
 @dataclass
@@ -182,6 +182,8 @@ class HDIMPipeline(nn.Module):
                 nn.ReLU(),
                 nn.Linear(clifford_dim // 4, 1),
             )
+        elif memory_type == 'hbma':
+            self.memory = HBMAMemory(hidden_dim=clifford_dim)
         else:
             # hippocampus, neocortex, or cls
             self.memory = CLSMemory(hidden_dim=clifford_dim)
