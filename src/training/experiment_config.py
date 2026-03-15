@@ -68,8 +68,6 @@ class ExperimentConfig:
     # ------------------------------------------------------------------ #
     # Phase-2 optional advanced components                                #
     # ------------------------------------------------------------------ #
-    advanced_encoder: bool = False
-    hierarchical_memory: bool = False
     soft_router: bool = False
     modernbert_encoder: bool = False
 

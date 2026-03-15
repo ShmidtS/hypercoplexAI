@@ -40,9 +40,6 @@ GRID_SEARCH_SPACE = {
     "num_experts": [4, 8],
     "lambda_iso": [0.05, 0.1, 0.2],
     "lambda_pair": [0.1, 0.2, 0.3],
-    "advanced_encoder": [False, True],
-    "hierarchical_memory": [False, True],
-    "soft_router": [False, True],
 }
 
 RANDOM_SEARCH_RANGES = {
@@ -53,9 +50,6 @@ RANDOM_SEARCH_RANGES = {
     "lambda_routing": (0.005, 0.05),
     "lambda_memory": (0.005, 0.03),
     "ranking_margin": (0.1, 0.6),
-    "advanced_encoder": [False, True],
-    "hierarchical_memory": [False, True],
-    "soft_router": [False, True],
 }
 
 
@@ -254,7 +248,7 @@ def generate_refinement_configs(best_config: dict, n: int = 5, seed: int = 123) 
             if key in cfg and isinstance(cfg[key], float):
                 delta = cfg[key] * 0.25
                 cfg[key] = round(max(0.005, cfg[key] + rng.uniform(-delta, delta)), 4)
-        for key in ["advanced_encoder", "hierarchical_memory", "soft_router"]:
+        for key in ["soft_router"]:
             if key in cfg and rng.random() < 0.2:
                 cfg[key] = not cfg[key]
         configs.append(cfg)
@@ -292,7 +286,7 @@ class HDIMAutoResearchLoop:
             "--eval_every", "5",
             "--save_every", str(max(1, self.epochs)),
             "--use_pairs",
-            "--text_mode",
+            "--soft_router",
             "--hidden_dim", str(cfg.get("hidden_dim", 128)),
             "--num_experts", str(cfg.get("num_experts", 4)),
             "--lambda_iso", str(cfg.get("lambda_iso", 0.1)),
@@ -302,10 +296,6 @@ class HDIMAutoResearchLoop:
             "--ranking_margin", str(cfg.get("ranking_margin", 0.3)),
             "--negative_ratio", "0.4",
         ]
-        if cfg.get("advanced_encoder"):
-            cmd.append("--advanced_encoder")
-        if cfg.get("hierarchical_memory"):
-            cmd.append("--hierarchical_memory")
         if cfg.get("soft_router"):
             cmd.append("--soft_router")
         return cmd

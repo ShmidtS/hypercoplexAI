@@ -13,7 +13,7 @@ HDIM GPU Training Script с AMP, gradient checkpointing и live monitoring.
   - Использует model_factory как единственный источник сборки моделей
 
 Запуск:
-  python scripts/gpu_train.py --epochs 50 --device cuda --use_pairs --text_mode --soft_router
+  python scripts/gpu_train.py --pretrained_encoder --soft_router --use_pairs --amp --real_pairs data/real_pairs_v10.json --epochs 60 --device cuda
   python scripts/gpu_train.py --config path/to/config.json
 """
 
@@ -157,13 +157,12 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             print("  + SoftMoERouter")
         return model
 
-    if args.text_mode or args.soft_router:
+    if args.soft_router:
         model = build_text_hdim_model(
             cfg,
-            soft_router=args.soft_router,
+            soft_router=True,
         )
-        if args.soft_router:
-            print("Components: SoftMoERouter")
+        print("Components: SimpleTextEncoder + SoftMoERouter")
         return model
     return build_hdim_model(cfg)
 
@@ -407,7 +406,6 @@ def run_gpu_training(
         betas=(0.9, 0.999),
     )
 
-    total_steps = args.epochs * max(1, getattr(args, 'num_samples', 500) // args.batch_size)
     use_amp = (device.type == "cuda") and args.amp
     scaler = GradScaler("cuda") if use_amp else None
     if use_amp:
@@ -756,7 +754,12 @@ def main() -> None:
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_experts", type=int, default=4)
     parser.add_argument("--num_domains", type=int, default=4)
-    parser.add_argument("--clifford_dim", type=int, default=None)
+    parser.add_argument("--clifford_p", type=int, default=4,
+                        help="Clifford algebra positive bases (default=4, Cl(4,1,0) dim=32)")
+    parser.add_argument("--clifford_q", type=int, default=1,
+                        help="Clifford algebra negative bases (default=1)")
+    parser.add_argument("--clifford_r", type=int, default=0,
+                        help="Clifford algebra nilpotent bases (default=0)")
     # Loss weights
     parser.add_argument("--lambda_iso", type=float, default=0.1)
     parser.add_argument("--lambda_pair", type=float, default=0.1)
@@ -772,7 +775,6 @@ def main() -> None:
     # Dataset
     parser.add_argument("--num_samples", type=int, default=500)
     parser.add_argument("--use_pairs", action="store_true")
-    parser.add_argument("--text_mode", action="store_true")
     parser.add_argument("--negative_ratio", type=float, default=0.3)
     parser.add_argument("--train_fraction", type=float, default=0.8)
     # Advanced components
@@ -901,7 +903,12 @@ def main() -> None:
         num_experts=args.num_experts,
         num_domains=args.num_domains,
         dropout=_dropout_override if _dropout_override is not None else 0.1,
+        clifford_p=args.clifford_p,
+        clifford_q=args.clifford_q,
+        clifford_r=args.clifford_r,
     )
+    clifford_dim = 2 ** (args.clifford_p + args.clifford_q + args.clifford_r)
+    print(f"Clifford algebra: Cl({args.clifford_p},{args.clifford_q},{args.clifford_r}) dim={clifford_dim}")
     if _dropout_override is not None:
         print(f"Override dropout: {_dropout_override}")
 
