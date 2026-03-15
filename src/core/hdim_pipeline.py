@@ -21,6 +21,7 @@ from .hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from .domain_operators import DomainRotationOperator, InvariantExtractor, sandwich_transfer
 from .titans_memory import MemoryState, TitansMemoryModule
 from .soft_moe_router import SoftMoERouter
+from .cls_memory import CLSMemory
 
 
 @dataclass
@@ -142,6 +143,7 @@ class HDIMPipeline(nn.Module):
         num_experts: int = 4,
         top_k: int = 2,
         memory_key_dim: int = 32,
+        memory_type: str = 'titans',
     ):
         super().__init__()
 
@@ -152,6 +154,7 @@ class HDIMPipeline(nn.Module):
         clifford_dim = self.algebra.dim
         self.clifford_dim = clifford_dim
 
+        self.memory_type = memory_type
         self.encoder = HDIMEncoder(input_dim, clifford_dim)
         self.decoder = HDIMDecoder(clifford_dim, output_dim)
         self.domain_rotors = nn.ModuleDict({
@@ -159,25 +162,29 @@ class HDIMPipeline(nn.Module):
             for name in domain_names
         })
         self.invariant_extractor = InvariantExtractor(self.algebra)
-        # LayerNorm после инварианта — критично для стабильности geometric_product цепочки
+        self.invariant_extractor = InvariantExtractor(self.algebra)
         self.invariant_norm = nn.LayerNorm(clifford_dim)
-        self.memory = TitansMemoryModule(
-            key_dim=memory_key_dim,
-            val_dim=clifford_dim,
-            hidden_dim=memory_key_dim * 2,
-        )
-        self.memory_key_proj = nn.Linear(clifford_dim, memory_key_dim)
         self.moe = SoftMoERouter(
             input_dim=clifford_dim,
             num_experts=num_experts,
             expert_dim=clifford_dim * 2,
             top_k=top_k,
         )
-        self.memory_gate = nn.Sequential(
-            nn.Linear(clifford_dim, clifford_dim // 4),
-            nn.ReLU(),
-            nn.Linear(clifford_dim // 4, 1),
-        )
+        if memory_type == 'titans':
+            self.memory = TitansMemoryModule(
+                key_dim=memory_key_dim,
+                val_dim=clifford_dim,
+                hidden_dim=memory_key_dim * 2,
+            )
+            self.memory_key_proj = nn.Linear(clifford_dim, memory_key_dim)
+            self.memory_gate = nn.Sequential(
+                nn.Linear(clifford_dim, clifford_dim // 4),
+                nn.ReLU(),
+                nn.Linear(clifford_dim // 4, 1),
+            )
+        else:
+            # hippocampus, neocortex, or cls
+            self.memory = CLSMemory(hidden_dim=clifford_dim)
         self._use_gradient_checkpointing = False
 
     def enable_gradient_checkpointing(self) -> None:
@@ -218,6 +225,17 @@ class HDIMPipeline(nn.Module):
                 updated=False,
             )
             return u_inv, empty_state
+
+        if self.memory_type != 'titans':
+            # CLS branch: hippocampus / neocortex / cls
+            mem_out = self.memory(u_inv)
+            mem_loss = self.memory.memory_loss()
+            cls_state = MemoryState(
+                retrieved=mem_out - u_inv,
+                loss=mem_loss,
+                updated=True,
+            )
+            return mem_out, cls_state
 
         mem_key = self.memory_key_proj(u_inv)
         memory_state = self.memory.retrieve_and_update(
@@ -335,8 +353,11 @@ class HDIMPipeline(nn.Module):
         self.domain_names.remove(domain_name)
 
     def reset_memory(self, strategy: str = 'geometric') -> None:
-        """Сбрасывает stateful память. strategy передаётся в TitansMemoryModule."""
-        self.memory.reset_memory(strategy=strategy)
+        """Сбрасывает stateful память."""
+        if self.memory_type == 'titans':
+            self.memory.reset_memory(strategy=strategy)
+        else:
+            self.memory.reset()
 
     def compute_isomorphism_loss(
         self,
@@ -345,7 +366,7 @@ class HDIMPipeline(nn.Module):
         """
         Потеря изоморфизма L_iso.
         """
-        total_loss = torch.tensor(0.0, device=self.memory_key_proj.weight.device)
+        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
         for x, domain_a, domain_b in domain_pairs:
             _, u_a = self.encode_domain(x, domain_a)
             _, u_b = self.encode_domain(x, domain_b)

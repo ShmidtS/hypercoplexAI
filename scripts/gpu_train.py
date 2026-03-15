@@ -881,6 +881,7 @@ def main() -> None:
         clifford_p=args.clifford_p,
         clifford_q=args.clifford_q,
         clifford_r=args.clifford_r,
+        memory_type=getattr(args, 'memory_type', 'titans'),
     )
     clifford_dim = 2 ** (args.clifford_p + args.clifford_q + args.clifford_r)
     print(f"Clifford algebra: Cl({args.clifford_p},{args.clifford_q},{args.clifford_r}) dim={clifford_dim}")

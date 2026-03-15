@@ -13,11 +13,13 @@ from .domain_operators import (
     sandwich_transfer,
 )
 from .titans_memory import TitansMemoryModule
+from .cls_memory import HippocampusMemory, NeocortexMemory, CLSMemory
 from .hdim_pipeline import HDIMPipeline, HDIMEncoder, HDIMDecoder
 
 __all__ = [
     'CliffordAlgebra', 'QuaternionLinear', 'QLayerNorm',
     'DomainRotationOperator', 'InvariantExtractor', 'DomainRegistry', 'sandwich_transfer',
     'TitansMemoryModule',
+    'HippocampusMemory', 'NeocortexMemory', 'CLSMemory',
     'HDIMPipeline', 'HDIMEncoder', 'HDIMDecoder',
 ]
