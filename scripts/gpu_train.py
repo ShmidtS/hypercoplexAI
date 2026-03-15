@@ -479,17 +479,6 @@ def run_gpu_training(
         _p26_flags.append("expert_ortho")
     if _p26_flags:
         print(f"Phase 26 features: {', '.join(_p26_flags)}")
-    # Phase 21/23: Similarity-Preserving Router
-    if getattr(args, 'similarity_preserving_router', False):
-        # Enable on the MoE router
-        moe = getattr(model, 'pipeline', None)
-        if moe is not None:
-            moe = getattr(moe, 'moe', None)
-        if moe is not None and hasattr(moe, 'use_similarity_balance'):
-            moe.use_similarity_balance = True
-            print("Similarity-Preserving Router: ENABLED (ICLR 2026)")
-        else:
-            print("WARNING: similarity_preserving_router flag set but MoE router not found or missing attribute")
     # Add learnable temperature to optimizer (must be before scheduler)
     if getattr(args, 'learnable_temperature', False) and trainer._log_temp is not None:
         optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * 0.1})
@@ -843,9 +832,6 @@ def main() -> None:
     # Phase 22: SC-InfoNCE cluster temperature (Cheng et al., Nov 2025)
     parser.add_argument("--sc_temperature", action="store_true", default=False,
                         help="SC-InfoNCE cluster-aware temperature scaling")
-    # Phase 21/23: Similarity-Preserving Router (ICLR 2026)
-    parser.add_argument("--similarity_preserving_router", action="store_true", default=False,
-                        help="Enable Similarity-Preserving Router loss (ICLR 2026)")
     # Phase 26: MoE Expert features
     parser.add_argument("--shared_expert", action="store_true", default=False,
                         help="Enable DeepSeek-V3 always-on shared expert in SoftMoERouter")
