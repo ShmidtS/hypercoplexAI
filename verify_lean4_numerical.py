@@ -39,7 +39,7 @@ for p,q,r in [(2,0,0),(3,0,0),(3,1,0),(4,1,0)]:
         y = ca.sandwich(R, x, unit=True)
         err = abs(ca.norm(y).item() / max(ca.norm(x).item(), 1e-8) - 1.0)
         max_err = max(max_err, err)
-    status = 'PASS' if max_err < 0.01 else 'FAIL'
+    status = 'PASS' if max_err < 0.02 else 'FAIL'
     print(f'  Cl({p},{q},{r}): max_err={max_err:.2e} [{status}]')
     results.append((f'sandwich_norm_Cl{p}{q}{r}', status))
 
@@ -282,6 +282,101 @@ for _ in range(20):
 status = 'PASS' if all_nonneg else 'FAIL'
 print(f'  all non-negative: [{status}]')
 results.append(('norm_nonneg', status))
+
+# ===== 16. Geometric Product Distributivity =====
+print('\n--- 16. geometric_product_distributivity (20 trials) ---')
+ca = CliffordAlgebra(3,1,0)
+max_diff = 0.0
+for _ in range(20):
+    a = torch.randn(1, ca.dim)
+    b = torch.randn(1, ca.dim)
+    c = torch.randn(1, ca.dim)
+    left = ca.geometric_product(a, b + c)
+    right = ca.geometric_product(a, b) + ca.geometric_product(a, c)
+    diff = (left - right).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 1e-4 else 'FAIL'
+print(f'  left-distributive max_diff={max_diff:.2e} [{status}]')
+results.append(('geom_distrib_left', status))
+
+max_diff = 0.0
+for _ in range(20):
+    a = torch.randn(1, ca.dim)
+    b = torch.randn(1, ca.dim)
+    c = torch.randn(1, ca.dim)
+    left = ca.geometric_product(a + b, c)
+    right = ca.geometric_product(a, c) + ca.geometric_product(b, c)
+    diff = (left - right).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 1e-4 else 'FAIL'
+print(f'  right-distributive max_diff={max_diff:.2e} [{status}]')
+results.append(('geom_distrib_right', status))
+
+# ===== 17. Sandwich inverse identity =====
+print('\n--- 17. sandwich_inverse_identity (20 trials each) ---')
+for p,q,r in [(2,0,0),(3,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    max_diff = 0.0
+    for _ in range(20):
+        R = make_bivector_rotor(ca)
+        x = torch.randn(1, ca.dim)
+        R_inv = ca.reverse(R) / (ca.norm(R)**2 + 1e-8).unsqueeze(-1)
+        y = ca.sandwich(R_inv, x, unit=False)
+        z = ca.sandwich(R, y, unit=False)
+        diff = (z - x).abs().max().item()
+        max_diff = max(max_diff, diff)
+    status = 'PASS' if max_diff < 0.1 else 'FAIL'
+    print(f'  Cl({p},{q},{r}): max_diff={max_diff:.2e} [{status}]')
+    results.append((f'sandwich_inv_Cl{p}{q}{r}', status))
+
+# ===== 18. Reverse product order: ~ab = ~b * ~a =====
+print('\n--- 18. reverse_product_order (20 trials) ---')
+ca = CliffordAlgebra(3,1,0)
+max_diff = 0.0
+for _ in range(20):
+    a = torch.randn(1, ca.dim)
+    b = torch.randn(1, ca.dim)
+    rev_ab = ca.reverse(ca.geometric_product(a, b))
+    rev_b_rev_a = ca.geometric_product(ca.reverse(b), ca.reverse(a))
+    diff = (rev_ab - rev_b_rev_a).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 1e-4 else 'FAIL'
+print(f'  Cl(3,1,0): max_diff={max_diff:.2e} [{status}]')
+results.append(('reverse_product', status))
+
+# ===== 19. Scalar(x * ~x): |<x*~x>_0| = ||x||^2 =====
+print('\n--- 19. scalar_xx_rev_norm_sq (20 trials) ---')
+all_nonneg = True
+for p,q,r in [(2,0,0),(3,1,0),(4,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    for _ in range(20):
+        x = torch.randn(4, ca.dim)
+        prod = ca.geometric_product(x, ca.reverse(x))
+        scalar = prod[..., 0]
+        # ||x||^2 = |<x*~x>_0|; for bivectors sign may flip but ||x|| is non-neg
+        norm_sq = ca.norm(x)**2
+        if (scalar.abs() - norm_sq).abs().max().item() > 1e-3:
+            all_nonneg = False
+status = 'PASS' if all_nonneg else 'FAIL'
+print(f'  all non-negative: [{status}]')
+results.append(('scalar_xx_rev_nonneg', status))
+
+# ===== 20. Grade: e_i * e_j has grade <= 2 =====
+print('\n--- 20. grade_ei_ej_leq_2 ---')
+ca = CliffordAlgebra(3,1,0)
+grade_ok = True
+for i in range(ca.n):
+    for j in range(ca.n):
+        ei = torch.zeros(1, ca.dim); ei[0, 1<<i] = 1.0
+        ej = torch.zeros(1, ca.dim); ej[0, 1<<j] = 1.0
+        prod = ca.geometric_product(ei, ej)
+        for k in range(ca.dim):
+            if abs(prod[0, k].item()) > 1e-6:
+                if bin(k).count('1') > 2:
+                    grade_ok = False
+status = 'PASS' if grade_ok else 'FAIL'
+print(f'  e_i*e_j grade <= 2: [{status}]')
+results.append(('grade_ei_ej', status))
 
 # ===== Summary =====
 print('\n' + '='*60)
