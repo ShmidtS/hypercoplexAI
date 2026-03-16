@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from src.models.hdim_model import HDIMAuxState, HDIMModel
+from src.training.augmentations import EmbeddingAugmenter
 @dataclass(frozen=True)
 class TrainingRegime:
     mode: Literal["reconstruction", "paired"]
@@ -50,6 +51,9 @@ class HDIMTrainer:
         tau_min: float = 0.01,
         temp_schedule_T_0: int = 20,
         focal_gamma: float = 1.0,
+        # Embedding augmentation
+        aug_noise_std: float = 0.0,
+        aug_mixup_alpha: float = 0.0,
     ) -> None:
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -108,6 +112,12 @@ class HDIMTrainer:
             self.model.register_parameter('_log_temp', self._log_temp)
         else:
             self._log_temp = None
+        # Embedding augmenter (training only, no-op in eval)
+        self._augmenter = EmbeddingAugmenter(
+            noise_std=aug_noise_std,
+            dropout_p=0.0,
+            mixup_alpha=aug_mixup_alpha,
+        ) if (aug_noise_std > 0 or aug_mixup_alpha > 0) else None
     def _resolve_training_regime(self, batch: Dict[str, Any]) -> TrainingRegime:
         is_pair_batch = self._has_pairs(batch)
         return TrainingRegime(
@@ -1016,6 +1026,9 @@ class HDIMTrainer:
                 _prl = batch.get("pair_relation_label")
                 _src_enc, _src_scales = self._encode_texts(texts, collect_matryoshka=True)
                 _tgt_enc, _tgt_scales = self._encode_texts(pair_texts, collect_matryoshka=True)
+                # Apply embedding augmentation to pair (non-anchor) side
+                if self._augmenter is not None:
+                    _tgt_enc = self._augmenter(_tgt_enc, pairs_only=False)
                 if _src_scales is not None and _tgt_scales is not None:
                     batch["matryoshka_source"] = _src_scales
                     batch["matryoshka_target"] = _tgt_scales
@@ -1035,6 +1048,9 @@ class HDIMTrainer:
             encoding = batch["encoding"].to(self.device)
             if regime.mode == "paired":
                 pair_encoding = batch["pair_encoding"].to(self.device)
+                # Apply embedding augmentation to pair (non-anchor) side
+                if self._augmenter is not None:
+                    pair_encoding = self._augmenter(pair_encoding, pairs_only=False)
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
                 output, routing_weights, invariant, aux_state = self.model.transfer_pairs(
                     encoding,

@@ -435,6 +435,8 @@ def run_gpu_training(
         lambda_diversity_var=getattr(args, 'lambda_diversity_var', 0.01),
         lambda_diversity_ortho=getattr(args, 'lambda_diversity_ortho', 0.005),
         lambda_matryoshka=getattr(args, 'lambda_matryoshka', 0.1),
+        aug_noise_std=getattr(args, 'aug_noise_std', 0.0),
+        aug_mixup_alpha=getattr(args, 'aug_mixup_alpha', 0.0),
     )
     # Focal-InfoNCE
     _focal_gamma = getattr(args, 'focal_gamma', 1.0)
