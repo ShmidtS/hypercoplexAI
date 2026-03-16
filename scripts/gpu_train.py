@@ -127,6 +127,7 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             use_cls_pooling=getattr(args, 'modernbert_use_cls_pooling', True),
             max_length=getattr(args, 'modernbert_max_length', 512),
             matryoshka_dims=matryoshka_dims,
+            z_loss_weight=getattr(args, 'lambda_z', 0.0),
         )
         print("Components: ModernBERT(answerdotai/ModernBERT-base) + Linear Projection")
         if matryoshka_dims:
