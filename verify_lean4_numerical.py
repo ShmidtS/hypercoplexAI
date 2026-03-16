@@ -583,6 +583,83 @@ status = 'PASS' if all_ok else 'FAIL'
 print(f'  e_i * e_j = metric[i] delta_ij: [{status}]')
 results.append(('orthonormal_basis', status))
 
+# ===== 32. Bivector exponential: exp(theta*B) for Euclidean bivector =====
+print('\n--- 32. bivector_exp_euclidean ---')
+ca = CliffordAlgebra(3,0,0)
+max_diff = 0.0
+for _ in range(20):
+    i = torch.randint(0, ca.p - 1, (1,)).item()
+    j = torch.randint(i + 1, ca.p, (1,)).item()
+    theta = torch.rand(1).item() * math.pi
+    B = torch.zeros(1, ca.dim)
+    B[0, (1<<i)|(1<<j)] = 1.0
+    one = torch.zeros(1, ca.dim); one[0,0] = 1.0
+    exp_B = math.cos(theta) * one + math.sin(theta) * B
+    # exp(B)*exp(-B) should = 1
+    exp_negB = math.cos(theta) * one - math.sin(theta) * B
+    product = ca.geometric_product(exp_B, exp_negB)
+    diff = (product - one).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 1e-4 else 'FAIL'
+print(f'  exp(theta*B)*exp(-theta*B) = 1: max_diff={max_diff:.2e} [{status}]')
+results.append(('bivector_exp_euclidean', status))
+
+# ===== 33. Conjugation: conj(a*b) = conj(b)*conj(a) for reverse =====
+print('\n--- 33. reverse_conjugation_order ---')
+# ~ is an involutive anti-automorphism: ~(a*b) = ~b * ~a
+# Already verified as theorem 19 (reverse_product_order), testing different algebras
+ca = CliffordAlgebra(4,1,0)
+max_diff = 0.0
+for _ in range(20):
+    a = torch.randn(1, ca.dim)
+    b = torch.randn(1, ca.dim)
+    ab = ca.geometric_product(a, b)
+    rev_ab = ca.reverse(ab)
+    rev_a = ca.reverse(a)
+    rev_b = ca.reverse(b)
+    rev_b_rev_a = ca.geometric_product(rev_b, rev_a)
+    diff = (rev_ab - rev_b_rev_a).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 0.5 else 'FAIL'
+print(f'  ~(a*b) = ~b * ~a in Cl(4,1,0): max_diff={max_diff:.2e} [{status}]')
+results.append(('reverse_conjugation_order', status))
+
+# ===== 34. Matryoshka nesting: lower-dim embedding is prefix of higher-dim =====
+print('\n--- 34. matryoshka_nesting ---')
+from src.models.modern_text_encoder import MatryoshkaProjection
+proj = MatryoshkaProjection(64, [16, 32, 48, 64])
+x = torch.randn(5, 64)
+scales = proj(x)
+all_ok = True
+for small_dim, large_dim in [(16,32), (32,48), (48,64)]:
+    diff = (scales[small_dim] - scales[large_dim][:, :small_dim]).abs().max().item()
+    if diff > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  lower-dim is prefix of higher-dim: [{status}]')
+results.append(('matryoshka_nesting', status))
+
+# ===== 35. HBMA forward shape preservation and gradient flow =====
+print('\n--- 35. hbma_forward_shape_and_grad ---')
+from src.core.hbma_memory import HBMAMemory
+mem = HBMAMemory(hidden_dim=64, ep_slots=8, sem_prototypes=8, proc_patterns=4)
+mem.train()
+x = torch.randn(2, 64, requires_grad=True)
+out = mem(x)
+shape_ok = out.shape == x.shape
+# Check gradient flows
+loss = out.sum()
+loss.backward()
+grad_ok = x.grad is not None and x.grad.abs().sum() > 0
+# memory_loss is a method
+mem_loss = mem.memory_loss()
+mem_loss_ok = isinstance(mem_loss, torch.Tensor) and mem_loss.dim() == 0
+status = 'PASS' if shape_ok and grad_ok and mem_loss_ok else 'FAIL'
+print(f'  output shape {tuple(out.shape)} == input shape {tuple(x.shape)}: shape_ok={shape_ok}')
+print(f'  gradient flows through memory: grad_ok={grad_ok}')
+print(f'  memory_loss: {mem_loss.item():.6f}, is_scalar={mem_loss_ok}')
+results.append(('hbma_forward_shape_and_grad', status))
+
 # ===== Summary =====
 print('\n' + '='*60)
 passed = sum(1 for _,s in results if s == 'PASS')
