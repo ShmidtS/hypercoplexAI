@@ -130,7 +130,6 @@ class CliffordAlgebra(nn.Module):
         indices = self.cayley_indices  # (D, D)
 
         # Upcast to float32 for numerical stability under AMP autocast
-        orig_dtype = a.dtype
         if a.dtype != torch.float32:
             a = a.float()
             b = b.float()
@@ -154,9 +153,9 @@ class CliffordAlgebra(nn.Module):
         if self.use_learnable_metric:
             result = result * self.learnable_metric
 
-        # Cast back to original dtype (fp16/bf16)
-        if orig_dtype != torch.float32:
-            result = result.to(orig_dtype)
+        # Always return float32 for numerical stability.
+        # fp16 max (65504) is too small for dim×dim outer products
+        # in sandwich/geometric_product chains (Cl410: dim=32, max²×32 > fp16).
         return result
 
     def _build_sign_buffers(self):
