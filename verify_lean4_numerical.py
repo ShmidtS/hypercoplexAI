@@ -378,6 +378,145 @@ status = 'PASS' if grade_ok else 'FAIL'
 print(f'  e_i*e_j grade <= 2: [{status}]')
 results.append(('grade_ei_ej', status))
 
+# ===== 21. Involute ∘ Reverse = Reverse ∘ Involute =====
+print('\n--- 21. involute_reverse_commute (20 trials) ---')
+ca = CliffordAlgebra(3,1,0)
+max_diff = 0.0
+for _ in range(20):
+    x = torch.randn(3, ca.dim)
+    lhs = ca.involute(ca.reverse(x))
+    rhs = ca.reverse(ca.involute(x))
+    diff = (lhs - rhs).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 1e-6 else 'FAIL'
+print(f'  Cl(3,1,0): max_diff={max_diff:.2e} [{status}]')
+results.append(('inv_rev_commute', status))
+
+# ===== 22. Norm scalar scaling: ||c*x|| = |c|*||x|| =====
+print('\n--- 22. norm_scalar_scaling (20 trials) ---')
+ca = CliffordAlgebra(3,1,0)
+all_ok = True
+for _ in range(20):
+    x = torch.randn(4, ca.dim)
+    c = torch.randn(1).item()
+    scaled_norm = ca.norm(c * x).max().item()
+    expected = abs(c) * ca.norm(x).max().item()
+    if abs(scaled_norm - expected) > 1e-4 * max(expected, 1e-8):
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  scaling holds: [{status}]')
+results.append(('norm_scalar_scale', status))
+
+# ===== 23. Scalar part of reverse = scalar part of original (scalar is invariant) =====
+print('\n--- 23. reverse_scalar_invariance (20 trials) ---')
+ca = CliffordAlgebra(3,1,0)
+max_diff = 0.0
+for _ in range(20):
+    x = torch.randn(5, ca.dim)
+    x_rev = ca.reverse(x)
+    diff = (x[:, 0] - x_rev[:, 0]).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 1e-6 else 'FAIL'
+print(f'  max_diff={max_diff:.2e} [{status}]')
+results.append(('rev_scalar_inv', status))
+
+# ===== 24. Sandwich composition: S_R2(S_R1(x)) = S_{R2*R1}(x) =====
+print('\n--- 24. sandwich_composition (20 trials each) ---')
+for p,q,r in [(2,0,0),(3,1,0),(4,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    max_diff = 0.0
+    for _ in range(20):
+        R1 = make_bivector_rotor(ca)
+        R2 = make_bivector_rotor(ca)
+        x = torch.randn(1, ca.dim)
+        composed = ca.sandwich(R2, ca.sandwich(R1, x, unit=True), unit=True)
+        R21 = ca.geometric_product(R2, R1)
+        R21 = R21 / ca.norm(R21)
+        direct = ca.sandwich(R21, x, unit=True)
+        diff = (composed - direct).abs().max().item()
+        max_diff = max(max_diff, diff)
+    status = 'PASS' if max_diff < 0.05 else 'FAIL'
+    print(f'  Cl({p},{q},{r}): max_diff={max_diff:.2e} [{status}]')
+    results.append((f'sandwich_comp2_Cl{p}{q}{r}', status))
+
+# ===== 25. QuaternionLinear: linearity (distinct from section 10 shape/grad) =====
+print('\n--- 25. quaternion_linear_linearity ---')
+ql = QuaternionLinear(8, 8)  # 8 features in, 8 features out (2 quaternions each)
+
+# Linearity: ql(a*x + b*y) == a*ql(x) + b*ql(y)
+x1 = torch.randn(2, 8)
+x2 = torch.randn(2, 8)
+a, b = 2.0, -0.5
+lhs = ql(a * x1 + b * x2)
+rhs = a * ql(x1) + b * ql(x2)
+lin_diff = (lhs - rhs).abs().max().item()
+status = 'PASS' if lin_diff < 1e-4 else 'FAIL'
+print(f'  linearity: diff={lin_diff:.2e} [{status}]')
+results.append(('quat_linear_linearity', status))
+
+# ===== 26. Nilpotent basis: e_k^2 = 0 for r-basis vectors (Cl310 has r=0, Cl300 has r=0) =====
+print('\n--- 26. nilpotent_basis_properties ---')
+# Test with Cl(2,0,1) which has one nilpotent direction
+ca_nilp = CliffordAlgebra(2, 0, 1)
+k = ca_nilp.n - 1  # last basis vector is nilpotent
+ek = torch.zeros(1, ca_nilp.dim)
+ek[0, 1 << k] = 1.0
+ek_sq = ca_nilp.geometric_product(ek, ek)
+is_zero = ek_sq.abs().max().item() < 1e-6
+status = 'PASS' if is_zero else 'FAIL'
+print(f'  Cl(2,0,1): e_{k}^2 = 0: max={ek_sq.abs().max().item():.2e} [{status}]')
+results.append(('nilpotent_basis', status))
+
+# Verify non-nilpotent basis: e_i^2 = +1 or -1
+ca_pn = CliffordAlgebra(3, 1, 0)
+all_unit_sq = True
+for i in range(ca_pn.n):
+    ei = torch.zeros(1, ca_pn.dim)
+    ei[0, 1 << i] = 1.0
+    ei_sq = ca_pn.geometric_product(ei, ei)
+    scalar = ei_sq[0, 0].item()
+    if i < ca_pn.p:
+        if abs(scalar - 1.0) > 1e-6: all_unit_sq = False
+    elif i < ca_pn.p + ca_pn.q:
+        if abs(scalar + 1.0) > 1e-6: all_unit_sq = False
+status = 'PASS' if all_unit_sq else 'FAIL'
+print(f'  Cl(3,1,0): e_i^2 = ±1 for non-nilpotent: [{status}]')
+results.append(('basis_unit_sq', status))
+
+# ===== 27. Involute sign: involute(e_k) = (-1)^grade_k * e_k =====
+print('\n--- 27. involute_grade_sign (Cl310) ---')
+ca = CliffordAlgebra(3, 1, 0)
+all_ok = True
+for idx in range(ca.dim):
+    grade = bin(idx).count('1')
+    expected_sign = (-1.0) ** grade
+    e = torch.zeros(1, ca.dim)
+    e[0, idx] = 1.0
+    inv_e = ca.involute(e)
+    actual = inv_e[0, idx].item()
+    if abs(actual - expected_sign) > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  all grades: [{status}]')
+results.append(('involute_grade_sign', status))
+
+# ===== 28. Geometric product of scalar and multivector is scalar multiplication =====
+print('\n--- 28. scalar_multivector_product (20 trials) ---')
+ca = CliffordAlgebra(3, 1, 0)
+max_diff = 0.0
+for _ in range(20):
+    s = torch.randn(1).item()
+    x = torch.randn(1, ca.dim)
+    # s * x = (s*1) * x = geometric_product(s*1, x)
+    scalar_basis = torch.zeros(1, ca.dim)
+    scalar_basis[0, 0] = s
+    prod = ca.geometric_product(scalar_basis, x)
+    diff = (prod - s * x).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 1e-4 else 'FAIL'
+print(f'  Cl(3,1,0): max_diff={max_diff:.2e} [{status}]')
+results.append(('scalar_mult_prod', status))
+
 # ===== Summary =====
 print('\n' + '='*60)
 passed = sum(1 for _,s in results if s == 'PASS')
