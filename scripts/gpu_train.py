@@ -148,6 +148,7 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             unfreeze_layers=unfreeze_layers,
             freeze_bottom_frac=_freeze_frac,
             projection_hidden=getattr(args, 'sbert_projection_hidden', None),
+            z_loss_weight=getattr(args, 'lambda_z', 0.0),
         )
         print("Components: SBERT(paraphrase-multilingual-mpnet-base-v2) + SimpleMLP")
         if unfreeze_layers:
@@ -162,6 +163,7 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
         model = build_text_hdim_model(
             cfg,
             soft_router=True,
+            z_loss_weight=getattr(args, 'lambda_z', 0.0),
         )
         print("Components: SimpleTextEncoder + SoftMoERouter")
         return model
