@@ -184,15 +184,21 @@ class CliffordAlgebra(nn.Module):
         scalar_part = product[..., 0]  # Grade-0 компонент
         return torch.sqrt(torch.clamp(scalar_part.abs(), min=1e-8))
 
-    def sandwich(self, R: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def sandwich(self, R: torch.Tensor, x: torch.Tensor, *, unit: bool = False) -> torch.Tensor:
         """
         Сэндвич-произведение: R x R^{-1}, где R^{-1} = reverse(R) / ||R||².
-        Корректно для произвольных (ненормализованных) верзоров.
-        Добавлен clamp промежуточных значений для предотвращения NaN.
+
+        unit=False (default): epsilon для численной стабильности.
+          Для обучаемых/ненормализованных роторов, ||R|| может быть ≈0.
+
+        unit=True: epsilon НЕ добавляется (теоремная корректность).
+          Для единичных роторов (||R||≈1): R⁻¹ = ~R, sandwich(R,x) = R⊗x⊗~R.
+          Удовлетворяет теоремам sandwich_norm_preservation,
+          sandwich_identity, sandwich_composition.
         """
         R_rev = self.reverse(R)
-        # norm возвращает (...) без последнего dim, нужно unsqueeze
-        norm_sq = (self.norm(R) ** 2 + 1e-8).unsqueeze(-1)  # (..., 1)
+        eps = 0.0 if unit else 1e-8
+        norm_sq = (self.norm(R) ** 2 + eps).unsqueeze(-1)  # (..., 1)
         R_inv = R_rev / norm_sq  # broadcast по последнему dim
         Rx = self.geometric_product(R, x)
         result = self.geometric_product(Rx, R_inv)

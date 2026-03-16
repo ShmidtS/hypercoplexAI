@@ -162,7 +162,6 @@ class HDIMPipeline(nn.Module):
             for name in domain_names
         })
         self.invariant_extractor = InvariantExtractor(self.algebra)
-        self.invariant_extractor = InvariantExtractor(self.algebra)
         self.invariant_norm = nn.LayerNorm(clifford_dim)
         self.moe = SoftMoERouter(
             input_dim=clifford_dim,

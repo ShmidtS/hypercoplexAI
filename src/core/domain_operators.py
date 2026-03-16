@@ -17,7 +17,18 @@ from .hypercomplex import CliffordAlgebra
 
 
 class DomainRotationOperator(nn.Module):
-    """Обучаемый ротор домена."""
+    """Обучаемый ротор домена.
+
+    Математически (согласно теоремам HDIM.lean):
+      R — единичный ротор: ||R|| = 1
+      R⁻¹ = ~R (для единичного ротора reverse = inverse)
+      sandwich(R, x) = R ⊗ x ⊗ R⁻¹
+
+    Численно (для стабильности градиентов):
+      epsilon используется только в _normalized_R при делении на ||R||,
+      чтобы избежать NaN когда ||R|| ≈ 0 во время обучения.
+      get_inverse НЕ добавляет epsilon — она принимает уже нормализованный ротор.
+    """
 
     def __init__(
         self,
@@ -33,22 +44,26 @@ class DomainRotationOperator(nn.Module):
             self.R.data[0] = 1.0
 
     def _normalized_R(self) -> torch.Tensor:
-        """Возвращает нормализованный ротор ||R||=1 для стабильного сэндвича."""
-        norm = self.algebra.norm(self.R) + 1e-8
-        return self.R / norm
+        """Нормализация R → R/||R|| (epsilon только для защиты от ||R||=0).
+        Результат: ||_normalized_R()|| ≈ 1."""
+        norm = self.algebra.norm(self.R)
+        return self.R / (norm + 1e-8)
 
     def get_inverse(self) -> torch.Tensor:
+        """Обратный ротор: R⁻¹ = ~R / ||R||².
+        Для единичного ротора (||R||≈1) R⁻¹ = ~R.
+        Epsilon только для защиты от ||R||=0 (обучение)."""
         R_n = self._normalized_R()
         R_rev = self.algebra.reverse(R_n)
-        # Для нормализованного верзора norm_sq ≈ 1, но держим safe eps
-        norm_sq = self.algebra.norm(R_n) ** 2 + 1e-8
-        return R_rev / norm_sq
+        norm_sq = self.algebra.norm(R_n) ** 2
+        return R_rev / (norm_sq + 1e-8)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.algebra.sandwich(self._normalized_R(), x)
+        # _normalized_R() возвращает ||R||≈1, используем unit=True для теоремной корректности
+        return self.algebra.sandwich(self._normalized_R(), x, unit=True)
 
     def apply_inverse(self, x: torch.Tensor) -> torch.Tensor:
-        return self.algebra.sandwich(self.get_inverse(), x)
+        return self.algebra.sandwich(self.get_inverse(), x, unit=True)
 
 
 class InvariantExtractor(nn.Module):
