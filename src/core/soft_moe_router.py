@@ -145,6 +145,22 @@ class SoftMoERouter(nn.Module):
         combine = F.softmax(logits, dim=-1)   # (T, num_slots)
         return dispatch, combine
 
+    def _evaluate_experts(self, slot_inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate all experts on slot inputs using batched matrix multiplications.
+
+        Args:
+            slot_inputs: (num_slots, D) aggregated slot representations
+        Returns:
+            slot_outputs: (num_slots, D) expert outputs
+        """
+        x_exp = slot_inputs.view(self.num_experts, self.slots_per_expert, -1)
+        h = torch.einsum('esd,ehd->esh', x_exp, self.W1_stack) + self.b1_stack.unsqueeze(1)
+        h = F.gelu(h)
+        h = F.dropout(h, p=0.1, training=self.training)
+        out = torch.einsum('esh,edh->esd', h, self.W2_stack) + self.b2_stack.unsqueeze(1)
+        return out.reshape(-1, slot_inputs.shape[-1])
+
     def forward(
         self,
         x: torch.Tensor,
@@ -169,12 +185,7 @@ class SoftMoERouter(nn.Module):
         slot_inputs = dispatch.T @ x_flat  # (num_slots, D)
 
         # Batched expert execution via stacked weights + einsum
-        x_exp = slot_inputs.view(self.num_experts, self.slots_per_expert, -1)  # (E, S, D)
-        h = torch.einsum('esd,ehd->esh', x_exp, self.W1_stack) + self.b1_stack.unsqueeze(1)
-        h = F.gelu(h)
-        h = F.dropout(h, p=0.1, training=self.training)
-        out = torch.einsum('esh,edh->esd', h, self.W2_stack) + self.b2_stack.unsqueeze(1)
-        slot_outputs = out.reshape(-1, slot_inputs.shape[-1])  # (E*S, D)
+        slot_outputs = self._evaluate_experts(slot_inputs)  # (E*S, D)
 
         output = combine @ slot_outputs  # (T, D)
 

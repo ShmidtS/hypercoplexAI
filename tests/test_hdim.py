@@ -445,8 +445,9 @@ def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
 
     model.train()
     _ = model(x, domain_id, update_memory=True, memory_mode="update")
-    memory_weight_before = model.pipeline.memory.memory.weight.detach().clone()
-    momentum_before = model.pipeline.memory.momentum_S.detach().clone()
+    titans = model.pipeline.memory.titans
+    memory_weight_before = titans.memory.weight.detach().clone()
+    momentum_before = titans.momentum_S.detach().clone()
     train_scores_before = model.pipeline.moe.train_scores.detach().clone()
 
     model.eval()
@@ -466,8 +467,8 @@ def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
             memory_mode="retrieve",
         )
 
-    assert torch.allclose(model.pipeline.memory.memory.weight, memory_weight_before)
-    assert torch.allclose(model.pipeline.memory.momentum_S, momentum_before)
+    assert torch.allclose(titans.memory.weight, memory_weight_before)
+    assert torch.allclose(titans.momentum_S, momentum_before)
     assert torch.allclose(model.pipeline.moe.train_scores, train_scores_before)
     assert torch.allclose(routing_a, routing_b)
     assert torch.allclose(inv_a, inv_b)
@@ -482,8 +483,9 @@ def test_model_reset_memory_clears_memory_and_router_state(model, cfg):
     model.train()
     model(x, domain_id, update_memory=True, memory_mode="update")
 
-    assert torch.count_nonzero(model.pipeline.memory.memory.weight).item() > 0
-    assert torch.count_nonzero(model.pipeline.memory.momentum_S).item() > 0
+    titans = model.pipeline.memory.titans
+    assert torch.count_nonzero(titans.memory.weight).item() > 0
+    assert torch.count_nonzero(titans.momentum_S).item() > 0
     train_scores_before_reset = model.pipeline.moe.train_scores.clone()
     assert not torch.allclose(
         train_scores_before_reset,
@@ -492,8 +494,8 @@ def test_model_reset_memory_clears_memory_and_router_state(model, cfg):
 
     model.reset_memory(strategy='hard')
 
-    assert torch.allclose(model.pipeline.memory.memory.weight, torch.zeros_like(model.pipeline.memory.memory.weight), atol=1e-6)
-    assert torch.allclose(model.pipeline.memory.momentum_S, torch.zeros_like(model.pipeline.memory.momentum_S), atol=1e-6)
+    assert torch.allclose(titans.memory.weight, torch.zeros_like(titans.memory.weight), atol=1e-6)
+    assert torch.allclose(titans.momentum_S, torch.zeros_like(titans.momentum_S), atol=1e-6)
     assert torch.allclose(
         model.pipeline.moe.train_scores,
         torch.full_like(model.pipeline.moe.train_scores, 1.0 / cfg.num_experts),

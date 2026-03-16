@@ -432,6 +432,9 @@ def run_gpu_training(
         learnable_temperature=getattr(args, 'learnable_temperature', False),
         lambda_dcl=getattr(args, 'lambda_dcl', 0.0),
         lambda_uniformity=getattr(args, 'lambda_uniformity', 0.0),
+        lambda_diversity_var=getattr(args, 'lambda_diversity_var', 0.01),
+        lambda_diversity_ortho=getattr(args, 'lambda_diversity_ortho', 0.005),
+        lambda_matryoshka=getattr(args, 'lambda_matryoshka', 0.1),
     )
     # Focal-InfoNCE
     _focal_gamma = getattr(args, 'focal_gamma', 1.0)
@@ -481,7 +484,8 @@ def run_gpu_training(
         print(f"Phase 26 features: {', '.join(_p26_flags)}")
     # Add learnable temperature to optimizer (must be before scheduler)
     if getattr(args, 'learnable_temperature', False) and trainer._log_temp is not None:
-        optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * 0.1})
+        temp_lr_mult = getattr(args, 'temperature_lr_mult', 0.1)
+        optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * temp_lr_mult})
         print(f"Learnable temperature enabled (init={trainer._log_temp.exp().item():.4f})")
     real_pairs_path = getattr(args, 'real_pairs', None)
     if real_pairs_path:
@@ -581,6 +585,7 @@ def run_gpu_training(
     val_metrics: dict = {}
     quality_metrics: dict = {"STS_exported": 0.0, "STS_training": 0.0, "DRS": 0.0, "AFR": 0.0, "pair_margin": 0.0}
     nan_batches_total: int = 0
+    consecutive_nan: int = 0
 
     for epoch in range(1, args.epochs + 1):
         trainer.set_epoch(epoch)
@@ -599,7 +604,16 @@ def run_gpu_training(
                 if torch.isnan(loss) or torch.isinf(loss):
                     nan_batches_epoch += 1
                     nan_batches_total += 1
+                    consecutive_nan += 1
+                    if consecutive_nan >= 3:
+                        old_lr = optimizer.param_groups[0]["lr"]
+                        new_lr = old_lr * 0.5
+                        for pg in optimizer.param_groups:
+                            pg["lr"] = new_lr
+                        consecutive_nan = 0
+                        print(f"  NaN recovery: LR reduced from {old_lr:.2e} to {new_lr:.2e}")
                     continue
+                consecutive_nan = 0
                 epoch_loss += loss.item()
                 n_batches += 1
             except RuntimeError as e:
@@ -754,6 +768,12 @@ def main() -> None:
     parser.add_argument("--lambda_uniformity", type=float, default=0.0,
                         help="Uniformity+Alignment loss weight (Wang & Isola 2020, try 0.1-0.3)")
     parser.add_argument("--lambda_memory", type=float, default=0.01)
+    parser.add_argument("--lambda_diversity_var", type=float, default=0.01,
+                        help="Diversity variance weight (anti-collapse)")
+    parser.add_argument("--lambda_diversity_ortho", type=float, default=0.005,
+                        help="Diversity orthogonality weight (anti-collapse)")
+    parser.add_argument("--lambda_matryoshka", type=float, default=0.1,
+                        help="Matryoshka multi-scale loss weight")
     parser.add_argument("--ranking_margin", type=float, default=0.3)
     # Dataset
     parser.add_argument("--num_samples", type=int, default=500)
@@ -803,6 +823,11 @@ def main() -> None:
                         help="Path to real_pairs.json for training on real cross-domain pairs")
     parser.add_argument("--augment_factor", type=int, default=8,
                         help="Augmentation factor for real pairs dataset")
+    # Embedding augmentations
+    parser.add_argument("--aug_noise_std", type=float, default=0.0,
+                        help="Gaussian noise std for embedding augmentation (0.0=disabled)")
+    parser.add_argument("--aug_mixup_alpha", type=float, default=0.0,
+                        help="Mixup Beta alpha for embedding augmentation (0.0=disabled)")
     # Early stopping
     parser.add_argument("--early_stopping_patience", type=int, default=0,
                         help="Stop if best score not improved for N evals (0=disabled)")
@@ -818,6 +843,8 @@ def main() -> None:
                         help="T_mult for cosine_restarts scheduler (default: 2, use 1 for stable LR)")
     parser.add_argument("--learnable_temperature", action="store_true", default=False,
                         help="Use learnable InfoNCE temperature (log-parameterized)")
+    parser.add_argument("--temperature_lr_mult", type=float, default=0.1,
+                        help="LR multiplier for learnable temperature param (default: 0.1)")
     # Focal-InfoNCE (Hou & Li, EMNLP 2023)
     parser.add_argument("--focal_gamma", type=float, default=1.0,
                         help="Focal-InfoNCE gamma (1.0=standard, 0.5=moderate, <1=focus on hard negatives)")

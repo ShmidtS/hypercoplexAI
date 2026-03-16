@@ -9,15 +9,74 @@ Four memory systems inspired by McClelland et al. (1995) and HBMA paper:
 
 All systems are pure PyTorch nn.Module — no external DBs, no Redis.
 Drop-in replacement for CLSMemory in HDIMPipeline.
+
+Extensible via MemorySubsystemPlugin for 5th+ subsystems.
 """
 from __future__ import annotations
 
 import math
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Plugin system — extensible 5th+ subsystem
+# ---------------------------------------------------------------------------
+
+class MemorySubsystemPlugin(nn.Module, ABC):
+    """Base class for HBMA memory subsystem plugins.
+
+    Subclass this to add a new memory system to HBMAMemory.
+    All nn.Parameters and registered buffers are automatically
+    tracked by the parent HBMAMemory module.
+
+    Required:
+        name: unique string identifier (e.g. "emotional", "social")
+        forward(x): returns [B, D] augmented representation
+
+    Optional:
+        on_consolidate(ctx): participate in consolidation pipeline
+        reset(): clear stateful buffers
+        auxiliary_loss(): extra diversity/regularization loss
+        priority: int — ordering hint (lower = earlier, default 10)
+    """
+
+    name: str = "plugin"
+    priority: int = 10
+
+    @abstractmethod
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ...
+
+    def on_consolidate(self, ctx: ConsolidationContext) -> None:
+        pass
+
+    def reset(self) -> None:
+        pass
+
+    def auxiliary_loss(self) -> torch.Tensor:
+        return torch.tensor(0.0)
+
+
+@dataclass
+class ConsolidationContext:
+    """Passed to plugins during consolidation.
+
+    Gives plugins read access to other subsystems and the current
+    hidden state, so they can participate in the consolidation pipeline.
+    """
+    hidden: torch.Tensor
+    working: WorkingMemory
+    episodic: EpisodicMemory
+    semantic: SemanticMemory
+    procedural: Optional[ProceduralMemory]
+    is_training: bool
+    step: int
 
 
 # ---------------------------------------------------------------------------
@@ -354,33 +413,45 @@ class SemanticMemory(nn.Module):
 
     @torch.no_grad()
     def _update_prototypes(self, h: torch.Tensor) -> None:
-        """EMA update of prototype centroids with confidence tracking."""
-        h_norm  = F.normalize(h.detach(), dim=-1)                    # [B, D]
-        p_norm  = F.normalize(self.prototypes, dim=-1)               # [P, D]
-        sim     = h_norm @ p_norm.T                                  # [B, P]
+        """EMA update of prototype centroids with confidence tracking.
+
+        Uses scatter-reduce for vectorized centroid computation.
+        Per-prototype contradiction checks remain in a loop (cosine sim
+        against current prototype is O(D) per prototype, negligible).
+        """
+        h_norm = F.normalize(h.detach(), dim=-1)                     # [B, D]
+        p_norm = F.normalize(self.prototypes, dim=-1)                # [P, D]
+        sim    = h_norm @ p_norm.T                                   # [B, P]
         assigns = sim.argmax(dim=-1)                                 # [B]
 
         self.proto_age += 1
 
+        # Vectorized centroid computation via scatter_reduce
+        D = h_norm.shape[1]
+        proto_sum   = torch.zeros(self.num_prototypes, D, device=h.device, dtype=h.dtype)
+        proto_count = torch.zeros(self.num_prototypes, device=h.device, dtype=h.dtype)
+
+        # Expand assigns for scatter: [B] -> [B, 1] to broadcast over dim
+        proto_sum.scatter_add_(0, assigns.unsqueeze(-1).expand(-1, D), h_norm)
+        proto_count.scatter_add_(0, assigns, torch.ones_like(assigns, dtype=h.dtype))
+
+        # Per-prototype loop: contradiction check + EMA update
+        has_samples = proto_count > 0
         for p in range(self.num_prototypes):
-            mask = assigns == p
-            if not mask.any():
+            if not has_samples[p]:
                 continue
-            centroid = h_norm[mask].mean(0)
+            centroid = proto_sum[p] / proto_count[p]
 
             # Contradiction check: if very dissimilar to current prototype
             curr_sim = F.cosine_similarity(centroid.unsqueeze(0),
                                            self.prototypes[p].unsqueeze(0)).item()
             if curr_sim < self.contradiction_thresh:
-                # Conflicting info — reduce confidence
                 self.proto_conf[p] = max(0.1, self.proto_conf[p] - 0.1)
             else:
-                # Consistent evidence — boost confidence, slow EMA update
-                self.proto_conf[p]    = min(0.95, self.proto_conf[p] + 0.02)
+                self.proto_conf[p]     = min(0.95, self.proto_conf[p] + 0.02)
                 self.proto_evidence[p] = self.proto_evidence[p] + 1
-                self.proto_age[p]     = 0
+                self.proto_age[p]      = 0
 
-                # EMA update (very slow for semantic stability)
                 updated = self.ema_momentum * self.prototypes[p] + (1 - self.ema_momentum) * centroid
                 self.prototypes[p] = F.normalize(updated, dim=-1)
 
@@ -522,8 +593,8 @@ class ProceduralMemory(nn.Module):
         if self.training:
             with torch.no_grad():
                 best_patterns = attn.argmax(dim=-1)                  # [B]
-                for idx in best_patterns:
-                    self.usage_count[idx] += 1
+                counts = torch.bincount(best_patterns, minlength=self.num_patterns)
+                self.usage_count += counts.to(self.usage_count.device)
 
         return out
 
@@ -695,6 +766,12 @@ class HBMAMemory(nn.Module):
         )
         self.consolidation = ConsolidationEngine(hidden_dim=hidden_dim, dropout=dropout)
 
+        # Plugin system
+        self._plugins = nn.ModuleList()
+        self._plugin_names: list[str] = []
+        self._needs_rebuild = False
+        self._global_step = 0
+
         # Learned 4-way routing gate
         # Outputs [B, 4] softmax weights for [working, episodic, semantic, procedural]
         self.router = nn.Sequential(
@@ -709,6 +786,47 @@ class HBMAMemory(nn.Module):
         self.norm        = nn.LayerNorm(hidden_dim)
         self.dropout_    = nn.Dropout(dropout)
 
+    def register_plugin(self, plugin: MemorySubsystemPlugin) -> None:
+        """Register a plugin subsystem. Call before first forward()."""
+        if plugin.name in self._plugin_names:
+            raise ValueError(f"Plugin '{plugin.name}' already registered")
+        self._plugins.append(plugin)
+        self._plugin_names.append(plugin.name)
+        self._needs_rebuild = True
+
+    def _get_all_subsystems(self) -> list[tuple[str, nn.Module]]:
+        """Returns ordered list of (name, module) for all subsystems."""
+        result = [
+            ("working", self.working),
+            ("episodic", self.episodic),
+            ("semantic", self.semantic),
+            ("procedural", self.procedural),
+        ]
+        indexed = list(zip(self._plugin_names, list(self._plugins)))
+        indexed.sort(key=lambda x: x[1].priority)
+        for name, mod in indexed:
+            result.append((name, mod))
+        return result
+
+    def _maybe_rebuild(self) -> None:
+        """Rebuild router/fusion if plugins have been added."""
+        if not self._needs_rebuild:
+            return
+        n = len(self._get_all_subsystems())
+        old_router_out = self.router[-1].out_features
+        if n == old_router_out:
+            self._needs_rebuild = False
+            return
+
+        self.router = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim // 2, n),
+        )
+        self.fusion_proj = nn.Linear(self.hidden_dim * n, self.hidden_dim)
+        self.fusion_gate = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self._needs_rebuild = False
+
     def forward(
         self,
         x: torch.Tensor,
@@ -718,35 +836,41 @@ class HBMAMemory(nn.Module):
         x: [B, D]
         Returns: [B, D] HBMA-augmented representation.
         """
+        self._maybe_rebuild()
+
         # Run consolidation (promotes patterns across hierarchy)
         x = self.consolidation.consolidate(
             x, self.working, self.episodic, self.semantic
         )
 
-        # Parallel retrieval from all four systems
-        wm_out   = self.working(x)      # [B, D]
-        ep_out   = self.episodic(x)     # [B, D]
-        sem_out  = self.semantic(x)     # [B, D]
-        proc_out = self.procedural(x)   # [B, D]
+        # Plugin consolidation hooks
+        if self._plugins:
+            ctx = ConsolidationContext(
+                hidden=x, working=self.working, episodic=self.episodic,
+                semantic=self.semantic, procedural=self.procedural,
+                is_training=self.training, step=self._global_step,
+            )
+            for p in self._plugins:
+                p.on_consolidate(ctx)
 
-        # Learned routing: how much of each system to blend
-        gate = F.softmax(self.router(x), dim=-1)  # [B, 4]
-        wm_w, ep_w, sem_w, proc_w = gate.unbind(dim=-1)  # each [B]
+        # Parallel retrieval from all subsystems (built-ins + plugins)
+        all_subs = self._get_all_subsystems()
+        outputs = [mod(x) for _, mod in all_subs]
 
-        # Weighted blend
-        blended = (
-            wm_w.unsqueeze(-1)   * wm_out
-          + ep_w.unsqueeze(-1)   * ep_out
-          + sem_w.unsqueeze(-1)  * sem_out
-          + proc_w.unsqueeze(-1) * proc_out
+        # Learned routing
+        gate = F.softmax(self.router(x), dim=-1)  # [B, n]
+        blended = sum(
+            gate[:, i:i+1] * out for i, out in enumerate(outputs)
         )  # [B, D]
 
         # Concatenate all outputs for richer fusion
-        concat = torch.cat([wm_out, ep_out, sem_out, proc_out], dim=-1)  # [B, 4D]
-        fused  = self.dropout_(F.gelu(self.fusion_proj(concat)))          # [B, D]
-        fg     = torch.sigmoid(self.fusion_gate(fused))                   # [B, D]
+        concat = torch.cat(outputs, dim=-1)                       # [B, n*D]
+        fused  = self.dropout_(F.gelu(self.fusion_proj(concat)))  # [B, D]
+        fg     = torch.sigmoid(self.fusion_gate(fused))           # [B, D]
         out    = fg * blended + (1 - fg) * fused
         out    = self.norm(out)
+
+        self._global_step += 1
 
         if return_gate:
             return out, gate
@@ -758,12 +882,15 @@ class HBMAMemory(nn.Module):
         self.episodic.reset()
         self.semantic.reset()
         self.procedural.reset()
+        for p in self._plugins:
+            p.reset()
 
     def memory_loss(self) -> torch.Tensor:
         """
         Combined auxiliary loss:
         - Semantic diversity (prevents prototype collapse)
         - Procedural pattern diversity
+        - Plugin auxiliary losses
         """
         sem_loss  = self.semantic.diversity_loss()
         p_norm    = F.normalize(self.procedural.patterns, dim=-1)
@@ -771,7 +898,19 @@ class HBMAMemory(nn.Module):
         mask      = ~torch.eye(proc_sim.shape[0], dtype=torch.bool,
                                device=proc_sim.device)
         proc_loss = proc_sim[mask].pow(2).mean()
-        return 0.7 * sem_loss + 0.3 * proc_loss
+
+        base_loss = 0.7 * sem_loss + 0.3 * proc_loss
+
+        # Accumulate plugin losses
+        if not self._plugins:
+            return base_loss
+        plugin_losses = torch.tensor(0.0, device=base_loss.device)
+        for p in self._plugins:
+            pl = p.auxiliary_loss()
+            if isinstance(pl, torch.Tensor):
+                plugin_losses = plugin_losses + pl
+        n = len(self._plugins) + 1
+        return (base_loss + plugin_losses) / n
 
 
 # ---------------------------------------------------------------------------

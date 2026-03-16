@@ -78,8 +78,8 @@ class CliffordAlgebra(nn.Module):
                 if result_bits[i] < b:
                     break
                 if result_bits[i] == b:
-                    # Квадрат базисного вектора
                     sign *= float(self.metric[b].item())
+                    sign *= (-1.0) ** swaps
                     result_bits.pop(i)
                     pos = -1
                     break

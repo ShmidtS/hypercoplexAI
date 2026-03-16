@@ -22,6 +22,7 @@ from .domain_operators import DomainRotationOperator, InvariantExtractor, sandwi
 from .titans_memory import MemoryState, TitansMemoryModule
 from .soft_moe_router import SoftMoERouter
 from .cls_memory import CLSMemory, HBMAMemory
+from .memory_interface import MemoryInterface, TitansAdapter, HBMAMemoryAdapter
 
 
 @dataclass
@@ -170,22 +171,21 @@ class HDIMPipeline(nn.Module):
             top_k=top_k,
         )
         if memory_type == 'titans':
-            self.memory = TitansMemoryModule(
+            _raw_memory = TitansMemoryModule(
                 key_dim=memory_key_dim,
                 val_dim=clifford_dim,
                 hidden_dim=memory_key_dim * 2,
             )
-            self.memory_key_proj = nn.Linear(clifford_dim, memory_key_dim)
-            self.memory_gate = nn.Sequential(
-                nn.Linear(clifford_dim, clifford_dim // 4),
-                nn.ReLU(),
-                nn.Linear(clifford_dim // 4, 1),
+            self.memory: MemoryInterface = TitansAdapter(
+                _raw_memory,
+                clifford_dim=clifford_dim,
+                memory_key_dim=memory_key_dim,
             )
         elif memory_type == 'hbma':
-            self.memory = HBMAMemory(hidden_dim=clifford_dim)
+            self.memory = HBMAMemoryAdapter(HBMAMemory(hidden_dim=clifford_dim))
         else:
             # hippocampus, neocortex, or cls
-            self.memory = CLSMemory(hidden_dim=clifford_dim)
+            self.memory = HBMAMemoryAdapter(CLSMemory(hidden_dim=clifford_dim))
         self._use_gradient_checkpointing = False
 
     def enable_gradient_checkpointing(self) -> None:
@@ -227,27 +227,16 @@ class HDIMPipeline(nn.Module):
             )
             return u_inv, empty_state
 
-        if self.memory_type != 'titans':
-            # CLS branch: hippocampus / neocortex / cls
-            mem_out = self.memory(u_inv)
-            mem_loss = self.memory.memory_loss()
-            cls_state = MemoryState(
-                retrieved=mem_out - u_inv,
-                loss=mem_loss,
-                updated=True,
-            )
-            return mem_out, cls_state
+        do_update = update_memory and memory_mode == "update"
 
-        mem_key = self.memory_key_proj(u_inv)
-        memory_state = self.memory.retrieve_and_update(
-            mem_key,
-            u_inv,
-            update_memory=update_memory and memory_mode == "update",
+        # Unified path: all memory types go through MemoryInterface
+        result = self.memory(u_inv, update_memory=do_update)
+        mem_state = MemoryState(
+            retrieved=result.output - u_inv,
+            loss=result.loss,
+            updated=result.updated,
         )
-        gate = torch.sigmoid(self.memory_gate(u_inv))
-        # Gradient isolation: memory.retrieved doesn't backprop through memory weights
-        retrieved = memory_state.retrieved.detach() if self.training else memory_state.retrieved
-        return u_inv + gate * retrieved, memory_state
+        return result.output, mem_state
 
     def transfer(
         self,

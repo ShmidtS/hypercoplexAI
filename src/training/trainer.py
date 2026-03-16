@@ -40,6 +40,8 @@ class HDIMTrainer:
         learnable_temperature: bool = False,
         lambda_dcl: float = 0.0,
         lambda_uniformity: float = 0.0,
+        lambda_diversity_var: float = 0.01,
+        lambda_diversity_ortho: float = 0.005,
         use_sc_temperature: bool = False,
         lambda_matryoshka: float = 0.1,
         # Temperature scheduling parameters (exposed for configurability)
@@ -67,7 +69,23 @@ class HDIMTrainer:
         self.lambda_expert_ortho = lambda_expert_ortho
         self.lambda_dcl = lambda_dcl
         self.lambda_uniformity = lambda_uniformity
+        self.lambda_diversity_var = lambda_diversity_var
+        self.lambda_diversity_ortho = lambda_diversity_ortho
+        self.lambda_matryoshka = lambda_matryoshka
         self.use_sc_temperature = use_sc_temperature
+
+        # Warn about conflicting loss combinations
+        if focal_gamma < 1.0 and lambda_dcl > 0:
+            print("WARNING: Focal-InfoNCE + DCL simultaneously — DCL already removes positive from denominator, "
+                  "focal modulation is redundant. Consider using DCL alone or InfoNCE+Focal alone.")
+        if use_infonce and lambda_supcon > 0:
+            print("WARNING: InfoNCE + SupCon simultaneously — SupCon generalizes InfoNCE, running both wastes compute. "
+                  "SupCon overrides InfoNCE when group_id is present.")
+        if lambda_uniformity > lambda_pair * 2:
+            print("WARNING: lambda_uniformity >> lambda_pair — uniformity pushes points apart, "
+                  "may prevent contrastive clustering. Recommend lambda_uniformity < lambda_pair.")
+        if lambda_dcl > 0 and lambda_uniformity > 0:
+            print("NOTE: DCL + Uniformity is a strong combo for embedding uniformity — ensure lambda_pair is tuned.")
         self.use_hard_negatives: bool = False
         self._last_cluster_temp: float | None = None
         self._step: int = 0
@@ -269,9 +287,7 @@ class HDIMTrainer:
 
         # Combined: we want HIGH variance and LOW avg cosine
         # loss_div = -variance + avg_cosine (minimize this)
-        lambda_var = 0.01
-        lambda_ortho = 0.005
-        loss_div = -lambda_var * variance + lambda_ortho * avg_cosine
+        loss_div = -self.lambda_diversity_var * variance + self.lambda_diversity_ortho * avg_cosine
         return loss_div
 
     def _resolve_pair_group_id(self, batch: Dict[str, Any]) -> torch.Tensor | None:
@@ -599,21 +615,17 @@ class HDIMTrainer:
         pos_indices = positive_mask.nonzero(as_tuple=True)[0]
         diag_mask = torch.eye(B, dtype=torch.bool, device=self.device)
 
-        losses = []
-        for i in pos_indices:
-            s_pos = sim_matrix[i, i]  # positive similarity (diagonal)
-            # Знаменатель: все j кроме самого positive (i,i)
-            neg_mask = ~diag_mask[i]
-            log_denom = torch.logsumexp(sim_matrix[i][neg_mask], dim=0)
-            loss_i = -(s_pos - log_denom)
-            losses.append(loss_i)
-
-        if not losses:
+        # Vectorized: mask diagonal to -inf for all rows at once
+        masked_sim = sim_matrix.clone()
+        masked_sim.masked_fill_(diag_mask, -3e4)
+        log_denom = torch.logsumexp(masked_sim, dim=1)  # (B,)
+        s_pos = sim_matrix.diag()  # (B,)
+        loss_per_sample = -(s_pos - log_denom)  # (B,)
+        # Apply weights only to positive samples
+        weights = pair_weight * positive_mask.float()
+        if weights.sum() == 0:
             return self._zero_loss(source_inv)
-
-        loss_tensor = torch.stack(losses)
-        weights = pair_weight[pos_indices]
-        return (loss_tensor * weights).sum() / weights.sum().clamp_min(1e-8)
+        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
 
     def _compute_uniformity_alignment_loss(
         self,
@@ -705,24 +717,18 @@ class HDIMTrainer:
 
         log_denom = torch.logsumexp(sim_matrix.masked_fill(eye, -3e4), dim=-1)  # safe for fp16
 
-        losses = []
-        weights = []
-        for i in range(B):
-            p_idx = pos_mask[i].nonzero(as_tuple=True)[0]  # индексы позитивов
-            if p_idx.numel() == 0:
-                continue
-            # -1/|P(i)| * Σ_p [sim(i,p)/T - log_denom]
-            pos_sims = sim_matrix[i, p_idx]  # (|P(i)|,)
-            loss_i = -(pos_sims - log_denom[i]).mean()
-            losses.append(loss_i)
-            weights.append(pair_weight[i])
-
-        if not losses:
+        # Vectorized: for each sample, average over positive similarities
+        num_pos = pos_mask.sum(dim=1).clamp(min=1)  # (B,) — at least 1 to avoid div by 0
+        # Mask non-positives to 0, sum per row, divide by count
+        pos_sim_sum = (sim_matrix * pos_mask.float()).sum(dim=1)  # (B,)
+        loss_per_sample = -((pos_sim_sum / num_pos) - log_denom)  # (B,)
+        # Zero out samples with no positives
+        has_pos = pos_mask.any(dim=1).float()
+        loss_per_sample = loss_per_sample * has_pos
+        weights = pair_weight * has_pos
+        if weights.sum() == 0:
             return self._zero_loss(source_inv)
-
-        loss_tensor = torch.stack(losses)       # (N,)
-        weight_tensor = torch.stack(weights).to(source_inv.dtype)  # (N,)
-        return (loss_tensor * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-8)
+        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
 
     def _compute_pair_ranking_loss(
         self,
@@ -1103,7 +1109,7 @@ class HDIMTrainer:
             + self.lambda_sts * loss_sts
             + self.lambda_z * loss_z
             + loss_diversity
-            + loss_matryoshka
+            + self.lambda_matryoshka * loss_matryoshka
             + self.lambda_expert_ortho * loss_expert_ortho
         )
         batch_losses = {
@@ -1150,14 +1156,22 @@ class HDIMTrainer:
         if scaler is not None:
             scaler.scale(loss_total).backward()
             scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
             scaler.step(self.optimizer)
             scaler.update()
         else:
             loss_total.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
             self.optimizer.step()
         self._step += 1
+        self._last_loss_components = {
+            k: v.item() if isinstance(v, torch.Tensor) and v.dim() == 0 else v
+            for k, v in losses.items()
+            if not isinstance(v, torch.Tensor) or v.dim() == 0
+        }
+        self._last_loss_components["grad_norm"] = self._last_grad_norm
         return loss_total.detach()
 
     def compute_iso_loss(

@@ -186,13 +186,7 @@ class HDIMModel(nn.Module):
 
                 dispatch, combine = moe._compute_dispatch_combine(x_flat)
                 slot_inputs = dispatch.T @ x_flat
-
-                x_exp = slot_inputs.view(moe.num_experts, moe.slots_per_expert, -1)
-                h = torch.einsum('esd,ehd->esh', x_exp, moe.W1_stack) + moe.b1_stack.unsqueeze(1)
-                h = torch.nn.functional.gelu(h)
-                h = torch.nn.functional.dropout(h, p=0.1, training=moe.training)
-                out = torch.einsum('esh,edh->esd', h, moe.W2_stack) + moe.b2_stack.unsqueeze(1)
-                slot_outputs = out.reshape(-1, slot_inputs.shape[-1])
+                slot_outputs = moe._evaluate_experts(slot_inputs)
                 output = combine @ slot_outputs
                 return output.reshape(orig_shape)
 
@@ -331,6 +325,123 @@ class HDIMModel(nn.Module):
             topk_gate_weights,
         )
 
+    def _build_rotor_stacks(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build stacked normalized and inverse rotor tensors for all domains."""
+        pipeline = self.pipeline
+        rotors_n = torch.stack(
+            [pipeline.domain_rotors[self._domain_names[i]]._normalized_R()
+             for i in range(len(self._domain_names))]
+        )
+        rotors_inv = torch.stack(
+            [pipeline.domain_rotors[self._domain_names[i]].get_inverse()
+             for i in range(len(self._domain_names))]
+        )
+        return rotors_n, rotors_inv
+
+    def _forward_core(
+        self,
+        x: torch.Tensor,
+        R_inv_extractor: torch.Tensor,
+        R_extractor: torch.Tensor,
+        R_transfer: torch.Tensor,
+        R_transfer_inv: torch.Tensor,
+        group_masks: List[torch.Tensor],
+        runtime: HDIMRuntimeConfig,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor, bool,
+    ]:
+        """Shared core for forward and transfer_pairs.
+
+        Runs encode, invariant extraction, memory, MoE routing, transfer, decode.
+
+        Args:
+            x: Input tensor (batch_size, hidden_dim).
+            R_inv_extractor: Inverse rotor for invariant extraction (per-sample).
+            R_extractor: Forward rotor for invariant extraction (per-sample).
+            R_transfer: Forward rotor for domain transfer (per-sample).
+            R_transfer_inv: Inverse rotor for domain transfer (per-sample).
+            group_masks: Boolean masks defining MoE routing groups.
+            runtime: Memory lifecycle configuration.
+        """
+        batch_size = x.shape[0]
+        device, dtype = x.device, x.dtype
+        pipeline = self.pipeline
+
+        output = torch.empty_like(x)
+        (
+            raw_invariant, memory_augmented_invariant, exported_invariant,
+            routing_weights, topk_idx, topk_gate_weights,
+        ) = self._allocate_state_tensors(batch_size=batch_size, device=device, dtype=dtype)
+
+        _num_experts = pipeline.moe.num_experts
+        train_scores_snapshot = torch.empty(_num_experts, device=device, dtype=dtype)
+        expert_usage = torch.empty(_num_experts, device=device, dtype=dtype)
+
+        # 1) Encode
+        g_source = pipeline.encoder(x)
+
+        # 2) Invariant extraction
+        step1 = pipeline.algebra.geometric_product(R_inv_extractor, g_source)
+        u_inv = pipeline.algebra.geometric_product(step1, R_extractor)
+        u_inv = pipeline.invariant_norm(u_inv)
+
+        # 3) Memory
+        u_mem, memory_state = pipeline._apply_memory(
+            u_inv,
+            update_memory=runtime.update_memory,
+            memory_mode=runtime.memory_mode,
+        )
+
+        # 4) MoE routing per group
+        u_route = torch.empty_like(u_mem)
+        router_loss = torch.zeros((), device=device, dtype=dtype)
+        z_loss = torch.zeros((), device=device, dtype=dtype)
+        routing_entropy = torch.zeros((), device=device, dtype=dtype)
+
+        for mask in group_masks:
+            group_route, group_router_state = pipeline.moe(u_mem[mask])
+            u_route[mask] = group_route.to(dtype=u_route.dtype)
+
+            routing_weights[mask] = group_router_state["gate_weights"].to(dtype=dtype)
+            topk_idx[mask] = group_router_state["topk_idx"].to(device=device)
+            topk_gate_weights[mask] = group_router_state["topk_gate_weights"].to(dtype=dtype)
+            router_loss = router_loss + group_router_state["router_loss"].to(dtype=dtype)
+            z_loss = z_loss + group_router_state.get(
+                "z_loss", torch.zeros((), device=device, dtype=dtype)
+            ).to(dtype=dtype)
+            routing_entropy = routing_entropy + group_router_state["routing_entropy"].to(dtype=dtype)
+            train_scores_snapshot.copy_(group_router_state["train_scores_snapshot"].to(dtype=dtype))
+            expert_usage.copy_(group_router_state["expert_usage"].to(dtype=dtype))
+
+        # 5) Transfer
+        step2 = pipeline.algebra.geometric_product(R_transfer, u_route)
+        g_target = pipeline.algebra.geometric_product(step2, R_transfer_inv)
+
+        # 6) Decode
+        output[:] = pipeline.decoder(g_target)
+
+        exported_invariant[:] = u_route.to(dtype=dtype)
+        raw_invariant[:] = u_inv.to(dtype=dtype)
+        memory_augmented_invariant[:] = u_mem.to(dtype=dtype)
+
+        memory_loss = memory_state.loss.to(dtype=dtype)
+        memory_updated = bool(memory_state.updated)
+
+        total_samples = max(batch_size, 1)
+        memory_loss = memory_loss / total_samples
+        router_loss = router_loss / total_samples
+        z_loss = z_loss / total_samples
+
+        return (
+            output, routing_weights, raw_invariant, memory_augmented_invariant,
+            exported_invariant, topk_idx, topk_gate_weights,
+            train_scores_snapshot, expert_usage, routing_entropy,
+            memory_loss, router_loss, z_loss, memory_updated,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -351,95 +462,21 @@ class HDIMModel(nn.Module):
             memory_mode=memory_mode,
         )
 
-        batch_size = x.shape[0]
-        output = torch.empty_like(x)
-        (
-            raw_invariant,
-            memory_augmented_invariant,
-            exported_invariant,
-            routing_weights,
-            topk_idx,
-            topk_gate_weights,
-        ) = self._allocate_state_tensors(
-            batch_size=batch_size, device=x.device, dtype=x.dtype,
-        )
-        _num_experts_fwd = self.pipeline.moe.num_experts
-        train_scores_snapshot = torch.empty(
-            _num_experts_fwd, device=x.device, dtype=x.dtype,
-        )
-        expert_usage = torch.empty(
-            _num_experts_fwd, device=x.device, dtype=x.dtype,
-        )
-        memory_loss = torch.zeros((), device=x.device, dtype=x.dtype)
-        router_loss = torch.zeros((), device=x.device, dtype=x.dtype)
-        z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
-        routing_entropy = torch.zeros((), device=x.device, dtype=x.dtype)
-        memory_updated = False
-
-        pipeline = self.pipeline
-
-        # 1) Encode full batch once
-        g_source = pipeline.encoder(x)
-
-        # 2) Build per-sample rotors
-        rotors_n = torch.stack(
-            [pipeline.domain_rotors[self._domain_names[i]]._normalized_R()
-             for i in range(len(self._domain_names))]
-        )
-        rotors_inv = torch.stack(
-            [pipeline.domain_rotors[self._domain_names[i]].get_inverse()
-             for i in range(len(self._domain_names))]
-        )
+        rotors_n, rotors_inv = self._build_rotor_stacks()
         R_per_sample = rotors_n[domain_id]
         R_inv_per_sample = rotors_inv[domain_id]
 
-        # 3) Batched invariant extraction
-        step1 = pipeline.algebra.geometric_product(R_inv_per_sample, g_source)
-        u_inv = pipeline.algebra.geometric_product(step1, R_per_sample)
-        u_inv = pipeline.invariant_norm(u_inv)
+        group_masks = [domain_id == idx for idx in domain_id.unique(sorted=True)]
 
-        # 4) Apply memory
-        u_mem, memory_state = pipeline._apply_memory(
-            u_inv,
-            update_memory=runtime.update_memory,
-            memory_mode=runtime.memory_mode,
+        (
+            output, routing_weights, raw_invariant, memory_augmented_invariant,
+            exported_invariant, topk_idx, topk_gate_weights,
+            train_scores_snapshot, expert_usage, _routing_entropy,
+            memory_loss, router_loss, z_loss, memory_updated,
+        ) = self._forward_core(
+            x, R_inv_per_sample, R_per_sample, R_per_sample, R_inv_per_sample,
+            group_masks, runtime,
         )
-
-        # 5) MoE routing — per domain group
-        u_route = torch.empty_like(u_mem)
-        for batch_domain_idx in domain_id.unique(sorted=True):
-            mask = domain_id == batch_domain_idx
-            group_route, group_router_state = pipeline.moe(u_mem[mask])
-            u_route[mask] = group_route.to(dtype=u_route.dtype)
-
-            routing_weights[mask] = group_router_state["gate_weights"].to(dtype=x.dtype)
-            topk_idx[mask] = group_router_state["topk_idx"].to(device=x.device)
-            topk_gate_weights[mask] = group_router_state["topk_gate_weights"].to(dtype=x.dtype)
-            router_loss = router_loss + group_router_state["router_loss"].to(dtype=x.dtype)
-            z_loss = z_loss + group_router_state.get(
-                "z_loss", torch.zeros((), device=x.device, dtype=x.dtype)
-            ).to(dtype=x.dtype)
-            routing_entropy = routing_entropy + group_router_state["routing_entropy"].to(dtype=x.dtype)
-            train_scores_snapshot.copy_(group_router_state["train_scores_snapshot"].to(dtype=x.dtype))
-            expert_usage.copy_(group_router_state["expert_usage"].to(dtype=x.dtype))
-
-        # 6) Batched domain transfer
-        step2 = pipeline.algebra.geometric_product(R_per_sample, u_route)
-        g_target = pipeline.algebra.geometric_product(step2, R_inv_per_sample)
-
-        # 7) Decode
-        output[:] = pipeline.decoder(g_target)
-
-        exported_invariant[:] = u_route.to(dtype=x.dtype)
-        raw_invariant[:] = u_inv.to(dtype=x.dtype)
-        memory_augmented_invariant[:] = u_mem.to(dtype=x.dtype)
-        memory_loss = memory_state.loss.to(dtype=x.dtype)
-        memory_updated = bool(memory_state.updated)
-
-        total_samples = max(batch_size, 1)
-        memory_loss = memory_loss / total_samples
-        router_loss = router_loss / total_samples
-        z_loss = z_loss / total_samples
 
         invariant = self.training_inv_head(exported_invariant).to(dtype=x.dtype)
 
@@ -453,7 +490,7 @@ class HDIMModel(nn.Module):
                 topk_gate_weights=topk_gate_weights,
                 train_scores_snapshot=train_scores_snapshot,
                 expert_usage=expert_usage,
-                routing_entropy=routing_entropy,
+                routing_entropy=_routing_entropy,
                 memory_loss=memory_loss,
                 router_loss=router_loss,
                 z_loss=z_loss,
@@ -562,119 +599,35 @@ class HDIMModel(nn.Module):
             memory_mode=memory_mode,
         )
 
-        batch_size = source_encoding.shape[0]
-        (
-            raw_invariant,
-            memory_augmented_invariant,
-            exported_invariant,
-            routing_weights,
-            topk_idx,
-            topk_gate_weights,
-        ) = self._allocate_state_tensors(
-            batch_size=batch_size,
-            device=source_encoding.device,
-            dtype=source_encoding.dtype,
-        )
-        _num_experts_tp = self.pipeline.moe.num_experts
-        train_scores_snapshot = torch.empty(
-            _num_experts_tp,
-            device=source_encoding.device,
-            dtype=source_encoding.dtype,
-        )
-        expert_usage = torch.empty(
-            _num_experts_tp,
-            device=source_encoding.device,
-            dtype=source_encoding.dtype,
-        )
-        output = torch.empty_like(source_encoding)
-        memory_loss = torch.zeros(
-            (), device=source_encoding.device, dtype=source_encoding.dtype
-        )
-        router_loss = torch.zeros(
-            (), device=source_encoding.device, dtype=source_encoding.dtype
-        )
-        z_loss = torch.zeros(
-            (), device=source_encoding.device, dtype=source_encoding.dtype
-        )
-        routing_entropy = torch.zeros(
-            (), device=source_encoding.device, dtype=source_encoding.dtype
-        )
-        memory_updated = False
-
-        pipeline = self.pipeline
-
-        # 1) Encode full batch once
-        g_source = pipeline.encoder(source_encoding)
-
-        # 2) Build per-sample source/target rotors
-        rotors_n = torch.stack(
-            [
-                pipeline.domain_rotors[self._domain_names[i]]._normalized_R()
-                for i in range(len(self._domain_names))
-            ]
-        )
-        rotors_inv = torch.stack(
-            [
-                pipeline.domain_rotors[self._domain_names[i]].get_inverse()
-                for i in range(len(self._domain_names))
-            ]
-        )
+        rotors_n, rotors_inv = self._build_rotor_stacks()
         R_src_per_sample = rotors_n[source_domain_id]
         R_src_inv_per_sample = rotors_inv[source_domain_id]
         R_tgt_per_sample = rotors_n[target_domain_id]
         R_tgt_inv_per_sample = rotors_inv[target_domain_id]
 
-        # 3) Batched invariant extraction
-        step1 = pipeline.algebra.geometric_product(R_src_inv_per_sample, g_source)
-        u_inv = pipeline.algebra.geometric_product(step1, R_src_per_sample)
-        u_inv = pipeline.invariant_norm(u_inv)
-
-        # 4) Apply memory
-        u_mem, memory_state = pipeline._apply_memory(
-            u_inv,
-            update_memory=runtime.update_memory,
-            memory_mode=runtime.memory_mode,
-        )
-
-        # 5) MoE routing per (src, tgt) pair group
-        u_route = torch.empty_like(u_mem)
         pair_keys = torch.stack((source_domain_id, target_domain_id), dim=1)
         unique_pairs = pair_keys.unique(dim=0)
-        for pair in unique_pairs:
-            src_idx, tgt_idx = int(pair[0].item()), int(pair[1].item())
-            mask = (source_domain_id == src_idx) & (target_domain_id == tgt_idx)
-            group_route, group_router_state = pipeline.moe(u_mem[mask])
-            u_route[mask] = group_route.to(dtype=u_route.dtype)
-            routing_weights[mask] = group_router_state["gate_weights"].to(dtype=source_encoding.dtype)
-            topk_idx[mask] = group_router_state["topk_idx"].to(device=source_encoding.device)
-            topk_gate_weights[mask] = group_router_state["topk_gate_weights"].to(dtype=source_encoding.dtype)
-            router_loss = router_loss + group_router_state["router_loss"].to(dtype=source_encoding.dtype)
-            z_loss = z_loss + group_router_state.get(
-                "z_loss", torch.zeros((), device=source_encoding.device, dtype=source_encoding.dtype)
-            ).to(dtype=source_encoding.dtype)
-            routing_entropy = routing_entropy + group_router_state["routing_entropy"].to(dtype=source_encoding.dtype)
-            train_scores_snapshot.copy_(group_router_state["train_scores_snapshot"].to(dtype=source_encoding.dtype))
-            expert_usage.copy_(group_router_state["expert_usage"].to(dtype=source_encoding.dtype))
+        group_masks = [
+            (source_domain_id == int(p[0].item())) & (target_domain_id == int(p[1].item()))
+            for p in unique_pairs
+        ]
 
-        # 6) Batched domain transfer
-        step2 = pipeline.algebra.geometric_product(R_tgt_per_sample, u_route)
-        g_target = pipeline.algebra.geometric_product(step2, R_tgt_inv_per_sample)
+        (
+            output, routing_weights, raw_invariant, memory_augmented_invariant,
+            exported_invariant, topk_idx, topk_gate_weights,
+            train_scores_snapshot, expert_usage, _routing_entropy,
+            memory_loss, router_loss, z_loss, memory_updated,
+        ) = self._forward_core(
+            source_encoding,
+            R_src_inv_per_sample, R_src_per_sample,
+            R_tgt_per_sample, R_tgt_inv_per_sample,
+            group_masks, runtime,
+        )
 
-        # 7) Decode
-        output[:] = pipeline.decoder(g_target)
+        invariant = self.training_inv_head(exported_invariant).to(
+            dtype=source_encoding.dtype
+        )
 
-        exported_invariant[:] = u_route.to(dtype=source_encoding.dtype)
-        raw_invariant[:] = u_inv.to(dtype=source_encoding.dtype)
-        memory_augmented_invariant[:] = u_mem.to(dtype=source_encoding.dtype)
-        memory_loss = memory_state.loss.to(dtype=source_encoding.dtype)
-        memory_updated = bool(memory_state.updated)
-
-        total_samples = max(batch_size, 1)
-        memory_loss = memory_loss / total_samples
-        router_loss = router_loss / total_samples
-        z_loss = z_loss / total_samples
-
-        invariant = self.training_inv_head(exported_invariant).to(dtype=source_encoding.dtype)
         aux_state = self._build_aux_state(
             raw_invariant=raw_invariant,
             memory_augmented_invariant=memory_augmented_invariant,
@@ -684,7 +637,7 @@ class HDIMModel(nn.Module):
             topk_gate_weights=topk_gate_weights,
             train_scores_snapshot=train_scores_snapshot,
             expert_usage=expert_usage,
-            routing_entropy=routing_entropy,
+            routing_entropy=_routing_entropy,
             memory_loss=memory_loss,
             router_loss=router_loss,
             z_loss=z_loss,
