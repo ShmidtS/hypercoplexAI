@@ -427,13 +427,15 @@ class SemanticMemory(nn.Module):
         self.proto_age += 1
 
         # Vectorized centroid computation via scatter_reduce
+        # Always fp32 to avoid AMP fp16/fp32 dtype mismatch in scatter_add_
         D = h_norm.shape[1]
-        proto_sum   = torch.zeros(self.num_prototypes, D, device=h.device, dtype=h.dtype)
-        proto_count = torch.zeros(self.num_prototypes, device=h.device, dtype=h.dtype)
+        proto_sum   = torch.zeros(self.num_prototypes, D, device=h.device, dtype=torch.float32)
+        proto_count = torch.zeros(self.num_prototypes, device=h.device, dtype=torch.float32)
+        h_norm_f32 = h_norm.float()
 
         # Expand assigns for scatter: [B] -> [B, 1] to broadcast over dim
-        proto_sum.scatter_add_(0, assigns.unsqueeze(-1).expand(-1, D), h_norm)
-        proto_count.scatter_add_(0, assigns, torch.ones_like(assigns, dtype=h.dtype))
+        proto_sum.scatter_add_(0, assigns.unsqueeze(-1).expand(-1, D), h_norm_f32)
+        proto_count.scatter_add_(0, assigns, torch.ones_like(assigns, dtype=torch.float32))
 
         # Per-prototype loop: contradiction check + EMA update
         has_samples = proto_count > 0
