@@ -1,6 +1,6 @@
 """Numerical verification of all Lean4 formalization theorems for HDIM."""
 import torch, math
-from src.core.hypercomplex import CliffordAlgebra
+from src.core.hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from src.core.domain_operators import DomainRotationOperator, sandwich_transfer, InvariantExtractor
 from src.core.memory_interface import TitansAdapter, HBMAMemoryAdapter
 from src.core.titans_memory import TitansMemoryModule
@@ -186,6 +186,102 @@ for p,q,r in [(2,0,0),(3,1,0)]:
     status = 'PASS' if abs(r_norm - 1.0) < 0.01 else 'FAIL'
     print(f'  Cl({p},{q},{r}): ||R||={r_norm:.6f} [{status}]')
     results.append((f'domain_rotor_norm_Cl{p}{q}{r}', status))
+
+# ===== 10. Quaternion Linear Properties =====
+print('\n--- 10. quaternion_linear_properties ---')
+ql = QuaternionLinear(32, 32, bias=True)
+x = torch.randn(4, 32)
+out = ql(x)
+shape_ok = out.shape == (4, 32)
+print(f'  forward shape: {out.shape} [{"PASS" if shape_ok else "FAIL"}]')
+results.append(('quat_linear_shape', 'PASS' if shape_ok else 'FAIL'))
+
+# Gradient flow
+loss = out.sum()
+loss.backward()
+grad_ok = ql.Wr.grad is not None and ql.Wr.grad.abs().sum() > 0
+print(f'  gradient flow: [{"PASS" if grad_ok else "FAIL"}]')
+results.append(('quat_linear_grad', 'PASS' if grad_ok else 'FAIL'))
+
+# Quaternion weight structure: Hamilton product matrix should be block-structured
+W = ql.hamilton_product_weights()
+assert W.shape == (32, 32), f"Expected (32,32), got {W.shape}"
+# Check block structure: Wr should appear on diagonal blocks
+# The first 8x8 block should equal Wr
+block_diag = W[:8, :8]
+wr_match = (block_diag - ql.Wr).abs().max().item() < 1e-6
+print(f'  Hamilton block structure: [{"PASS" if wr_match else "FAIL"}]')
+results.append(('quat_hamilton_structure', 'PASS' if wr_match else 'FAIL'))
+
+# ===== 11. QLayerNorm Properties =====
+print('\n--- 11. qlayernorm_properties ---')
+qln = QLayerNorm(8)
+x = torch.randn(3, 32)
+out = qln(x)
+shape_ok = out.shape == (3, 32)
+print(f'  forward shape: {out.shape} [{"PASS" if shape_ok else "FAIL"}]')
+results.append(('qlayernorm_shape', 'PASS' if shape_ok else 'FAIL'))
+
+# Each quadrant normalized independently: var of each chunk ~ 1
+var_ok = True
+for i in range(4):
+    chunk = out[:, i*8:(i+1)*8]
+    var = chunk.var(dim=-1).mean().item()
+    if abs(var - 1.0) > 0.5:
+        var_ok = False
+print(f'  per-component normalization: [{"PASS" if var_ok else "FAIL"}]')
+results.append(('qlayernorm_normalize', 'PASS' if var_ok else 'FAIL'))
+
+# ===== 12. Geometric Product Associativity =====
+print('\n--- 12. geometric_product_associativity (30 trials) ---')
+ca = CliffordAlgebra(3,1,0)
+max_diff = 0.0
+for _ in range(30):
+    a = torch.randn(1, ca.dim)
+    b = torch.randn(1, ca.dim)
+    c = torch.randn(1, ca.dim)
+    ab_c = ca.geometric_product(ca.geometric_product(a, b), c)
+    a_bc = ca.geometric_product(a, ca.geometric_product(b, c))
+    diff = (ab_c - a_bc).abs().max().item()
+    max_diff = max(max_diff, diff)
+status = 'PASS' if max_diff < 1e-4 else 'FAIL'
+print(f'  max_diff={max_diff:.2e} [{status}]')
+results.append(('geom_assoc', status))
+
+# ===== 13. Reverse involutive: reverse(reverse(x)) = x =====
+print('\n--- 13. reverse_involution ---')
+for p,q,r in [(2,0,0),(3,1,0),(4,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    x = torch.randn(5, ca.dim)
+    x_rev_rev = ca.reverse(ca.reverse(x))
+    diff = (x_rev_rev - x).abs().max().item()
+    status = 'PASS' if diff < 1e-6 else 'FAIL'
+    print(f'  Cl({p},{q},{r}): diff={diff:.2e} [{status}]')
+    results.append((f'rev_involution_Cl{p}{q}{r}', status))
+
+# ===== 14. Involution twice = identity: inv(inv(x)) = x =====
+print('\n--- 14. involution_twice ---')
+for p,q,r in [(2,0,0),(3,1,0),(4,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    x = torch.randn(5, ca.dim)
+    x_inv_inv = ca.involute(ca.involute(x))
+    diff = (x_inv_inv - x).abs().max().item()
+    status = 'PASS' if diff < 1e-6 else 'FAIL'
+    print(f'  Cl({p},{q},{r}): diff={diff:.2e} [{status}]')
+    results.append((f'inv_twice_Cl{p}{q}{r}', status))
+
+# ===== 15. Norm non-negativity =====
+print('\n--- 15. norm_nonnegativity (20 trials) ---')
+ca = CliffordAlgebra(3,1,0)
+all_nonneg = True
+for _ in range(20):
+    x = torch.randn(4, ca.dim)
+    n = ca.norm(x)
+    if (n < 0).any():
+        all_nonneg = False
+status = 'PASS' if all_nonneg else 'FAIL'
+print(f'  all non-negative: [{status}]')
+results.append(('norm_nonneg', status))
 
 # ===== Summary =====
 print('\n' + '='*60)
