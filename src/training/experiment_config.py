@@ -70,6 +70,11 @@ class ExperimentConfig:
     # ------------------------------------------------------------------ #
     soft_router: bool = False
     modernbert_encoder: bool = False
+    modernbert_model_name: str = "answerdotai/ModernBERT-base"
+    freeze_modernbert: bool = True
+    modernbert_use_cls_pooling: bool = True
+    modernbert_max_length: int = 512
+    matryoshka_dims: Optional[list] = None
 
     # ------------------------------------------------------------------ #
     # Misc extras                                                         #

@@ -219,6 +219,11 @@ def model_from_experiment_config(
             return build_modernbert_hdim_model(
                 cfg,
                 soft_router=exp.soft_router,
+                modernbert_model_name=getattr(exp, 'modernbert_model_name', 'answerdotai/ModernBERT-base'),
+                freeze_modernbert=getattr(exp, 'freeze_modernbert', True),
+                use_cls_pooling=getattr(exp, 'modernbert_use_cls_pooling', True),
+                max_length=getattr(exp, 'modernbert_max_length', 512),
+                matryoshka_dims=getattr(exp, 'matryoshka_dims', None),
                 z_loss_weight=z_loss_weight,
             )
         if getattr(exp, "pretrained_encoder", False):
