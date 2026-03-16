@@ -349,12 +349,18 @@ class ModernBertEncoder(nn.Module):
         # Project
         if hasattr(self, 'use_matryoshka') and self.use_matryoshka:
             result = self.projection(pooled, target_dim=target_dim)
+            # Return output_dim tensor by default; dict only when target_dim="all"
+            if isinstance(result, dict) and target_dim is None:
+                result = result[self.output_dim]
         else:
             result = self.projection(pooled)
-        
+
         if dtype is not None:
-            result = result.to(dtype=dtype)
-        
+            if isinstance(result, dict):
+                result = {k: v.to(dtype=dtype) for k, v in result.items()}
+            else:
+                result = result.to(dtype=dtype)
+
         return result
 
 

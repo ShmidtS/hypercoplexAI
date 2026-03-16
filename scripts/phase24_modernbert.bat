@@ -49,7 +49,6 @@ python scripts\gpu_train.py ^
     --t_mult 2 ^
     --warmup_epochs 3 ^
     --gradient_checkpointing ^
-    --similarity_preserving_router ^
     --early_stopping_patience 5 ^
     --eval_every 5 ^
     --save_every 25 ^
