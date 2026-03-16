@@ -120,11 +120,20 @@ class CliffordAlgebra(nn.Module):
             result: (..., dim)
 
         Формула: (a ⊗ b)_c = Σ_{i,j: e_i*e_j=±e_c} sign * a_i * b_j
+
+        Note: arithmetic is always done in float32 to prevent fp16 overflow
+        from the dim×dim outer product (Cl(p,q,r) dim=16 for p+q+r=4).
         """
         D = self.dim
         device = a.device
         signs = self.cayley_signs      # (D, D)
         indices = self.cayley_indices  # (D, D)
+
+        # Upcast to float32 for numerical stability under AMP autocast
+        orig_dtype = a.dtype
+        if a.dtype != torch.float32:
+            a = a.float()
+            b = b.float()
 
         # a: (..., D), b: (..., D)
         # outer: (..., D, D)
@@ -145,6 +154,9 @@ class CliffordAlgebra(nn.Module):
         if self.use_learnable_metric:
             result = result * self.learnable_metric
 
+        # Cast back to original dtype (fp16/bf16)
+        if orig_dtype != torch.float32:
+            result = result.to(orig_dtype)
         return result
 
     def _build_sign_buffers(self):
