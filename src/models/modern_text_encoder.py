@@ -188,8 +188,7 @@ class GatedMLPEncoder(nn.Module):
             self.projection = MatryoshkaProjection(d_model, matryoshka_dims)
         else:
             self.projection = nn.Linear(d_model, output_dim)
-            self.projection尺度 = None
-        
+
     def forward(
         self,
         token_ids: torch.Tensor,
@@ -236,7 +235,7 @@ class GatedMLPEncoder(nn.Module):
             pooled = x.mean(dim=1)
         
         # Project to output
-        if hasattr(self, 'projection尺度') and self.projection尺度 is not None:
+        if isinstance(self.projection, MatryoshkaProjection):
             return self.projection(pooled, target_dim=target_dim)
         return self.projection(pooled)
 

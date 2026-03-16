@@ -91,31 +91,6 @@ class InvariantExtractor(nn.Module):
         return self.forward(G_source, R)
 
 
-class DomainRegistry:
-    """Реестр обучаемых роторов доменов."""
-
-    def __init__(self):
-        self._operators: Dict[str, DomainRotationOperator] = {}
-
-    def register(self, name: str, operator: DomainRotationOperator) -> None:
-        self._operators[name] = operator
-
-    def get(self, name: str) -> DomainRotationOperator:
-        if name not in self._operators:
-            raise KeyError(f"Domain {name} not registered")
-        return self._operators[name]
-
-    def all_operators(self) -> Dict[str, DomainRotationOperator]:
-        return dict(self._operators)
-
-    def __contains__(self, name: str) -> bool:
-        return name in self._operators
-
-    def parameters(self):
-        for operator in self._operators.values():
-            yield from operator.parameters()
-
-
 def sandwich_transfer(
     algebra: CliffordAlgebra,
     G_source: torch.Tensor,
