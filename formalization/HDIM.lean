@@ -22,6 +22,12 @@
 -- Added: HBMA formalization, MemoryInterface ABC, sandwich_composition.
 -- Added: bilinearity, linearity, idempotency, nilpotent basis, quaternionic layers,
 --         SoftMoE, HBMA capacity, Titans stability.
+-- Updated 2026-03-18: 159/159 numerical proofs PASS (Phase 28: MoEKernel +11 theorems)
+-- - MoEKernel with 4 domain experts: Math, Language, Code, Science
+-- - Verified: combine/dispatch normalization, load balance, gradient flow
+-- - Verified: ortho loss, similarity loss, aux-loss-free bias, shared expert
+-- - New: moe_kernel.py (560K params, Soft MoE + DeepSeek-V3 extensions)
+-- - Tests: 168 pytest PASS (was 123, +45 test_moe_kernel.py)
 
 -- ============================================================
 --  0. Helper Lemma
@@ -464,6 +470,38 @@ def HDIMSystem.target {sig} [CliffordAlgebra sig] [HasReverse (Multivector sig)]
 - Removed: `domain_expert_pool.py` (259 lines, never imported by code)
 - Kept: clifford_p=4 default (Phase 25 intentional Cl(4,1,0) upgrade)
 - Kept: memory_type="titans" default (1.76x faster than HBMA, slightly better loss)
+
+## Phase 28 Additions (2026-03-18): MoEKernel
+- `moe_kernel.py`: Full MoE routing kernel with 4 domain experts
+  MathExpert: 2-layer bottleneck FFN (GELU), wider hidden_dim for numeric patterns
+  LanguageExpert: pre-norm + GELU for semantic stability
+  CodeExpert: SiLU activation for structured logic patterns
+  ScienceExpert: Tanh for bounded physical-range activations
+  SharedExpert (DeepSeek-V3): always-on residual FFN
+- MoEKernelConfig: dataclass with expert_names, slots_per_expert, aux settings
+- MoEKernelState: typed output with expert_weights, dispatch/combine, losses
+- Auxiliary-Loss-Free per-expert bias (DeepSeek-V3, arXiv:2412.19437)
+- Expert Orthogonalization loss (arXiv:2505.22323)
+- Router Similarity-Preserving loss (SIMBAL, arXiv:2506.14038)
+- EXPERT_REGISTRY + create_expert() factory for extensible expert registration
+- `test_moe_kernel.py`: 45 pytest tests (all PASS)
+- `scripts/run_moe_demo.py`: 9-section integration demo (all PASS)
+- Lean4 theorems 116-126: MoEKernel numerical verification (11 new, all PASS)
+- Total: 159/159 Lean4 PASS, 168/168 pytest PASS
+
+## Implementation Correspondence (Phase 28):
+| Formal Concept        | HDIM Code                        | File:Line                |
+|-----------------------|----------------------------------|--------------------------|
+| MoEKernel             | MoEKernel                        | moe_kernel.py:156        |
+| DomainExpert          | DomainExpert (base class)        | moe_kernel.py:82         |
+| MathExpert            | MathExpert                       | moe_kernel.py:107        |
+| LanguageExpert        | LanguageExpert                   | moe_kernel.py:125        |
+| CodeExpert            | CodeExpert                       | moe_kernel.py:138        |
+| ScienceExpert         | ScienceExpert                    | moe_kernel.py:152        |
+| dispatch/combine      | _compute_dispatch_combine()      | moe_kernel.py:219        |
+| expert ortho loss     | expert_orthogonalization_loss()  | moe_kernel.py:357        |
+| router similarity     | router_similarity_loss()         | moe_kernel.py:379        |
+| aux bias update       | _expert_bias (AuxLossFree)       | moe_kernel.py:196        |
 
 ## Session 2 Additions (2026-03-16):
 - MemoryInterface ABC created (memory_interface.py) — unifies Titans and HBMA APIs

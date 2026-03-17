@@ -2352,6 +2352,200 @@ status = 'PASS' if all_ok else 'FAIL'
 print(f' Working memory slot reuse (oldest evicted first): [{status}]')
 results.append(('hbma_working_slot_reuse', status))
 
+
+# ===== 116. MoEKernel: combine weights sum to 1 =====
+print('\n--- 116. moe_kernel_combine_sums_to_one ---')
+from src.core.moe_kernel import MoEKernel, MoEKernelConfig
+all_ok = True
+torch.manual_seed(1160)
+cfg116 = MoEKernelConfig(
+    input_dim=64, expert_hidden_dim=128, num_experts=4,
+    expert_names=['math','language','code','science']
+)
+k116 = MoEKernel(cfg116)
+k116.eval()
+with torch.no_grad():
+    x116 = torch.randn(32, 64)
+    _, st116 = k116(x116)
+    combine = st116.combine_weights
+    sums = combine.sum(dim=-1)
+    max_err_116 = (sums - 1.0).abs().max().item()
+    if max_err_116 > 1e-5:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Combine weights sum to 1 (max_err={max_err_116:.2e}): [{status}]')
+results.append(('moe_kernel_combine_sums_to_one', status))
+
+# ===== 117. MoEKernel: dispatch weights sum to 1 per slot =====
+print('\n--- 117. moe_kernel_dispatch_sums_to_one ---')
+all_ok = True
+torch.manual_seed(1170)
+k117 = MoEKernel(cfg116)
+k117.eval()
+with torch.no_grad():
+    x117 = torch.randn(16, 64)
+    _, st117 = k117(x117)
+    dispatch = st117.dispatch_weights
+    dsums = dispatch.sum(dim=0)
+    max_err_d = (dsums - 1.0).abs().max().item()
+    if max_err_d > 1e-5:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Dispatch weights sum to 1 per slot (max_err={max_err_d:.2e}): [{status}]')
+results.append(('moe_kernel_dispatch_sums_to_one', status))
+
+# ===== 118. MoEKernel: no NaN for 50 random inputs at varied scale =====
+print('\n--- 118. moe_kernel_no_nan_50_trials ---')
+all_ok = True
+k118 = MoEKernel(cfg116)
+k118.eval()
+with torch.no_grad():
+    for _trial in range(50):
+        torch.manual_seed(1180 + _trial)
+        _scale = 10 ** (_trial % 3)
+        x118 = torch.randn(8, 64) * _scale
+        out118, _ = k118(x118)
+        if torch.isnan(out118).any() or torch.isinf(out118).any():
+            all_ok = False
+            break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' No NaN/Inf in output (50 trials, varied scale): [{status}]')
+results.append(('moe_kernel_no_nan_50_trials', status))
+
+# ===== 119. MoEKernel: gradient flows to all 4 domain experts =====
+print('\n--- 119. moe_kernel_gradient_all_experts ---')
+all_ok = True
+torch.manual_seed(1190)
+k119 = MoEKernel(cfg116)
+k119.train()
+x119 = torch.randn(8, 64, requires_grad=True)
+out119, st119 = k119(x119)
+loss119 = out119.mean() + st119.total_loss()
+loss119.backward()
+if x119.grad is None or torch.isnan(x119.grad).any():
+    all_ok = False
+for _expert in k119.experts:
+    for _p in _expert.parameters():
+        if _p.grad is None or torch.isnan(_p.grad).any():
+            all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Gradient flows to all 4 domain experts: [{status}]')
+results.append(('moe_kernel_gradient_all_experts', status))
+
+# ===== 120. MoEKernel: load balance near uniform (max_dev < 0.2) =====
+print('\n--- 120. moe_kernel_load_balance_uniform ---')
+all_ok = True
+torch.manual_seed(1200)
+k120 = MoEKernel(cfg116)
+k120.eval()
+with torch.no_grad():
+    x120 = torch.randn(128, 64)
+    _, st120 = k120(x120)
+max_dev120 = (st120.expert_usage - 0.25).abs().max().item()
+if max_dev120 > 0.2:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Expert load max_dev={max_dev120:.4f} (threshold 0.2): [{status}]')
+results.append(('moe_kernel_load_balance_uniform', status))
+
+# ===== 121. MoEKernel: expert ortho loss non-negative =====
+print('\n--- 121. moe_kernel_ortho_loss_nonneg ---')
+torch.manual_seed(1210)
+k121 = MoEKernel(cfg116)
+k121.train()
+ortho_l_121 = k121.expert_orthogonalization_loss()
+all_ok = ortho_l_121.item() >= 0 and torch.isfinite(ortho_l_121)
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Expert ortho loss >= 0 (value={ortho_l_121.item():.4f}): [{status}]')
+results.append(('moe_kernel_ortho_loss_nonneg', status))
+
+# ===== 122. MoEKernel: router similarity loss non-negative =====
+print('\n--- 122. moe_kernel_sim_loss_nonneg ---')
+torch.manual_seed(1220)
+k122 = MoEKernel(cfg116)
+sim_l_122 = k122.router_similarity_loss()
+all_ok = sim_l_122.item() >= 0 and torch.isfinite(sim_l_122)
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Router similarity loss >= 0 (value={sim_l_122.item():.4f}): [{status}]')
+results.append(('moe_kernel_sim_loss_nonneg', status))
+
+# ===== 123. MoEKernel: aux-loss-free bias stays bounded after 20 steps =====
+print('\n--- 123. moe_kernel_aux_bias_bounded ---')
+all_ok = True
+torch.manual_seed(1230)
+k123 = MoEKernel(cfg116)
+k123.train()
+for _s in range(20):
+    x123 = torch.randn(32, 64)
+    out123, st123 = k123(x123)
+    loss123 = out123.mean() + st123.router_loss + st123.z_loss
+    loss123.backward()
+    for _p in k123.parameters():
+        if _p.grad is not None:
+            _p.grad.zero_()
+bias_max_123 = k123._expert_bias.data.abs().max().item()
+if bias_max_123 > 1.0:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Expert bias bounded after 20 steps (max={bias_max_123:.4f}): [{status}]')
+results.append(('moe_kernel_aux_bias_bounded', status))
+
+# ===== 124. MoEKernel: shared expert output is finite =====
+print('\n--- 124. moe_kernel_shared_expert_finite ---')
+all_ok = True
+torch.manual_seed(1240)
+cfg124_shared = MoEKernelConfig(
+    input_dim=64, expert_hidden_dim=128, num_experts=4,
+    use_shared_expert=True, expert_names=['math','language','code','science']
+)
+k124 = MoEKernel(cfg124_shared)
+k124.eval()
+x124 = torch.randn(16, 64)
+with torch.no_grad():
+    out124, _ = k124(x124)
+if torch.isnan(out124).any() or torch.isinf(out124).any():
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Shared expert output is finite: [{status}]')
+results.append(('moe_kernel_shared_expert_finite', status))
+
+# ===== 125. MoEKernel: 3D seq input (B, T, D) =====
+print('\n--- 125. moe_kernel_seq_input ---')
+all_ok = True
+torch.manual_seed(1250)
+k125 = MoEKernel(cfg116)
+k125.eval()
+with torch.no_grad():
+    x125 = torch.randn(4, 16, 64)
+    out125, st125 = k125(x125)
+    if out125.shape != (4, 16, 64):
+        all_ok = False
+    if torch.isnan(out125).any():
+        all_ok = False
+    if st125.expert_weights.shape != (4, 16, 4):
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Seq input (4,16,64) -> (4,16,64): [{status}]')
+results.append(('moe_kernel_seq_input', status))
+
+# ===== 126. MoEKernel: domain expert type consistency =====
+print('\n--- 126. moe_kernel_expert_types ---')
+from src.core.moe_kernel import MathExpert, LanguageExpert, CodeExpert, ScienceExpert as SE126
+all_ok = True
+torch.manual_seed(1260)
+k126 = MoEKernel(cfg116)
+type_ok = [
+    isinstance(k126.experts[0], MathExpert),
+    isinstance(k126.experts[1], LanguageExpert),
+    isinstance(k126.experts[2], CodeExpert),
+    isinstance(k126.experts[3], SE126),
+]
+if not all(type_ok):
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Expert types correct {type_ok}: [{status}]')
+results.append(('moe_kernel_expert_types', status))
+
 # ===== Summary =====
 print('\n' + '='*60)
 passed = sum(1 for _,s in results if s == 'PASS')

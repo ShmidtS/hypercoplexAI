@@ -101,6 +101,86 @@ def _patch_modernbert_encoder(
 
 
 
+def _patch_moe_kernel(
+    core_model: HDIMModel,
+    *,
+    expert_names: list | None = None,
+    z_loss_weight: float = 0.01,
+    ortho_loss_weight: float = 0.01,
+) -> None:
+    """Replace pipeline.moe with MoEKernel (wrapped as drop-in) in-place.
+
+    MoEKernel returns (output, MoEKernelState), but HDIMPipeline expects
+    (output, router_state_dict).  The inner MoEKernelRouterAdapter bridges
+    the gap so the pipeline contract is fully preserved.
+    """
+    import torch.nn as nn
+    from src.core.moe_kernel import MoEKernel, MoEKernelConfig
+
+    pipeline = core_model.pipeline
+    cfg = core_model.config
+    input_dim: int = pipeline.clifford_dim
+
+    if expert_names is None:
+        expert_names = ["math", "language", "code", "science"][: cfg.num_experts]
+        if len(expert_names) < cfg.num_experts:
+            expert_names += [
+                f"expert_{i}" for i in range(len(expert_names), cfg.num_experts)
+            ]
+
+    kernel_cfg = MoEKernelConfig(
+        input_dim=input_dim,
+        expert_hidden_dim=input_dim * 2,
+        num_experts=cfg.num_experts,
+        slots_per_expert=1,
+        temperature=1.0,
+        z_loss_weight=z_loss_weight,
+        ortho_loss_weight=ortho_loss_weight,
+        use_shared_expert=True,
+        use_aux_loss_free=True,
+        use_expert_ortho=True,
+        expert_names=expert_names,
+    )
+
+    class MoEKernelRouterAdapter(nn.Module):
+        """Wraps MoEKernel to match the (output, router_state_dict) API of SoftMoERouter."""
+
+        def __init__(self, kernel: MoEKernel, top_k: int = 2):
+            super().__init__()
+            self.kernel = kernel
+            # Expose attributes expected by HDIMPipeline / HDIMModel
+            self.num_experts = kernel.num_experts
+            self.num_slots = kernel.num_slots
+            self.top_k = top_k
+
+        def expert_orthogonalization_loss(self):
+            return self.kernel.expert_orthogonalization_loss()
+
+        def forward(self, x):
+            import torch
+            output, state = self.kernel(x)
+            top_k = min(2, state.expert_weights.shape[-1])
+            topk_weights, topk_idx = state.expert_weights.topk(top_k, dim=-1)
+            topk_weights_norm = topk_weights / topk_weights.sum(-1, keepdim=True).clamp_min(1e-8)
+            router_state = {
+                "loss": state.total_loss(),
+                "router_loss": state.total_loss(),
+                "z_loss": state.z_loss,
+                "gate_weights": state.expert_weights,
+                "scores": state.expert_weights,
+                "expert_usage": state.expert_usage,
+                "routing_entropy": state.routing_entropy,
+                "dispatch_weights": state.dispatch_weights,
+                "train_scores_snapshot": state.expert_usage,
+                "topk_idx": topk_idx,
+                "topk_gate_weights": topk_weights_norm,
+                "moe_kernel_state": state,
+            }
+            return output, router_state
+
+    pipeline.moe = MoEKernelRouterAdapter(MoEKernel(kernel_cfg), top_k=cfg.top_k)  # type: ignore[assignment]
+
+
 # ---------------------------------------------------------------------------
 # Public factory functions
 # ---------------------------------------------------------------------------
