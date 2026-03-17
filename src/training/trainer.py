@@ -1170,18 +1170,36 @@ class HDIMTrainer:
         losses = self._compute_batch_losses(batch)
         loss_total = losses["loss_total"]
         if scaler is not None:
+            # NaN/Inf loss: skip step entirely and force scale reduction.
+            # Without this, backward() produces NaN grads → scaler.step()
+            # considers the step "successful" (no exception) → scaler.update()
+            # keeps the high scale → next normal batch overflows → permanent
+            # loss explosion (7 → 2414 → 18M over 3 epochs).
+            if torch.isnan(loss_total) or torch.isinf(loss_total):
+                # Force scale reduction for stability
+                new_scale = max(scaler.get_scale() * 0.5, 1.0)
+                scaler.update(new_scale)
+                self._last_grad_norm = float('inf')
+                self._step += 1
+                return loss_total.detach()
+
             scaler.scale(loss_total).backward()
             scaler.unscale_(self.optimizer)
-            # Zero NaN/Inf gradients — first batch can produce NaN from
-            # uninitialized state (memory, MoE gate softmax), which corrupts
-            # the GradScaler dynamic scale factor permanently.
+            # Zero NaN/Inf gradients from uninitialized memory/MoE state
+            has_nan_grad = False
             for p in self.model.parameters():
                 if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
                     p.grad.zero_()
+                    has_nan_grad = True
             grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
-            scaler.step(self.optimizer)
-            scaler.update()
+            if has_nan_grad:
+                # NaN grads found — skip step and reduce scale to prevent
+                # permanent scaler corruption from non-finite gradients.
+                scaler.update(max(scaler.get_scale() * 0.5, 1.0))
+            else:
+                scaler.step(self.optimizer)
+                scaler.update()
         else:
             loss_total.backward()
             for p in self.model.parameters():
