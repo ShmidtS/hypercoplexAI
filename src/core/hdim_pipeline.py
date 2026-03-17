@@ -337,19 +337,6 @@ class HDIMPipeline(nn.Module):
         self.domain_rotors[domain_name] = new_rotor
         self.domain_names.append(domain_name)
 
-    def remove_domain(self, domain_name: str) -> None:
-        """Удаляет домен из pipeline.
-
-        Args:
-            domain_name: имя домена для удаления.
-        """
-        if domain_name not in self.domain_rotors:
-            raise KeyError(f"Domain '{domain_name}' not found.")
-        if len(self.domain_names) <= 2:
-            raise RuntimeError("Cannot remove domain: at least 2 domains required.")
-        del self.domain_rotors[domain_name]
-        self.domain_names.remove(domain_name)
-
     def reset_memory(self, strategy: str = 'geometric') -> None:
         """Сбрасывает stateful память."""
         if self.memory_type == 'titans':

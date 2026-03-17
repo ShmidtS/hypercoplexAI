@@ -538,13 +538,6 @@ class HDIMModel(nn.Module):
         """Add a new domain rotor to the pipeline in runtime."""
         self.pipeline.add_domain(domain_name)
 
-    def remove_domain(self, domain_name: str) -> None:
-        """Remove a domain from the pipeline."""
-        if domain_name not in self._domain_names:
-            raise KeyError(f"Domain '{domain_name}' not found.")
-        self.pipeline.remove_domain(domain_name)
-        self._domain_names.remove(domain_name)
-
     def reset_memory(self, strategy: str = "geometric") -> None:
         """Reset stateful HDIM memory and router replay state.
 
@@ -568,15 +561,6 @@ class HDIMModel(nn.Module):
                     )
                     self.pipeline.moe.train_scores.mul_(0.7).add_(uniform * 0.3)
                 # 'stabilize': leave train_scores unchanged
-
-    def enable_cls_memory(self) -> None:
-        """Switch memory to CLS mode at runtime (no-op if already CLS)."""
-        if self.pipeline.memory_type != 'cls':
-            print(
-                "WARNING: enable_cls_memory() called but model was built with "
-                f"memory_type='{self.pipeline.memory_type}'. "
-                "Rebuild model with HDIMConfig(memory_type='cls') for full CLS support."
-            )
 
     def transfer_pairs(
         self,
