@@ -500,6 +500,12 @@ class HDIMTrainer:
         if B < 2:
             return self._zero_loss(source_inv)
 
+        # NaN/Inf protection during validation
+        if torch.isnan(source_inv).any() or torch.isinf(source_inv).any():
+            return self._zero_loss(source_inv)
+        if torch.isnan(target_inv).any() or torch.isinf(target_inv).any():
+            return self._zero_loss(source_inv)
+
         positive_mask = pair_relation_label > 0.5
         if not positive_mask.any():
             return self._zero_loss(source_inv)
@@ -553,6 +559,12 @@ class HDIMTrainer:
         """
         B = source_inv.shape[0]
         if B < 2:
+            return self._zero_loss(source_inv)
+
+        # NaN/Inf protection during validation
+        if torch.isnan(source_inv).any() or torch.isinf(source_inv).any():
+            return self._zero_loss(source_inv)
+        if torch.isnan(target_inv).any() or torch.isinf(target_inv).any():
             return self._zero_loss(source_inv)
 
         positive_mask = pair_relation_label > 0.5
@@ -759,6 +771,7 @@ class HDIMTrainer:
             self.device, dtype=exported_invariant.dtype
         )
         pair_weight = pair_weight.to(self.device, dtype=exported_invariant.dtype)
+
 
         # InfoNCE path (use_infonce=True by default via ranking_margin <= 0)
         if getattr(self, 'use_infonce', True):
@@ -1243,9 +1256,12 @@ class HDIMTrainer:
         with torch.no_grad():
             for batch in dataloader:
                 losses = self._compute_batch_losses(batch)
-                for key in totals:
-                    totals[key] += losses[key].item()
-                n_batches += 1
+            for key in totals:
+                val = losses[key].item()
+                # Skip NaN/Inf values to prevent corruption of validation metrics
+                if math.isfinite(val):
+                    totals[key] += val
+            n_batches += 1
         if n_batches > 0:
             for key in totals:
                 totals[key] /= n_batches

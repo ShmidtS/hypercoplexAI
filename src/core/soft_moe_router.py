@@ -159,6 +159,8 @@ class SoftMoERouter(nn.Module):
         h = F.gelu(h)
         h = F.dropout(h, p=0.1, training=self.training)
         out = torch.einsum('esh,edh->esd', h, self.W2_stack) + self.b2_stack.unsqueeze(1)
+        # Clamp to prevent fp16 overflow under AMP
+        out = torch.clamp(out, min=-10.0, max=10.0)
         return out.reshape(-1, slot_inputs.shape[-1])
 
     def forward(
@@ -188,6 +190,9 @@ class SoftMoERouter(nn.Module):
         slot_outputs = self._evaluate_experts(slot_inputs)  # (E*S, D)
 
         output = combine @ slot_outputs  # (T, D)
+        # NaN/Inf protection: clamp to prevent overflow, preserve gradients
+        output = torch.nan_to_num(output, nan=0.0, posinf=10.0, neginf=-10.0)
+        output = torch.clamp(output, min=-10.0, max=10.0)
 
         # Phase 26: Shared Expert (DeepSeek-V3) — always-on FFN
         if self.use_shared_expert:
