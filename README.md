@@ -449,9 +449,13 @@ Real training on `data/real_pairs_v10.json` (1036 pairs), SBERT encoder, RTX 307
 | **pair_margin** | 0.000 | **0.902** | ∞ |
 | **STS** | 1.000 | 0.551 | — |
 | **train_loss (ep5)** | 0.930 | **0.274** | -71% |
+| **train_loss (ep10)** | — | **0.208** | — |
+| **pair_margin (ep10)** | — | **0.930** | — |
+| **score (ep10)** | — | **1.092** | — |
 | params | 349K | 360K | +3% |
 
 MoEKernel expert load (ep5): `[math=0.28, lang=0.21, code=0.23, sci=0.29]` — balanced, non-collapsed.
+Training curve: ep1=0.697 → ep5=0.274 → ep10=0.208 (consistent decrease, no NaN).
 
 ### Hyperparameter Search (Optuna)
 
