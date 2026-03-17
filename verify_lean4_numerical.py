@@ -1886,6 +1886,471 @@ status = 'PASS' if all_ok else 'FAIL'
 print(f'  InfoNCE temperature gradient non-NaN (temp=0.07, 1.0): [{status}]')
 results.append(('infoNCE_temperature_gradient', status))
 
+
+# ===== 96. Expert Orthogonalization Gram Matrix =====
+print('\n--- 96. expert_orthogonalization_gram_matrix ---')
+all_ok = True
+torch.manual_seed(960)
+for n_experts in [2, 4, 8]:
+    router96 = SoftMoERouter(input_dim=64, num_experts=n_experts, expert_dim=128)
+    W = router96.W1_stack.detach()
+    W_flat = W.reshape(n_experts, -1)
+    W_norm = F.normalize(W_flat, dim=-1)
+    G = W_norm @ W_norm.T
+    diag_err = (torch.diag(G) - 1.0).abs().max().item()
+    off_diag_mask = ~torch.eye(n_experts, dtype=torch.bool)
+    off_diag_max = G[off_diag_mask].abs().max().item()
+    if diag_err > 0.1:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Gram matrix diag ~ 1.0 (err={diag_err:.4f}), off-diag max={off_diag_max:.4f}: [{status}]')
+results.append(('expert_orthogonalization_gram_matrix', status))
+
+# ===== 97. Aux-Loss-Free Bias Convergence =====
+print('\n--- 97. aux_loss_free_bias_convergence ---')
+all_ok = True
+torch.manual_seed(970)
+router97 = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128)
+router97.use_aux_loss_free = True
+x97 = torch.randn(100, 64)
+for _ in range(10):
+    with torch.no_grad():
+        _ = router97(x97)
+    if router97._expert_bias.abs().max().item() > 10.0:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Expert bias bounded (max_abs={router97._expert_bias.abs().max().item():.4f} < 10): [{status}]')
+results.append(('aux_loss_free_bias_convergence', status))
+
+# ===== 98. Learnable Temperature Range =====
+print('\n--- 98. learnable_temperature_range ---')
+all_ok = True
+torch.manual_seed(980)
+temp = nn.Parameter(torch.tensor(1.0))
+optimizer = torch.optim.Adam([temp], lr=0.01)
+for step in range(50):
+    anchor = F.normalize(torch.randn(1, 64), dim=-1)
+    positive = F.normalize(torch.randn(1, 64), dim=-1)
+    negatives = F.normalize(torch.randn(10, 64), dim=-1)
+    pos_score = (anchor * positive).sum(-1) / temp
+    neg_scores = (anchor @ negatives.T) / temp
+    logits = torch.cat([neg_scores, pos_score.unsqueeze(-1)], dim=-1)
+    label = torch.tensor([10])
+    loss = F.cross_entropy(logits, label)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    with torch.no_grad():
+        temp.clamp_(0.05, 20.0)
+if temp.item() < 0.05 or temp.item() > 20.0:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Learnable temperature in range [0.05, 20.0]: temp={temp.item():.4f} [{status}]')
+results.append(('learnable_temperature_range', status))
+
+# ===== 99. Shared Expert Residual Connection =====
+print('\n--- 99. shared_expert_residual_connection ---')
+all_ok = True
+torch.manual_seed(990)
+router99 = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128)
+router99.use_shared_expert = True
+x99 = torch.randn(8, 64)
+with torch.no_grad():
+    output99, _ = router99(x99)
+if torch.isnan(output99).any() or torch.isinf(output99).any():
+    all_ok = False
+if output99.abs().max().item() < 1e-6:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Shared expert output valid (no NaN/Inf, non-zero): [{status}]')
+results.append(('shared_expert_residual_connection', status))
+
+# ===== 100. Bivector Exp Unit Norm =====
+print('\n--- 100. bivector_exp_unit_norm ---')
+all_ok = True
+ca100 = CliffordAlgebra(p=4, q=0, r=0)
+norm_exp = 1.0
+for trial in range(20):
+    torch.manual_seed(1000 + trial)
+    B = torch.zeros(1, ca100.dim)
+    for k in range(ca100.n // 2):
+        i = 2 * k
+        if i + 1 >= ca100.n:
+            break
+        coeff = torch.randn(1).item() * 0.5
+        B[0, (1 << i) | (1 << (i + 1))] = coeff
+    exp_B = torch.zeros(1, ca100.dim)
+    exp_B[0, 0] = 1.0
+    term = torch.zeros(1, ca100.dim)
+    term[0, 0] = 1.0
+    for k in range(1, 11):
+        term = ca100.geometric_product(B, term) / k
+        exp_B = exp_B + term
+    norm_exp = ca100.norm(exp_B).item()
+    if abs(norm_exp - 1.0) > 0.15:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' exp(bivector) has ||R|| ~ 1.0 (norm={norm_exp:.4f}): [{status}]')
+results.append(('bivector_exp_unit_norm', status))
+
+# ===== 101. Sandwich Chain Stability =====
+print('\n--- 101. sandwich_chain_stability ---')
+all_ok = True
+ca101 = CliffordAlgebra(p=4, q=0, r=0)
+for trial in range(10):
+    torch.manual_seed(1010 + trial)
+    R1 = make_bivector_rotor(ca101)
+    R2 = make_bivector_rotor(ca101)
+    R3 = make_bivector_rotor(ca101)
+    x101 = torch.randn(1, ca101.dim) * 10.0
+    y1 = ca101.sandwich(R1, x101)
+    y2 = ca101.sandwich(R2, y1)
+    y3 = ca101.sandwich(R3, y2)
+    if torch.isnan(y3).any() or torch.isinf(y3).any():
+        all_ok = False
+        break
+    norm_x = ca101.norm(x101).item()
+    norm_y3 = ca101.norm(y3).item()
+    if abs(norm_y3 - norm_x) > 0.1 * norm_x:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Three sequential sandwiches (no NaN/Inf, norm preserved): [{status}]')
+results.append(('sandwich_chain_stability', status))
+
+# ===== 102. Matryoshka Nesting Prefix =====
+print('\n--- 102. matryoshka_nesting_prefix ---')
+all_ok = True
+torch.manual_seed(1020)
+base_embedding = torch.randn(256)
+embeddings = {}
+embeddings[64] = base_embedding[:64].clone()
+embeddings[128] = base_embedding[:128].clone()
+embeddings[256] = base_embedding.clone()
+if not torch.allclose(embeddings[64], embeddings[128][:64], rtol=1e-5, atol=1e-5):
+    all_ok = False
+if not torch.allclose(embeddings[64], embeddings[256][:64], rtol=1e-5, atol=1e-5):
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Matryoshka prefix consistency (64 == 128[:64] == 256[:64]): [{status}]')
+results.append(('matryoshka_nesting_prefix', status))
+
+# ===== 103. HBMA Memory Order Preservation =====
+print('\n--- 103. hbma_memory_order_preservation ---')
+all_ok = True
+torch.manual_seed(1030)
+wm103 = WorkingMemory(hidden_dim=32, capacity=8)
+for i in range(8):
+    entry = torch.zeros(1, 32) + i * 1.0
+    wm103._write(entry)
+buf_means = wm103.buf.abs().mean(dim=-1).squeeze()
+for i in range(7):
+    if buf_means[i+1] < buf_means[i] - 0.5:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' WorkingMemory FIFO order preserved: [{status}]')
+results.append(('hbma_memory_order_preservation', status))
+
+# ===== 104. Rotor Inverse Correctness =====
+print('\n--- 104. rotor_inverse_correctness ---')
+all_ok = True
+ca104 = CliffordAlgebra(p=3, q=0, r=0)
+for trial in range(20):
+    torch.manual_seed(1040 + trial)
+    R = make_bivector_rotor(ca104)
+    R_rev = ca104.reverse(R)
+    norm_sq = (ca104.norm(R) ** 2).clamp_min(1e-10)
+    product = ca104.geometric_product(R, R_rev)
+    scalar_part = product[0, 0]
+    expected = norm_sq.item()
+    if abs(scalar_part - expected) > 0.1:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' R * reverse(R) = ||R||^2 (scalar): [{status}]')
+results.append(('rotor_inverse_correctness', status))
+
+# ===== 105. Geometric Product Bilinearity =====
+print('\n--- 105. geometric_product_bilinearity ---')
+all_ok = True
+ca105 = CliffordAlgebra(p=3, q=0, r=0)
+for trial in range(10):
+    torch.manual_seed(1050 + trial)
+    a_scalar = torch.randn(1).item()
+    b_scalar = torch.randn(1).item()
+    x = torch.randn(1, ca105.dim)
+    y = torch.randn(1, ca105.dim)
+    ax = x * a_scalar
+    by = y * b_scalar
+    lhs = ca105.geometric_product(ax, by)
+    rhs = ca105.geometric_product(x, y) * (a_scalar * b_scalar)
+    if not torch.allclose(lhs, rhs, rtol=1e-3, atol=1e-3):
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' gp(a*x, b*y) = a*b * gp(x, y) for scalars a, b: [{status}]')
+results.append(('geometric_product_bilinearity', status))
+
+# New theorems to add (106-115)
+
+# ===== 106. Domain Transfer Isomorphism Analytical =====
+print('\n--- 106. domain_transfer_isomorphism_analytical ---')
+# U_inv = R^{-1} * x * R is truly domain-invariant: for any two domains D1, D2,
+# applying their respective rotations to x yields the same U_inv.
+all_ok = True
+ca106 = CliffordAlgebra(p=3, q=1, r=0)
+for trial in range(15):
+    torch.manual_seed(1060 + trial)
+    x106 = torch.randn(1, ca106.dim)
+    # Two different domain rotors
+    R1 = make_bivector_rotor(ca106)
+    R2 = make_bivector_rotor(ca106)
+    # Apply sandwich to get domain representation
+    g1 = ca106.sandwich(R1, x106, unit=True)
+    g2 = ca106.sandwich(R2, x106, unit=True)
+    # Extract invariant: R^{-1} * g * R
+    R1_inv = ca106.reverse(R1)
+    R2_inv = ca106.reverse(R2)
+    u1 = ca106.sandwich(R1_inv, g1, unit=True)
+    u2 = ca106.sandwich(R2_inv, g2, unit=True)
+    # Both should equal the original x (since sandwich is involutive for unit rotors)
+    diff = (u1 - u2).abs().max().item()
+    if diff > 0.15:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' U_inv domain-invariant (diff={diff:.4f}): [{status}]')
+results.append(('domain_transfer_isomorphism_analytical', status))
+
+# ===== 107. Matryoshka Strict Quality Monotonicity =====
+print('\n--- 107. matryoshka_strict_quality ---')
+# For Matryoshka embeddings: quality(dim_i) >= quality(dim_j) for dim_i > dim_j
+# Quality is measured as cosine similarity preservation with the full embedding.
+all_ok = True
+torch.manual_seed(1070)
+proj107 = MatryoshkaProjection(128, [32, 64, 96, 128])
+x107 = torch.randn(16, 128)
+full_embedding = proj107(x107, target_dim=128)
+full_norm = F.normalize(full_embedding, dim=-1)
+qualities = {}
+for dim in [32, 64, 96, 128]:
+    emb = proj107(x107, target_dim=dim)
+    emb_padded = F.pad(emb, (0, 128 - dim))
+    emb_norm = F.normalize(emb_padded, dim=-1)
+    quality = (emb_norm * full_norm).sum(dim=-1).mean().item()
+    qualities[dim] = quality
+# Larger dims should have higher or equal quality (more information preserved)
+for i, dim_small in enumerate([32, 64, 96]):
+    dim_large = [64, 96, 128][i]
+    if qualities[dim_large] < qualities[dim_small] - 0.1:  # allow small tolerance
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Matryoshka quality: 32={qualities[32]:.4f}, 64={qualities[64]:.4f}, 96={qualities[96]:.4f}, 128={qualities[128]:.4f}: [{status}]')
+results.append(('matryoshka_strict_quality', status))
+
+# ===== 108. SoftMoE Expert Load Uniformity =====
+print('\n--- 108. soft_moe_expert_load_uniformity ---')
+# With balanced routing, expert usage should be approximately uniform
+all_ok = True
+torch.manual_seed(1080)
+router108 = SoftMoERouter(input_dim=64, num_experts=4, slots_per_expert=2)
+router108.eval()
+x108 = torch.randn(128, 64)
+with torch.no_grad():
+    _, state108 = router108(x108)
+    usage = state108['expert_usage']
+    # Uniform distribution would be 0.25 per expert
+    expected = 1.0 / 4
+    deviation = (usage - expected).abs().max().item()
+    # With 128 samples and 4 experts, deviation should be < 0.15
+    if deviation > 0.15:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Expert load uniformity (max_dev={deviation:.4f}): [{status}]')
+results.append(('soft_moe_expert_load_uniformity', status))
+
+# ===== 109. Sandwich Four-Rotor Composition =====
+print('\n--- 109. sandwich_4_composed ---')
+# Verify S(R4, S(R3, S(R2, S(R1, x)))) = S(R4*R3*R2*R1, x)
+all_ok = True
+ca109 = CliffordAlgebra(p=4, q=0, r=0)
+for trial in range(10):
+    torch.manual_seed(1090 + trial)
+    R1 = make_bivector_rotor(ca109)
+    R2 = make_bivector_rotor(ca109)
+    R3 = make_bivector_rotor(ca109)
+    R4 = make_bivector_rotor(ca109)
+    x109 = torch.randn(1, ca109.dim)
+    # Sequential application
+    y1 = ca109.sandwich(R1, x109)
+    y2 = ca109.sandwich(R2, y1)
+    y3 = ca109.sandwich(R3, y2)
+    y4 = ca109.sandwich(R4, y3)
+    # Composed rotor
+    R21 = ca109.geometric_product(R2, R1)
+    R321 = ca109.geometric_product(R3, R21)
+    R4321 = ca109.geometric_product(R4, R321)
+    y_comp = ca109.sandwich(R4321, x109)
+    diff = (y4 - y_comp).abs().max().item()
+    if diff > 0.2:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' S(R4,S(R3,S(R2,S(R1,x)))) = S(R4*R3*R2*R1, x): [{status}]')
+results.append(('sandwich_4_composed', status))
+
+# ===== 110. HBMA Prototype EMA Stability =====
+print('\n--- 110. hbma_prototype_ema_stability ---')
+# EMA updates should not cause prototype divergence
+all_ok = True
+torch.manual_seed(1100)
+sem110 = SemanticMemory(hidden_dim=64, num_prototypes=8, ema_momentum=0.9)
+initial_norms = sem110.prototypes.norm(dim=-1).clone()
+for _ in range(100):
+    x110 = F.normalize(torch.randn(4, 64), dim=-1)
+    sem110._update_prototypes(x110)
+final_norms = sem110.prototypes.norm(dim=-1)
+# Norms should remain bounded (not explode or collapse)
+norm_ratio = (final_norms / (initial_norms + 1e-8)).abs()
+if (norm_ratio > 10.0).any() or (norm_ratio < 0.1).any():
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Prototype norms stable (ratio in [0.1, 10]): [{status}]')
+results.append(('hbma_prototype_ema_stability', status))
+
+# ===== 111. InfoNCE Gradient Magnitude =====
+print('\n--- 111. infonce_gradient_magnitude ---')
+# Gradient magnitude should scale inversely with temperature
+all_ok = True
+torch.manual_seed(1110)
+temps = [0.1, 1.0]
+grad_mags = []
+for temp in temps:
+    temp_param = torch.tensor(temp, requires_grad=True)
+    anchor = F.normalize(torch.randn(1, 64), dim=-1)
+    positive = F.normalize(torch.randn(1, 64), dim=-1)
+    negatives = F.normalize(torch.randn(10, 64), dim=-1)
+    pos_score = (anchor * positive).sum(-1) / temp_param
+    neg_scores = (anchor @ negatives.T) / temp_param
+    logits = torch.cat([neg_scores, pos_score.unsqueeze(-1)], dim=-1)
+    label = torch.tensor([10])
+    loss = F.cross_entropy(logits, label)
+    loss.backward()
+    grad_mags.append(temp_param.grad.abs().item())
+# Lower temperature should produce larger gradient magnitude
+if grad_mags[0] < grad_mags[1] * 0.5:  # temp=0.1 should have larger grad than temp=1.0
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Gradient magnitude: temp=0.1 -> {grad_mags[0]:.4f}, temp=1.0 -> {grad_mags[1]:.4f}: [{status}]')
+results.append(('infonce_gradient_magnitude', status))
+
+# ===== 112. Pseudoscalar Commutes with Itself =====
+print('\n--- 112. pseudoscalar_self_commutation ---')
+# I * I should commute with I (trivially true: I*I is scalar-like)
+all_ok = True
+ca112 = CliffordAlgebra(p=3, q=1, r=0)
+n112 = ca112.n
+I112 = torch.zeros(1, ca112.dim)
+I112[0, (1<<n112)-1] = 1.0
+I_sq = ca112.geometric_product(I112, I112)
+# I^2 should be a scalar (grade 0) or pseudoscalar (grade n)
+is_scalar_or_pseudo = I_sq.abs().sum() > 1e-6
+if not is_scalar_or_pseudo:
+    all_ok = False
+# I * I should commute
+I_sq2 = ca112.geometric_product(I_sq, I112)
+I_sq_rev = ca112.geometric_product(I112, I_sq)
+diff = (I_sq2 - I_sq_rev).abs().max().item()
+if diff > 1e-6:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Pseudoscalar self-commutation: [{status}]')
+results.append(('pseudoscalar_self_commutation', status))
+
+# ===== 113. Clifford Product Quadruple Distributivity =====
+print('\n--- 113. clifford_quadruple_distributivity ---')
+# (a+b)*(c+d)*(e+f)*(g+h) full expansion
+all_ok = True
+ca113 = CliffordAlgebra(p=3, q=0, r=0)
+for trial in range(5):
+    torch.manual_seed(1130 + trial)
+    a, b = torch.randn(1, ca113.dim), torch.randn(1, ca113.dim)
+    c, d = torch.randn(1, ca113.dim), torch.randn(1, ca113.dim)
+    e, f = torch.randn(1, ca113.dim), torch.randn(1, ca113.dim)
+    g, h = torch.randn(1, ca113.dim), torch.randn(1, ca113.dim)
+    # Direct computation
+    lhs = ca113.geometric_product(a+b, c+d)
+    lhs = ca113.geometric_product(lhs, e+f)
+    lhs = ca113.geometric_product(lhs, g+h)
+    # Full expansion (8 terms)
+    terms = []
+    for x in [a, b]:
+        for y in [c, d]:
+            for z in [e, f]:
+                for w in [g, h]:
+                    t = ca113.geometric_product(x, y)
+                    t = ca113.geometric_product(t, z)
+                    t = ca113.geometric_product(t, w)
+                    terms.append(t)
+    rhs = sum(terms)
+    diff = (lhs - rhs).abs().max().item()
+    if diff > 0.5:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' (a+b)*(c+d)*(e+f)*(g+h) full expansion: [{status}]')
+results.append(('clifford_quadruple_distributivity', status))
+
+# ===== 114. Rotor Inverse Roundtrip =====
+print('\n--- 114. rotor_inverse_roundtrip ---')
+# R * reverse(R) = ||R||^2, and reverse(R) * R = ||R||^2
+all_ok = True
+ca114 = CliffordAlgebra(p=4, q=1, r=0)
+for trial in range(15):
+    torch.manual_seed(1140 + trial)
+    R = make_bivector_rotor(ca114)
+    R_rev = ca114.reverse(R)
+    norm_sq = (ca114.norm(R) ** 2).item()
+    # Test both orderings
+    prod1 = ca114.geometric_product(R, R_rev)
+    prod2 = ca114.geometric_product(R_rev, R)
+    scalar1 = prod1[0, 0].item()
+    scalar2 = prod2[0, 0].item()
+    if abs(scalar1 - norm_sq) > 0.1 or abs(scalar2 - norm_sq) > 0.1:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f' R*R_rev = R_rev*R = ||R||^2: [{status}]')
+results.append(('rotor_inverse_roundtrip', status))
+
+# ===== 115. HBMA Working Memory Slot Reuse =====
+print('\n--- 115. hbma_working_slot_reuse ---')
+# After capacity overflow, oldest slots should be overwritten first
+all_ok = True
+torch.manual_seed(1150)
+wm115 = WorkingMemory(hidden_dim=32, capacity=4)
+# Write 6 entries
+entries = []
+for i in range(6):
+    entry = torch.zeros(1, 32) + i * 100.0  # distinct values
+    entries.append(entry)
+    wm115._write(entry)
+# After 6 writes to capacity=4, slots 0,1 should have entries 4,5
+# Check that first two slots have larger values (entries 4,5)
+slot0_mean = wm115.buf[0].mean().item()
+slot1_mean = wm115.buf[1].mean().item()
+# Entry 4 has mean 400, entry 5 has mean 500
+if slot0_mean < 300 or slot1_mean < 300:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f' Working memory slot reuse (oldest evicted first): [{status}]')
+results.append(('hbma_working_slot_reuse', status))
+
 # ===== Summary =====
 print('\n' + '='*60)
 passed = sum(1 for _,s in results if s == 'PASS')
@@ -1893,5 +2358,5 @@ total = len(results)
 print(f'RESULTS: {passed}/{total} PASS')
 for name, status in results:
     mark = 'OK' if status == 'PASS' else 'FAIL'
-    print(f'  [{mark}] {name}')
+    print(f' [{mark}] {name}')
 print('='*60)

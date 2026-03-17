@@ -130,7 +130,8 @@ class SoftMoERouter(nn.Module):
 
         # Router z-loss (ST-MoE): penalize large logit magnitudes
         if self.z_loss_weight > 0:
-            self._z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+            lse = torch.logsumexp(logits, dim=-1)
+            self._z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
         else:
             self._z_loss = None
 
@@ -155,10 +156,10 @@ class SoftMoERouter(nn.Module):
             slot_outputs: (num_slots, D) expert outputs
         """
         x_exp = slot_inputs.view(self.num_experts, self.slots_per_expert, -1)
-        h = torch.einsum('esd,ehd->esh', x_exp, self.W1_stack) + self.b1_stack.unsqueeze(1)
+        h = torch.bmm(x_exp, self.W1_stack.transpose(-1, -2)) + self.b1_stack.unsqueeze(1)
         h = F.gelu(h)
         h = F.dropout(h, p=0.1, training=self.training)
-        out = torch.einsum('esh,edh->esd', h, self.W2_stack) + self.b2_stack.unsqueeze(1)
+        out = torch.bmm(h, self.W2_stack.transpose(-1, -2)) + self.b2_stack.unsqueeze(1)
         # Clamp to prevent fp16 overflow under AMP
         out = torch.clamp(out, min=-10.0, max=10.0)
         return out.reshape(-1, slot_inputs.shape[-1])
