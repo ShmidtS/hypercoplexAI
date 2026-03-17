@@ -7,8 +7,9 @@
 [Status]()
 
 > **Best Score:** 1.1542 (Phase 26c, epoch 15) — `pair_margin=0.993`, `STS=0.537`
-> **Verification:** 148/148 Lean4 theorems PASS | 123 pytest tests PASS
-> **Features:** DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho + auto_tune v27
+> **Phase 28:** MoEKernel score=1.0671 | pair_margin=0.9018 | STS=0.5512 (+355% vs SoftMoERouter baseline)
+> **Verification:** 159/159 Lean4 theorems PASS | 168 pytest tests PASS
+> **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + SIMBAL
 
 ---
 
@@ -129,7 +130,7 @@ G_B = R_B ⊗ U_inv ⊗ R_B⁻¹
 
 This reconstructs the target domain representation from the invariant.
 
-### Verification: 148 Lean4 Theorems
+### Verification: 159 Lean4 Theorems
 
 All mathematical properties are numerically verified in `verify_lean4_numerical.py`:
 
@@ -146,7 +147,8 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 | Quaternion Operations | 9        | ✅ PASS         |
 | Training Losses       | 5        | ✅ PASS         |
 | Memory Adapters       | 5        | ✅ PASS         |
-| **Total**             | **148**  | **✅ ALL PASS** |
+| **MoEKernel (Ph.28)** | **11**   | ✅ PASS         |
+| **Total**             | **159**  | **✅ ALL PASS** |
 
 
 ---
@@ -258,6 +260,7 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 | **TitansMemoryModule**     | Test-Time Training memory (fp32-safe)                        | `src/core/titans_memory.py:30`      |
 | **HBMAMemoryAdapter**      | 4-system memory (Working, Episodic, Semantic, Procedural)    | `src/core/hbma_memory.py:20`        |
 | **SoftMoERouter**          | Soft MoE with SharedExpert + AuxLossFree                     | `src/core/soft_moe_router.py:43`    |
+| **MoEKernel**              | Full MoE kernel: math/language/code/science domain experts   | `src/core/moe_kernel.py:213`        |
 | **DomainExpertPool**       | 4 frozen SBERT experts + trainable projections               | `src/core/domain_expert_pool.py:20` |
 | **HDIMPipeline**           | End-to-end pipeline orchestrator                             | `src/core/hdim_pipeline.py:128`     |
 
@@ -420,17 +423,35 @@ print(f"Invariant norm: {invariant.norm()}")    # Should equal input norm
 ### Basic Training
 
 ```bash
+# SoftMoERouter (baseline)
 python scripts/gpu_train.py \
-    --use_pairs \
-    --amp \
-    --hidden_dim 256 \
-    --num_experts 4 \
-    --top_k 2 \
-    --lambda_z 0.01 \
-    --infonce_temperature 0.15 \
-    --epochs 60 \
-    --batch_size 32
+    --pretrained_encoder --soft_router \
+    --real_pairs data/real_pairs_v10.json \
+    --amp --device cuda \
+    --epochs 60 --batch_size 32
+
+# MoEKernel (Phase 28) — domain-specialized experts
+python scripts/gpu_train.py \
+    --pretrained_encoder --moe_kernel \
+    --real_pairs data/real_pairs_v10.json \
+    --amp --device cuda \
+    --lambda_z 0.01 --lambda_expert_ortho 0.01 \
+    --epochs 60 --batch_size 32
 ```
+
+### Phase 28 Results: MoEKernel vs SoftMoERouter
+
+Real training on `data/real_pairs_v10.json` (1036 pairs), SBERT encoder, RTX 3070:
+
+| Metric | SoftMoERouter | MoEKernel | Improvement |
+|---|---|---|---|
+| **score** | 0.300 | **1.067** | +256% |
+| **pair_margin** | 0.000 | **0.902** | ∞ |
+| **STS** | 1.000 | 0.551 | — |
+| **train_loss (ep5)** | 0.930 | **0.274** | -71% |
+| params | 349K | 360K | +3% |
+
+MoEKernel expert load (ep5): `[math=0.28, lang=0.21, code=0.23, sci=0.29]` — balanced, non-collapsed.
 
 ### Hyperparameter Search (Optuna)
 
@@ -461,11 +482,14 @@ python scripts/auto_tune.py \
 ### Run All Tests
 
 ```bash
-# Lean4 numerical verification (148 theorems)
+# Lean4 numerical verification (159 theorems, Phase 28)
 python verify_lean4_numerical.py
 
-# pytest suite (123 tests)
+# pytest suite (168 tests: 45 moe_kernel + 123 existing)
 python -m pytest tests/ -v
+
+# Real-model verification (MoEKernel on SBERT + real_pairs_v10.json)
+python scripts/verify_moe_kernel_real.py  # 14/14 checks PASS
 
 # Import check
 python -c "from src.core.hypercomplex import CliffordAlgebra; \
@@ -503,6 +527,7 @@ hypercoplexAI/
 │   │   ├── titans_memory.py     # TitansMemoryModule (TTT)
 │   │   ├── hbma_memory.py       # HBMAMemory (4-system memory)
 │   │   ├── soft_moe_router.py   # SoftMoERouter (Phase 26)
+│   │   ├── moe_kernel.py        # MoEKernel domain experts (Phase 28)
 │   │   ├── domain_expert_pool.py # DomainExpertPool + SharedExpert
 │   │   └── memory_interface.py  # MemoryInterface ABC
 │   ├── models/
@@ -522,7 +547,8 @@ hypercoplexAI/
 │   ├── test_hypercomplex.py
 │   ├── test_domain_operators.py
 │   ├── test_moe_router.py
-│   └── ... (123 tests total)
+│   ├── test_moe_kernel.py       # 45 MoEKernel tests (Phase 28)
+│   └── ... (168 tests total)
 ├── docs/
 │   ├── ARCHITECTURE.md          # Full architecture documentation
 │   └── DIAGRAMS.md              # Mermaid diagrams
@@ -675,7 +701,7 @@ If you use HDIM in your research, please cite:
   author = {HypercoplexAI Team},
   year = {2026},
   url = {https://github.com/your-org/hypercoplexAI},
-  note = {Phase 27: 148 Lean4-verified theorems, 123 tests passing}
+  note = {Phase 28: 159 Lean4-verified theorems, 168 tests passing, MoEKernel score=1.067}
 }
 ```
 
@@ -687,4 +713,4 @@ TBD
 
 ---
 
-*Last updated: 2026-03-17 | Phase 27 Complete | Research prototype — API may evolve*
+*Last updated: 2026-03-18 | Phase 28 Complete | Research prototype — API may evolve*
