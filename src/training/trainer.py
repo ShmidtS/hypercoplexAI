@@ -677,7 +677,9 @@ class HDIMTrainer:
         # Маскируем диагональ (нулевое расстояние до себя)
         mask = ~torch.eye(2 * B, dtype=torch.bool, device=self.device)
         sq_dists_off = sq_dists[mask].view(2 * B, 2 * B - 1)
-        loss_uniform = torch.log(torch.exp(-t_uniform * sq_dists_off).mean())
+        # Numerically stable log-mean-exp to avoid Inf overflow
+        neg_sq = -t_uniform * sq_dists_off
+        loss_uniform = torch.logsumexp(neg_sq, dim=-1).mean() - math.log(neg_sq.shape[-1])
 
         return lambda_align * loss_align + lambda_uniform * loss_uniform
 
