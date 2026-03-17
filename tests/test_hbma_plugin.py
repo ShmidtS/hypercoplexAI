@@ -254,13 +254,12 @@ class TestConsolidationHook:
 
 class TestGradientFlow:
     def test_plugin_params_receive_gradient(self):
+        torch.manual_seed(7)  # fix full RNG state before model + input creation
         mem = HBMAMemory(hidden_dim=64)
         plugin = EmotionalMemoryPlugin(hidden_dim=64)
         mem.register_plugin(plugin)
         mem.train()
 
-        # Use seeded input that guarantees non-zero gradients
-        torch.manual_seed(7)
         x = torch.randn(4, 64, requires_grad=True)
         out = mem(x)
         loss = out.sum()

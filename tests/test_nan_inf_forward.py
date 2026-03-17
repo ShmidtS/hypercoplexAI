@@ -106,7 +106,8 @@ def test_geometric_product_overflow():
 
     print("\n  VERIFICATION: geometric_product always returns fp32 (correct)")
 
-    return all(not r["has_nan"] and not r["has_inf"] for r in results)
+    assert all(not r["has_nan"] and not r["has_inf"] for r in results), \
+        "geometric_product produced NaN/Inf"
 
 
 def test_soft_moe_router_nan():
@@ -170,7 +171,8 @@ def test_soft_moe_router_nan():
             print_diagnostics(diag)
             results.append(diag)
 
-    return all(not r["has_nan"] and not r["has_inf"] for r in results)
+    assert all(not r["has_nan"] and not r["has_inf"] for r in results), \
+        "SoftMoERouter produced NaN/Inf"
 
 
 def test_hbma_semantic_scatter():
@@ -220,7 +222,8 @@ def test_hbma_semantic_scatter():
         print_diagnostics(diag)
         results.append(diag)
 
-    return all(not r["has_nan"] and not r["has_inf"] for r in results)
+    assert all(not r["has_nan"] and not r["has_inf"] for r in results), \
+        "HBMA SemanticMemory produced NaN/Inf"
 
 
 def test_full_hdim_forward():
@@ -296,7 +299,8 @@ def test_full_hdim_forward():
         print_diagnostics(diag)
         results.append(diag)
 
-    return all(not r["has_nan"] and not r["has_inf"] for r in results)
+    assert all(not r["has_nan"] and not r["has_inf"] for r in results), \
+        "Full HDIM forward produced NaN/Inf"
 
 
 def test_extreme_values():
@@ -371,7 +375,8 @@ def test_extreme_values():
         print_diagnostics(diag)
         results.append(diag)
 
-    return all(not r["has_nan"] and not r["has_inf"] for r in results)
+    assert all(not r["has_nan"] and not r["has_inf"] for r in results), \
+        "Extreme values produced NaN/Inf"
 
 
 def analyze_overflow_sources():
