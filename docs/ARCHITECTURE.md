@@ -1,8 +1,9 @@
 # HDIM Architecture Documentation
 
-> **Дата:** 2026-03-15
-> **Версия:** Research Prototype (Phase 26)
+> **Дата:** 2026-03-17
+> **Версия:** Research Prototype (Phase 27)
 > **Источники:** Исследовательские отчёты в `[.omc/research/](../.omc/research/)`
+> **Verification:** Lean4 148/148 PASS | pytest 123 PASS
 
 ---
 

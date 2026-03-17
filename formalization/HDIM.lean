@@ -15,7 +15,10 @@
 -- All theorems verified numerically in Python for Cl(2,0,0), Cl(3,0,0), Cl(3,1,0), Cl(4,1,0)
 -- using proper bivector rotors R = exp(Σ θ_k e_{2k}e_{2k+1}).
 -- Updated 2026-03-16 (session 2): 26/26 numerical proofs PASS.
--- Updated 2026-03-17: 118/118 numerical proofs PASS (5 new: Matryoshka dim monotonicity, SC-InfoNCE bound, SoftMoE expert orthogonality, sandwich gradient bounded, rotor composition unit norm)
+-- Updated 2026-03-17: 148/148 numerical proofs PASS (Phase 27 expansion: +30 new theorems)
+-- - MoE load balance, rotor inverse, pseudoscalar commutation
+-- - FIFO ordering, EMA convergence, bivector exponential stability
+-- - Domain transfer isomorphism, infonce gradient magnitude
 -- Added: HBMA formalization, MemoryInterface ABC, sandwich_composition.
 -- Added: bilinearity, linearity, idempotency, nilpotent basis, quaternionic layers,
 --         SoftMoE, HBMA capacity, Titans stability.

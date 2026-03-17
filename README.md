@@ -6,7 +6,8 @@
 [Status: Research]()
 
 > **Best score: 1.1542** (Phase 26c, ep15) — `pair_margin=0.993`, `STS=0.537`
-> **Current:** Phase 26 complete | DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho
+> **Current:** Phase 27 complete | Lean4: 148/148 PASS | pytest: 123 PASS
+> **Features:** DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho + auto_tune v27
 
 ---
 
