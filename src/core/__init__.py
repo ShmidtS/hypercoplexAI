@@ -12,13 +12,13 @@ from .domain_operators import (
     sandwich_transfer,
 )
 from .titans_memory import TitansMemoryModule
-from .hbma_memory import HippocampusMemory, NeocortexMemory, CLSMemory, HBMAMemory, WorkingMemory, EpisodicMemory, SemanticMemory, ProceduralMemory
-from .hdim_pipeline import HDIMPipeline, HDIMEncoder, HDIMDecoder
+from .hbma_memory import HippocampusMemory, HBMAMemory, WorkingMemory, EpisodicMemory, SemanticMemory, ProceduralMemory
+from .hdim_pipeline import HDIMPipeline, HDIMEncoder
 
 __all__ = [
     'CliffordAlgebra', 'QuaternionLinear', 'QLayerNorm',
     'DomainRotationOperator', 'InvariantExtractor', 'sandwich_transfer',
     'TitansMemoryModule',
-    'HippocampusMemory', 'NeocortexMemory', 'CLSMemory', 'HBMAMemory', 'WorkingMemory', 'EpisodicMemory', 'SemanticMemory', 'ProceduralMemory',
-    'HDIMPipeline', 'HDIMEncoder', 'HDIMDecoder',
+    'HippocampusMemory', 'HBMAMemory', 'WorkingMemory', 'EpisodicMemory', 'SemanticMemory', 'ProceduralMemory',
+    'HDIMPipeline', 'HDIMEncoder',
 ]

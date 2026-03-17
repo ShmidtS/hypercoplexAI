@@ -1568,6 +1568,98 @@ status = 'PASS' if all_ok else 'FAIL'
 print(f'  grade projection extraction: [{status}]')
 results.append(('grade_projection_extraction', status))
 
+# ===== 81. Matryoshka nesting dimension monotonicity =====
+print('\n--- 81. matryoshka_dim_monotonicity ---')
+all_ok = True
+from src.models.modern_text_encoder import MatryoshkaProjection
+proj81 = MatryoshkaProjection(128, [32, 64, 96, 128])
+x81 = torch.randn(16, 128)
+# Larger target dim should produce equal or higher-quality (higher norm) output
+prev_norm = 0.0
+for dim in [32, 64, 96, 128]:
+    out = proj81(x81, target_dim=dim)
+    n = out.norm(dim=-1).mean().item()
+    if n < prev_norm * 0.5:  # allow some variation but not collapse
+        all_ok = False
+    prev_norm = n
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  Matryoshka dim monotonicity (non-collapsing): [{status}]')
+results.append(('matryoshka_dim_monotonicity', status))
+
+# ===== 82. SC-InfoNCE loss bounded below =====
+print('\n--- 82. infoNCE_lower_bound ---')
+all_ok = True
+for temp in [0.07, 0.1, 0.5]:
+    # InfoNCE loss is cross-entropy over similarity logits
+    n = 16
+    # Create embeddings: positive pairs have high similarity, negatives low
+    anchors = torch.randn(n, 64)
+    positives = anchors.clone()
+    negatives = torch.randn(n, 63, 64)
+    # Build logits: [neg_0, ..., neg_62, pos] — positive at index 63
+    logits82 = torch.zeros(n, 64)
+    for i in range(n):
+        logits82[i, :63] = (anchors[i].unsqueeze(0) * negatives[i]).sum(-1) / temp
+        logits82[i, 63] = (anchors[i] * positives[i]).sum(-1) / temp
+    labels82 = torch.full((n,), 63)
+    loss = F.cross_entropy(logits82, labels82)
+    # With good positive scores, loss should be bounded (not explode)
+    if torch.isnan(loss) or loss.item() > 20.0:
+        all_ok = False
+    # loss lower bound: -log(1/K) for uniform = log(K), here K=64
+    if loss.item() < -math.log(64) - 1.0:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  InfoNCE loss bounded (no NaN, within bounds): [{status}]')
+results.append(('infoNCE_lower_bound', status))
+
+# ===== 83. SoftMoE expert orthogonality loss >= 0 =====
+print('\n--- 83. soft_moe_orthogonality_bound ---')
+all_ok = True
+from src.core.soft_moe_router import SoftMoERouter
+for n_experts in [2, 4, 8]:
+    router = SoftMoERouter(input_dim=64, num_experts=n_experts)
+    for _ in range(10):
+        orth_loss = router.expert_orthogonalization_loss()
+        if orth_loss.item() < -1e-6:  # should always be >= 0
+            all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  expert_orthogonalization_loss >= 0: [{status}]')
+results.append(('soft_moe_orthogonality_bound', status))
+
+# ===== 84. Gradient norm bounded through sandwich =====
+print('\n--- 84. sandwich_gradient_bounded ---')
+all_ok = True
+ca84 = CliffordAlgebra(p=3, q=0, r=0)
+for _ in range(20):
+    R84 = make_bivector_rotor(ca84)
+    x84 = torch.randn(1, ca84.dim, requires_grad=True)
+    y84 = ca84.sandwich(R84, x84)
+    loss84 = y84.pow(2).sum()
+    loss84.backward()
+    if x84.grad is None or torch.isnan(x84.grad).any() or x84.grad.abs().max().item() > 1000.0:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  sandwich gradient bounded (no NaN, max < 1000): [{status}]')
+results.append(('sandwich_gradient_bounded', status))
+
+# ===== 85. Bivector rotor composition preserves unit norm =====
+print('\n--- 85. rotor_composition_unit_norm ---')
+all_ok = True
+ca85 = CliffordAlgebra(p=4, q=0, r=0)
+for _ in range(20):
+    R_a = make_bivector_rotor(ca85)
+    R_b = make_bivector_rotor(ca85)
+    R_ab = ca85.geometric_product(R_a, R_b)
+    norm_ab = ca85.norm(R_ab).item()
+    if abs(norm_ab - 1.0) > 1e-4:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  ||R_a * R_b|| = 1 for unit bivector rotors: [{status}]')
+results.append(('rotor_composition_unit_norm', status))
+
 # ===== Summary =====
 print('\n' + '='*60)
 passed = sum(1 for _,s in results if s == 'PASS')

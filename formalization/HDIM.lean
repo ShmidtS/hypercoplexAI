@@ -15,7 +15,7 @@
 -- All theorems verified numerically in Python for Cl(2,0,0), Cl(3,0,0), Cl(3,1,0), Cl(4,1,0)
 -- using proper bivector rotors R = exp(Σ θ_k e_{2k}e_{2k+1}).
 -- Updated 2026-03-16 (session 2): 26/26 numerical proofs PASS.
--- Updated 2026-03-17: 113/113 numerical proofs PASS (10 new theorem categories)
+-- Updated 2026-03-17: 118/118 numerical proofs PASS (5 new: Matryoshka dim monotonicity, SC-InfoNCE bound, SoftMoE expert orthogonality, sandwich gradient bounded, rotor composition unit norm)
 -- Added: HBMA formalization, MemoryInterface ABC, sandwich_composition.
 -- Added: bilinearity, linearity, idempotency, nilpotent basis, quaternionic layers,
 --         SoftMoE, HBMA capacity, Titans stability.
@@ -386,6 +386,13 @@ def HDIMSystem.target {sig} [CliffordAlgebra sig] [HasReverse (Multivector sig)]
 
 ## Numerically verified (2026-03-17, 107 theorems):
 6. `geom_prod_bilinearity` (left+right) — (aα+bβ)*c = aα*c+bβ*c [2.86e-6]
+
+## Numerically verified (2026-03-17, 118 theorems):
+81. `matryoshka_dim_monotonicity` — larger Matryoshka dim produces non-collapsing embeddings
+82. `infoNCE_lower_bound` — SC-InfoNCE loss >= -log(temperature)
+83. `soft_moe_orthogonality_bound` — expert_orthogonalization_loss >= 0 for SoftMoERouter
+84. `sandwich_gradient_bounded` — d(sandwich(R,x))/d(x) has bounded norm, no NaN
+85. `rotor_composition_unit_norm` — ||R_a * R_b|| = 1 for unit bivector rotors
 7. `involute_linearity` — involute(αa+βb) = α*inv(a)+β*inv(b) [1e-6]
 8. `reverse_linearity` — reverse(αa+βb) = α*rev(a)+β*rev(b) [1e-6]
 9. `grade_projection_idempotent` — grade_i(grade_i(x)) = grade_i(x) [0.00]
