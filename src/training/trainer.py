@@ -1172,12 +1172,21 @@ class HDIMTrainer:
         if scaler is not None:
             scaler.scale(loss_total).backward()
             scaler.unscale_(self.optimizer)
+            # Zero NaN/Inf gradients — first batch can produce NaN from
+            # uninitialized state (memory, MoE gate softmax), which corrupts
+            # the GradScaler dynamic scale factor permanently.
+            for p in self.model.parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    p.grad.zero_()
             grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
             scaler.step(self.optimizer)
             scaler.update()
         else:
             loss_total.backward()
+            for p in self.model.parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    p.grad.zero_()
             grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
             self.optimizer.step()
