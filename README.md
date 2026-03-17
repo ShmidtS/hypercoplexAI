@@ -1,11 +1,10 @@
 # HDIM: Hypercomplex Domain Isomorphism Machine
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Lean4](https://img.shields.io/badge/Lean4-148%2F148%20PASS-brightgreen.svg)](verify_lean4_numerical.py)
-[![Tests](https://img.shields.io/badge/pytest-123%20PASS-success.svg)](tests/)
-[![Status](https://img.shields.io/badge/Status-Phase%2027%20Complete-blue.svg)]()
+[Python 3.10+](https://www.python.org/downloads/)
+[PyTorch 2.0+](https://pytorch.org/)  
+[Lean4](verify_lean4_numerical.py)
+[Tests](tests/)
+[Status]()
 
 > **Best Score:** 1.1542 (Phase 26c, epoch 15) — `pair_margin=0.993`, `STS=0.537`
 > **Verification:** 148/148 Lean4 theorems PASS | 123 pytest tests PASS
@@ -48,20 +47,24 @@ Standard text embedding models (BERT, SBERT, etc.) compare texts by **token prox
 ...describe **the same physical phenomenon** — bubble collapse causing surface damage. Different vocabulary, identical structure.
 
 HDIM solves this by:
+
 1. **Stripping domain-specific vocabulary** through hypercomplex algebra
 2. **Preserving structural topology** in a domain-invariant representation
 3. **Finding isomorphisms** between problems with matching structure
 
 ### Canonical Example
 
-| Domain A (Engineering) | Domain B (Dentistry) |
-|------------------------|----------------------|
-| Cavitation erosion | Ultrasonic plaque removal |
-| Bubble collapse dynamics | Micro-cavitation in fluids |
-| Surface pitting | Enamel erosion |
-| **Shared Physics:** Rapid pressure changes cause bubble collapse → surface damage |
+
+| Domain A (Engineering)                                                            | Domain B (Dentistry)       |
+| --------------------------------------------------------------------------------- | -------------------------- |
+| Cavitation erosion                                                                | Ultrasonic plaque removal  |
+| Bubble collapse dynamics                                                          | Micro-cavitation in fluids |
+| Surface pitting                                                                   | Enamel erosion             |
+| **Shared Physics:** Rapid pressure changes cause bubble collapse → surface damage |                            |
+
 
 Standard embeddings miss this connection. HDIM finds it via the **sandwich product**:
+
 ```
 U_inv = R⁻¹ ⊗ G_A ⊗ R   (extracts invariant structure)
 G_B = R_B ⊗ U_inv ⊗ R_B⁻¹   (transfers to target domain)
@@ -73,15 +76,18 @@ G_B = R_B ⊗ U_inv ⊗ R_B⁻¹   (transfers to target domain)
 
 ### Limitations of Standard Embeddings
 
-| Approach | What It Captures | What It Misses |
-|----------|------------------|----------------|
-| **Word2Vec/FastText** | Word co-occurrence | Structural relationships |
-| **BERT/SBERT** | Semantic similarity, context | Cross-domain isomorphisms |
-| **Sentence Embeddings** | Meaning similarity | Mathematical structure |
+
+| Approach                | What It Captures             | What It Misses            |
+| ----------------------- | ---------------------------- | ------------------------- |
+| **Word2Vec/FastText**   | Word co-occurrence           | Structural relationships  |
+| **BERT/SBERT**          | Semantic similarity, context | Cross-domain isomorphisms |
+| **Sentence Embeddings** | Meaning similarity           | Mathematical structure    |
+
 
 ### What HDIM Adds
 
 **Clifford Algebra Cl(3,1,0)** provides:
+
 - **Multivector representations** (16-dimensional): scalar + vectors + bivectors + trivectors + pseudoscalar
 - **Geometric product**: Encodes both symmetric (inner) and antisymmetric (wedge) relationships
 - **Rotor-based transformations**: Norm-preserving operations for domain transfer
@@ -106,6 +112,7 @@ U_inv = R⁻¹ ⊗ G_A ⊗ R
 ```
 
 Where:
+
 - `G_A` = Multivector encoding of problem in domain A
 - `R` = Domain rotor (learnable rotation in hypercomplex space)
 - `U_inv` = Domain-invariant structural encoding
@@ -126,19 +133,21 @@ This reconstructs the target domain representation from the invariant.
 
 All mathematical properties are numerically verified in `verify_lean4_numerical.py`:
 
-| Category | Theorems | Status |
-|----------|----------|--------|
-| Clifford Algebra | 67 | ✅ PASS |
-| Sandwich Product | 17 | ✅ PASS |
-| Involutions | 16 | ✅ PASS |
-| Domain Transfer | 11 | ✅ PASS |
-| HBMA Memory | 11 | ✅ PASS |
-| SoftMoE Router | 10 | ✅ PASS |
-| Matryoshka Embeddings | 7 | ✅ PASS |
-| Quaternion Operations | 9 | ✅ PASS |
-| Training Losses | 5 | ✅ PASS |
-| Memory Adapters | 5 | ✅ PASS |
-| **Total** | **148** | **✅ ALL PASS** |
+
+| Category              | Theorems | Status         |
+| --------------------- | -------- | -------------- |
+| Clifford Algebra      | 67       | ✅ PASS         |
+| Sandwich Product      | 17       | ✅ PASS         |
+| Involutions           | 16       | ✅ PASS         |
+| Domain Transfer       | 11       | ✅ PASS         |
+| HBMA Memory           | 11       | ✅ PASS         |
+| SoftMoE Router        | 10       | ✅ PASS         |
+| Matryoshka Embeddings | 7        | ✅ PASS         |
+| Quaternion Operations | 9        | ✅ PASS         |
+| Training Losses       | 5        | ✅ PASS         |
+| Memory Adapters       | 5        | ✅ PASS         |
+| **Total**             | **148**  | **✅ ALL PASS** |
+
 
 ---
 
@@ -146,49 +155,49 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        HDIM ARCHITECTURE                                 │
+│                        HDIM ARCHITECTURE                                │
 ├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
+│                                                                         │
 │  INPUT: Text pairs from different domains                               │
 │         ┌──────────────────┐    ┌──────────────────┐                    │
-│         │  "Cavitation in   │    │ "Ultrasonic      │                    │
-│         │   turbines..."    │    │  plaque..."      │                    │
+│         │  "Cavitation in  │    │ "Ultrasonic      │                    │
+│         │   turbines..."   │    │  plaque..."      │                    │
 │         └────────┬─────────┘    └────────┬─────────┘                    │
-│                  │                        │                              │
-│                  ▼                        ▼                              │
+│                  │                       │                              │
+│                  ▼                       ▼                              │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                    ENCODING LAYER                                  │  │
+│  │                    ENCODING LAYER                                 │  │
 │  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐            │  │
 │  │  │ SBERTEncoder│───▶│ DomainExpert│───▶│ HDIMEncoder │            │  │
 │  │  │ (frozen)    │    │ Pool (4x)   │    │ (MLP)       │            │  │
 │  │  └─────────────┘    └─────────────┘    └──────┬──────┘            │  │
-│  │                                              │                     │  │
-│  │                                              ▼                     │  │
+│  │                                               │                   │  │
+│  │                                               ▼                   │  │
 │  │                                    ┌─────────────────┐            │  │
 │  │                                    │ Multivector G   │            │  │
 │  │                                    │ (B × 16 dim)    │            │  │
 │  │                                    └────────┬────────┘            │  │
 │  └─────────────────────────────────────────────┼─────────────────────┘  │
-│                                                │                         │
-│                                                ▼                         │
+│                                                │                        │
+│                                                ▼                        │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                 STRUCTURAL EXTRACTION                              │  │
+│  │                 STRUCTURAL EXTRACTION                             │  │
 │  │  ┌────────────────────────────────────────────────────────────┐   │  │
-│  │  │            InvariantExtractor                               │   │  │
+│  │  │            InvariantExtractor                              │   │  │
 │  │  │                                                            │   │  │
-│  │  │   G ──▶ R⁻¹ ⊗ G ⊗ R ──▶ U_inv (domain-invariant)          │   │  │
+│  │  │   G ──▶ R⁻¹ ⊗ G ⊗ R ──▶ U_inv (domain-invariant)           │   │  │
 │  │  │                                                            │   │  │
 │  │  │   • Strips domain vocabulary                               │   │  │
 │  │  │   • Preserves structural topology                          │   │  │
 │  │  │   • Norm-preserving (||U|| = ||G||)                        │   │  │
 │  │  └────────────────────────────────────────────────────────────┘   │  │
 │  └─────────────────────────────────────────────┬─────────────────────┘  │
-│                                                │                         │
-│                                                ▼                         │
+│                                                │                        │
+│                                                ▼                        │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                    MEMORY LAYER (Titans)                           │  │
+│  │                    MEMORY LAYER (Titans)                          │  │
 │  │  ┌────────────────────────────────────────────────────────────┐   │  │
-│  │  │              TitansMemoryModule (TTT)                       │   │  │
+│  │  │              TitansMemoryModule (TTT)                      │   │  │
 │  │  │                                                            │   │  │
 │  │  │   • Test-Time Training for adaptive memory                 │   │  │
 │  │  │   • Working Memory (16 slots)                              │   │  │
@@ -197,12 +206,12 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 │  │  │   • fp32-safe AMP path                                     │   │  │
 │  │  └────────────────────────────────────────────────────────────┘   │  │
 │  └─────────────────────────────────────────────┬─────────────────────┘  │
-│                                                │                         │
-│                                                ▼                         │
+│                                                │                        │
+│                                                ▼                        │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                 MOE ROUTING LAYER                                  │  │
+│  │                 MOE ROUTING LAYER                                 │  │
 │  │  ┌────────────────────────────────────────────────────────────┐   │  │
-│  │  │                 SoftMoERouter                               │   │  │
+│  │  │                 SoftMoERouter                              │   │  │
 │  │  │                                                            │   │  │
 │  │  │   • Soft routing (no token dropping)                       │   │  │
 │  │  │   • Shared Expert (DeepSeek-V3 style)                      │   │  │
@@ -214,23 +223,23 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 │  │  │     └───────────┴───────────┴───────────┴──────────┘       │   │  │
 │  │  │                           │                                │   │  │
 │  │  │                           ▼                                │   │  │
-│  │  │                    [Weighted Combine]                       │   │  │
+│  │  │                    [Weighted Combine]                      │   │  │
 │  │  └────────────────────────────────────────────────────────────┘   │  │
 │  └─────────────────────────────────────────────┬─────────────────────┘  │
-│                                                │                         │
-│                                                ▼                         │
+│                                                │                        │
+│                                                ▼                        │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                   DECODING LAYER                                   │  │
+│  │                   DECODING LAYER                                  │  │
 │  │  ┌────────────────────────────────────────────────────────────┐   │  │
 │  │  │   Domain Transfer: G_B = R_B ⊗ U_inv ⊗ R_B⁻¹               │   │  │
 │  │  │                                                            │   │  │
 │  │  │   HDIMDecoder ──▶ Output Embedding (B × output_dim)        │   │  │
 │  │  └────────────────────────────────────────────────────────────┘   │  │
 │  └─────────────────────────────────────────────┬─────────────────────┘  │
-│                                                │                         │
-│                                                ▼                         │
+│                                                │                        │
+│                                                ▼                        │
 │  OUTPUT: Domain-transferred embeddings for analogy matching             │
-│                                                                          │
+│                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -240,30 +249,36 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 
 ### Core Layer
 
-| Component | Description | File |
-|-----------|-------------|------|
-| **CliffordAlgebra** | Cl(3,1,0) implementation with Cayley-table geometric product | `src/core/hypercomplex.py:20` |
-| **DomainRotationOperator** | Learnable rotor for domain transformations | `src/core/domain_operators.py:19` |
-| **InvariantExtractor** | Sandwich product: R⁻¹⊗G⊗R | `src/core/domain_operators.py:54` |
-| **TitansMemoryModule** | Test-Time Training memory (fp32-safe) | `src/core/titans_memory.py:30` |
-| **HBMAMemoryAdapter** | 4-system memory (Working, Episodic, Semantic, Procedural) | `src/core/hbma_memory.py:20` |
-| **SoftMoERouter** | Soft MoE with SharedExpert + AuxLossFree | `src/core/soft_moe_router.py:43` |
-| **DomainExpertPool** | 4 frozen SBERT experts + trainable projections | `src/core/domain_expert_pool.py:20` |
-| **HDIMPipeline** | End-to-end pipeline orchestrator | `src/core/hdim_pipeline.py:128` |
+
+| Component                  | Description                                                  | File                                |
+| -------------------------- | ------------------------------------------------------------ | ----------------------------------- |
+| **CliffordAlgebra**        | Cl(3,1,0) implementation with Cayley-table geometric product | `src/core/hypercomplex.py:20`       |
+| **DomainRotationOperator** | Learnable rotor for domain transformations                   | `src/core/domain_operators.py:19`   |
+| **InvariantExtractor**     | Sandwich product: R⁻¹⊗G⊗R                                    | `src/core/domain_operators.py:54`   |
+| **TitansMemoryModule**     | Test-Time Training memory (fp32-safe)                        | `src/core/titans_memory.py:30`      |
+| **HBMAMemoryAdapter**      | 4-system memory (Working, Episodic, Semantic, Procedural)    | `src/core/hbma_memory.py:20`        |
+| **SoftMoERouter**          | Soft MoE with SharedExpert + AuxLossFree                     | `src/core/soft_moe_router.py:43`    |
+| **DomainExpertPool**       | 4 frozen SBERT experts + trainable projections               | `src/core/domain_expert_pool.py:20` |
+| **HDIMPipeline**           | End-to-end pipeline orchestrator                             | `src/core/hdim_pipeline.py:128`     |
+
 
 ### Model Layer
 
-| Component | Description | File |
-|-----------|-------------|------|
-| **HDIMModel** | Core HDIM model with configurable architecture | `src/models/hdim_model.py:117` |
-| **TextHDIMModel** | Text-to-embedding wrapper | `src/models/text_hdim_model.py:191` |
-| **SBERTEncoder** | Frozen SBERT encoder wrapper | `src/models/sbert_encoder.py:20` |
+
+| Component         | Description                                    | File                                |
+| ----------------- | ---------------------------------------------- | ----------------------------------- |
+| **HDIMModel**     | Core HDIM model with configurable architecture | `src/models/hdim_model.py:117`      |
+| **TextHDIMModel** | Text-to-embedding wrapper                      | `src/models/text_hdim_model.py:191` |
+| **SBERTEncoder**  | Frozen SBERT encoder wrapper                   | `src/models/sbert_encoder.py:20`    |
+
 
 ### Training Layer
 
-| Component | Description | File |
-|-----------|-------------|------|
+
+| Component       | Description                        | File                         |
+| --------------- | ---------------------------------- | ---------------------------- |
 | **HDIMTrainer** | Full training loop with all losses | `src/training/trainer.py:19` |
+
 
 ---
 
@@ -285,26 +300,30 @@ Geometric product rules:
 
 ### Key Operations
 
-| Operation | Formula | Code |
-|-----------|---------|------|
-| Geometric Product | `a ⊗ b = a·b + a∧b` | `CliffordAlgebra.geometric_product()` |
-| Sandwich | `R⁻¹ ⊗ M ⊗ R` | `InvariantExtractor.forward()` |
-| Rotor Exponential | `exp(B) = cos(θ) + B·sin(θ/θ)` | `CliffordAlgebra.bivector_exp()` |
-| Reverse Involution | `rev(e₁₂₃) = e₃₂₁` | `CliffordAlgebra.reverse()` |
+
+| Operation          | Formula                        | Code                                  |
+| ------------------ | ------------------------------ | ------------------------------------- |
+| Geometric Product  | `a ⊗ b = a·b + a∧b`            | `CliffordAlgebra.geometric_product()` |
+| Sandwich           | `R⁻¹ ⊗ M ⊗ R`                  | `InvariantExtractor.forward()`        |
+| Rotor Exponential  | `exp(B) = cos(θ) + B·sin(θ/θ)` | `CliffordAlgebra.bivector_exp()`      |
+| Reverse Involution | `rev(e₁₂₃) = e₃₂₁`             | `CliffordAlgebra.reverse()`           |
+
 
 ### Loss Functions
 
-| Loss | Weight | Phase | Purpose |
-|------|--------|-------|---------|
-| Reconstruction | 1.0 | 1 | MSE between input and output |
-| Isomorphism | 0.1 | 1 | MSE between transferred and target |
-| Focal-InfoNCE | 0.1 | 3 | Pair discrimination with focal loss |
-| Routing Entropy | 0.05 | 7 | Balanced expert utilization |
-| Z-Loss | 0.01 | 9 | MoE collapse prevention |
-| Memory | 0.05 | 6 | Titans memory consistency |
-| DCL | 0.2 | 20 | Decoupled Contrastive Learning |
-| Uniformity+Alignment | 0.1 | 20 | Representation quality |
-| Expert Ortho | 0.02 | 26 | Expert diversity |
+
+| Loss                 | Weight | Phase | Purpose                             |
+| -------------------- | ------ | ----- | ----------------------------------- |
+| Reconstruction       | 1.0    | 1     | MSE between input and output        |
+| Isomorphism          | 0.1    | 1     | MSE between transferred and target  |
+| Focal-InfoNCE        | 0.1    | 3     | Pair discrimination with focal loss |
+| Routing Entropy      | 0.05   | 7     | Balanced expert utilization         |
+| Z-Loss               | 0.01   | 9     | MoE collapse prevention             |
+| Memory               | 0.05   | 6     | Titans memory consistency           |
+| DCL                  | 0.2    | 20    | Decoupled Contrastive Learning      |
+| Uniformity+Alignment | 0.1    | 20    | Representation quality              |
+| Expert Ortho         | 0.02   | 26    | Expert diversity                    |
+
 
 ---
 
@@ -424,14 +443,16 @@ python scripts/auto_tune.py \
 
 ### Key Hyperparameters
 
-| Parameter | Default | Range | Effect |
-|-----------|---------|-------|--------|
-| `hidden_dim` | 256 | [128, 512] | Model capacity |
-| `num_experts` | 4 | [2, 8] | MoE diversity |
-| `top_k` | 2 | [1, 4] | Experts per token |
-| `lambda_z` | 0.01 | [0.001, 0.1] | MoE collapse prevention |
-| `temperature` | 0.15 | [0.1, 0.5] | InfoNCE contrast |
-| `focal_gamma` | 2.0 | [0.5, 3.0] | Hard negative focus |
+
+| Parameter     | Default | Range        | Effect                  |
+| ------------- | ------- | ------------ | ----------------------- |
+| `hidden_dim`  | 256     | [128, 512]   | Model capacity          |
+| `num_experts` | 4       | [2, 8]       | MoE diversity           |
+| `top_k`       | 2       | [1, 4]       | Experts per token       |
+| `lambda_z`    | 0.01    | [0.001, 0.1] | MoE collapse prevention |
+| `temperature` | 0.15    | [0.1, 0.5]   | InfoNCE contrast        |
+| `focal_gamma` | 2.0     | [0.5, 3.0]   | Hard negative focus     |
+
 
 ---
 
@@ -505,10 +526,6 @@ hypercoplexAI/
 ├── docs/
 │   ├── ARCHITECTURE.md          # Full architecture documentation
 │   └── DIAGRAMS.md              # Mermaid diagrams
-├── .omc/
-│   ├── research/                # Research reports (15 files)
-│   ├── plans/                   # Implementation plans
-│   └── project-memory.json      # Project state
 ├── verify_lean4_numerical.py    # 148 theorem verification
 ├── HDIM.md                      # Technical specification
 └── README.md                    # This file
@@ -582,12 +599,13 @@ training_config = {
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
+
+| Document                                         | Description                                                |
+| ------------------------------------------------ | ---------------------------------------------------------- |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Full architecture: layers, components, API, configurations |
-| **[docs/DIAGRAMS.md](docs/DIAGRAMS.md)** | Mermaid diagrams: data flow, sequence, class diagrams |
-| **[HDIM.md](HDIM.md)** | Technical specification: formulas, algorithms, phases |
-| **[.omc/research/](.omc/research/)** | Research reports: architecture, training, verification |
+| **[docs/DIAGRAMS.md](docs/DIAGRAMS.md)**         | Mermaid diagrams: data flow, sequence, class diagrams      |
+| **[HDIM.md](HDIM.md)**                           | Technical specification: formulas, algorithms, phases      |
+
 
 ---
 
@@ -595,25 +613,29 @@ training_config = {
 
 ### Key Papers
 
-| Paper | Citation | Relevance |
-|-------|----------|-----------|
-| Soft MoE | Puigcerver et al. (ICLR 2024) | Soft routing without token dropping |
-| DeepSeek-V3 | DeepSeek (2024) | Shared Expert + Aux-loss-free balancing |
-| Titans Memory | Gu & Dao (2023) | Test-Time Training for memory |
-| DCL | Yeh et al. (2022) | Decoupled Contrastive Learning |
-| Uniformity+Alignment | Wang & Isola (2020) | Contrastive representation quality |
-| Expert Orthogonalization | arXiv:2505.22323 (2025) | Expert diversity via orthogonality |
+
+| Paper                    | Citation                      | Relevance                               |
+| ------------------------ | ----------------------------- | --------------------------------------- |
+| Soft MoE                 | Puigcerver et al. (ICLR 2024) | Soft routing without token dropping     |
+| DeepSeek-V3              | DeepSeek (2024)               | Shared Expert + Aux-loss-free balancing |
+| Titans Memory            | Gu & Dao (2023)               | Test-Time Training for memory           |
+| DCL                      | Yeh et al. (2022)             | Decoupled Contrastive Learning          |
+| Uniformity+Alignment     | Wang & Isola (2020)           | Contrastive representation quality      |
+| Expert Orthogonalization | arXiv:2505.22323 (2025)       | Expert diversity via orthogonality      |
+
 
 ### Code References
 
-| Component | File | Key Lines |
-|-----------|------|-----------|
-| Geometric Product | `src/core/hypercomplex.py` | L20-150 |
-| Sandwich Product | `src/core/domain_operators.py` | L54-103 |
-| SoftMoE Router | `src/core/soft_moe_router.py` | L43-250 |
-| Shared Expert | `src/core/domain_expert_pool.py` | L115-180 |
-| Titans Memory | `src/core/titans_memory.py` | L30-200 |
-| HBMA Adapter | `src/core/hbma_memory.py` | L20-150 |
+
+| Component         | File                             | Key Lines |
+| ----------------- | -------------------------------- | --------- |
+| Geometric Product | `src/core/hypercomplex.py`       | L20-150   |
+| Sandwich Product  | `src/core/domain_operators.py`   | L54-103   |
+| SoftMoE Router    | `src/core/soft_moe_router.py`    | L43-250   |
+| Shared Expert     | `src/core/domain_expert_pool.py` | L115-180  |
+| Titans Memory     | `src/core/titans_memory.py`      | L30-200   |
+| HBMA Adapter      | `src/core/hbma_memory.py`        | L20-150   |
+
 
 ---
 
@@ -629,15 +651,17 @@ training_config = {
 
 ### Phase 17 Critical Fixes (C1-C7)
 
-| Code | Issue | Fix |
-|------|-------|-----|
-| C1 | SoftMoERouter guard for T=1 | Added epsilon in softmax |
-| C2 | Dynamic load-balance loss | EMA scores for stability |
-| C3 | Out-of-place operations | In-place tensor ops |
-| C4 | fp32 TTT path | TitansMemory in fp32 during AMP |
-| C5 | Memory drift | `reset_memory()` per epoch |
-| C6 | Focal gamma | Applied to denominator only |
-| C7 | Non-leaf tensor fix | `.clone()` for non-leaf tensors |
+
+| Code | Issue                       | Fix                             |
+| ---- | --------------------------- | ------------------------------- |
+| C1   | SoftMoERouter guard for T=1 | Added epsilon in softmax        |
+| C2   | Dynamic load-balance loss   | EMA scores for stability        |
+| C3   | Out-of-place operations     | In-place tensor ops             |
+| C4   | fp32 TTT path               | TitansMemory in fp32 during AMP |
+| C5   | Memory drift                | `reset_memory()` per epoch      |
+| C6   | Focal gamma                 | Applied to denominator only     |
+| C7   | Non-leaf tensor fix         | `.clone()` for non-leaf tensors |
+
 
 ---
 
@@ -659,7 +683,7 @@ If you use HDIM in your research, please cite:
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+TBD
 
 ---
 

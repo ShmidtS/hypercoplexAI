@@ -118,23 +118,23 @@
 ### 3.1 Обзор модулей
 
 
-| Модуль                                                         | Класс                      | Назначение                   | Статус       |
-| -------------------------------------------------------------- | -------------------------- | ---------------------------- | ------------ |
-| `[hypercomplex.py](../src/core/hypercomplex.py)`               | `CliffordAlgebra`          | Алгебра Клиффорда Cl_{p,q,r} | **Stable**   |
-|                                                                | `QuaternionLinear`         | Кватернионный слой           | **Stable**   |
-|                                                                | `PHMLinear`                | Parameterized Hypercomplex   | *Удалён* |
-| `[domain_operators.py](../src/core/domain_operators.py)`       | `DomainRotationOperator`   | Обучаемый ротор домена       | **Stable**   |
-|                                                                | `InvariantExtractor`       | Извлечение U_inv = R⁻¹GR     | **Stable**   |
-|                                                                | `DomainRegistry`           | Реестр доменов               | **Stable**   |
-| `[titans_memory.py](../src/core/titans_memory.py)`             | `TitansMemoryModule`       | Test-Time Training память    | **Stable**   |
-| `[soft_moe_router.py](../src/core/soft_moe_router.py)`         | `SoftMoERouter`            | Soft Mixture-of-Experts (Phase 26: SharedExpert, AuxLossFree, ExpertOrtho) | **Stable**   |
-| `[domain_expert_pool.py](../src/core/domain_expert_pool.py)`   | `DomainExpertPool`         | Пул из 4 frozen SBERT экспертов с trainable projections | **Stable**   |
-|                                                                | `SharedExpert`             | Always-on FFN (DeepSeek-V3)  | **Stable**   |
-|                                                                | `ExpertProjection`         | Trainable projection head    | **Stable**   |
-| `[hdim_pipeline.py](../src/core/hdim_pipeline.py)`             | `HDIMPipeline`             | Главный orchestrator         | **Stable**   |
-|                                                                | `HDIMEncoder`              | Кодирование → мультивектор   | **Stable**   |
-|                                                                | `HDIMDecoder`              | Мультивектор → выход         | **Stable**   |
-|                                                                | `TransferState`            | State-контейнер              | **Stable**   |
+| Модуль                                                       | Класс                    | Назначение                                                                 | Статус     |
+| ------------------------------------------------------------ | ------------------------ | -------------------------------------------------------------------------- | ---------- |
+| `[hypercomplex.py](../src/core/hypercomplex.py)`             | `CliffordAlgebra`        | Алгебра Клиффорда Cl_{p,q,r}                                               | **Stable** |
+|                                                              | `QuaternionLinear`       | Кватернионный слой                                                         | **Stable** |
+|                                                              | `PHMLinear`              | Parameterized Hypercomplex                                                 | *Удалён*   |
+| `[domain_operators.py](../src/core/domain_operators.py)`     | `DomainRotationOperator` | Обучаемый ротор домена                                                     | **Stable** |
+|                                                              | `InvariantExtractor`     | Извлечение U_inv = R⁻¹GR                                                   | **Stable** |
+|                                                              | `DomainRegistry`         | Реестр доменов                                                             | **Stable** |
+| `[titans_memory.py](../src/core/titans_memory.py)`           | `TitansMemoryModule`     | Test-Time Training память                                                  | **Stable** |
+| `[soft_moe_router.py](../src/core/soft_moe_router.py)`       | `SoftMoERouter`          | Soft Mixture-of-Experts (Phase 26: SharedExpert, AuxLossFree, ExpertOrtho) | **Stable** |
+| `[domain_expert_pool.py](../src/core/domain_expert_pool.py)` | `DomainExpertPool`       | Пул из 4 frozen SBERT экспертов с trainable projections                    | **Stable** |
+|                                                              | `SharedExpert`           | Always-on FFN (DeepSeek-V3)                                                | **Stable** |
+|                                                              | `ExpertProjection`       | Trainable projection head                                                  | **Stable** |
+| `[hdim_pipeline.py](../src/core/hdim_pipeline.py)`           | `HDIMPipeline`           | Главный orchestrator                                                       | **Stable** |
+|                                                              | `HDIMEncoder`            | Кодирование → мультивектор                                                 | **Stable** |
+|                                                              | `HDIMDecoder`            | Мультивектор → выход                                                       | **Stable** |
+|                                                              | `TransferState`          | State-контейнер                                                            | **Stable** |
 
 
 ### 3.2 CliffordAlgebra
@@ -270,11 +270,13 @@ if self.use_shared_expert:
 
 **Phase 26 нововведения:**
 
-| Фича | Описание | Включение |
-|------|----------|-----------|
-| Shared Expert (DeepSeek-V3) | Always-on FFN обрабатывает ВСЕ входы | `enable_shared_expert()` |
-| AuxLoss-Free Balancing (DeepSeek-V3) | Per-expert bias для динамической балансировки | `enable_aux_loss_free(lr=0.001)` |
-| Expert Orthogonalization | `L_o = \|\|W1 @ W1^T - I\|\|^2 + \|\|W2 @ W2^T - I\|\|^2` | `enable_expert_ortho()` |
+
+| Фича                                 | Описание                                          | Включение                        |
+| ------------------------------------ | ------------------------------------------------- | -------------------------------- |
+| Shared Expert (DeepSeek-V3)          | Always-on FFN обрабатывает ВСЕ входы              | `enable_shared_expert()`         |
+| AuxLoss-Free Balancing (DeepSeek-V3) | Per-expert bias для динамической балансировки     | `enable_aux_loss_free(lr=0.001)` |
+| Expert Orthogonalization             | `L_o = ||W1 @ W1^T - I||^2 + ||W2 @ W2^T - I||^2` | `enable_expert_ortho()`          |
+
 
 **Phase 26 удаления:**
 
@@ -289,31 +291,37 @@ if self.use_shared_expert:
 
 **Назначение:** Пул из 4 frozen SBERT-энкодеров (MiniLM family) с обучаемыми projection heads.
 
-| ID | Модель | Параметры | Назначение |
-|----|--------|-----------|------------|
-| 0 | `all-MiniLM-L6-v2` | 22M frozen | General semantics |
-| 1 | `paraphrase-MiniLM-L3-v2` | 17M frozen | Paraphrase/structural similarity |
-| 2 | `multi-qa-MiniLM-L6-cos-v1` | 22M frozen | QA/domain-crossing |
-| 3 | `all-MiniLM-L12-v2` | 33M frozen | Deep semantic analysis |
+
+| ID  | Модель                      | Параметры  | Назначение                       |
+| --- | --------------------------- | ---------- | -------------------------------- |
+| 0   | `all-MiniLM-L6-v2`          | 22M frozen | General semantics                |
+| 1   | `paraphrase-MiniLM-L3-v2`   | 17M frozen | Paraphrase/structural similarity |
+| 2   | `multi-qa-MiniLM-L6-cos-v1` | 22M frozen | QA/domain-crossing               |
+| 3   | `all-MiniLM-L12-v2`         | 33M frozen | Deep semantic analysis           |
+
 
 **Общий footprint:** ~94M frozen params + ~100K trainable per expert.
 
 **Ключевые классы:**
 
-| Класс | Назначение |
-|-------|------------|
-| `DomainExpertPool` | Управление пулом экспертов, forward, routing |
-| `DomainExpert` | Один frozen SBERT + trainable projection |
+
+| Класс              | Назначение                                     |
+| ------------------ | ---------------------------------------------- |
+| `DomainExpertPool` | Управление пулом экспертов, forward, routing   |
+| `DomainExpert`     | Один frozen SBERT + trainable projection       |
 | `ExpertProjection` | `Linear → LayerNorm → GELU → Dropout → Linear` |
-| `SharedExpert` | Always-on FFN (DeepSeek-V3 pattern) |
+| `SharedExpert`     | Always-on FFN (DeepSeek-V3 pattern)            |
+
 
 **Ключевые методы:**
 
-| Метод | Описание |
-|-------|----------|
-| `forward_all_experts(texts, device)` | Stack всех экспертов: `(E, B, D)` |
+
+| Метод                                          | Описание                             |
+| ---------------------------------------------- | ------------------------------------ |
+| `forward_all_experts(texts, device)`           | Stack всех экспертов: `(E, B, D)`    |
 | `forward_with_routing(texts, weights, device)` | Weighted combination + shared expert |
-| `precompute_cache(texts)` | Предвычисление SBERT embeddings |
+| `precompute_cache(texts)`                      | Предвычисление SBERT embeddings      |
+
 
 ### 3.8 HDIMPipeline
 
@@ -788,10 +796,10 @@ config = HDIMConfig(
 ### 9.3 Factory Flags
 
 
-| Флаг                       | Эффект                                            |
-| -------------------------- | ------------------------------------------------- |
-| `soft_router=True`         | Заменяет R3MoERouter на SoftMoERouter             |
-| `freeze_sbert=True`        | Frozen SBERT + trainable projection               |
+| Флаг                | Эффект                                |
+| ------------------- | ------------------------------------- |
+| `soft_router=True`  | Заменяет R3MoERouter на SoftMoERouter |
+| `freeze_sbert=True` | Frozen SBERT + trainable projection   |
 
 
 ---
@@ -819,7 +827,6 @@ config = HDIMConfig(
 ### 10.2 Удалено (Occam's razor)
 
 Компоненты удалены как неиспользуемый мёртвый код:
-
 
 ---
 
@@ -865,13 +872,6 @@ config = HDIMConfig(
 - `[src/models/text_hdim_model.py](../src/models/text_hdim_model.py)` — TextHDIMModel
 - `[src/models/model_factory.py](../src/models/model_factory.py)` — Factory functions
 - `[src/training/trainer.py](../src/training/trainer.py)` — HDIMTrainer, losses
-
-### Исследовательские отчёты
-
-- `[.omc/research/core-architecture.md](../.omc/research/core-architecture.md)` — Ядро
-- `[.omc/research/model-stack.md](../.omc/research/model-stack.md)` — Модели
-- `[.omc/research/training-and-ops.md](../.omc/research/training-and-ops.md)` — Обучение
-- `[.omc/research/architecture-synthesis.md](../.omc/research/architecture-synthesis.md)` — Синтез архитектуры
 
 ---
 
