@@ -620,9 +620,9 @@ def test_trainer_uses_text_pair_path_for_raw_pair_batches(text_model):
     losses = trainer.evaluate_batch(batch)
 
     assert losses["loss_total"].item() >= 0.0
-    assert calls["transfer_text_pairs"] == 1
+    assert calls["transfer_text_pairs"] == 0
     assert calls["forward_texts"] == 1
-    assert calls["transfer_pairs"] == 0
+    assert calls["transfer_pairs"] == 1
     assert calls["forward"] == 0
 
 

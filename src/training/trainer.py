@@ -176,12 +176,8 @@ class HDIMTrainer:
         pair_domain_id = batch["pair_domain_id"].to(self.device)
         return self._compute_pair_iso_targets(pair_encoding, pair_domain_id)
 
-    def _exported_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
-        return aux_state.exported_invariant
     def _training_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
         return aux_state.training_invariant
-    def _iso_reference_invariant(self, aux_state: HDIMAuxState) -> torch.Tensor:
-        return self._training_invariant(aux_state)
 
     def _has_pairs(self, batch: Dict[str, Any]) -> bool:
         return ("pair_encoding" in batch and "pair_domain_id" in batch) or (
@@ -405,7 +401,7 @@ class HDIMTrainer:
         """
         if embeddings.numel() == 0:
             return base_temp
-        cluster_var = embeddings.var(dim=0).mean()
+        cluster_var = embeddings.var(dim=0, unbiased=False).mean()
         scale = torch.exp(-cluster_var)
         scaled = base_temp * scale.clamp(0.5, 2.0)
         self._last_cluster_temp = float(scaled.item())
@@ -627,7 +623,7 @@ class HDIMTrainer:
 
         # Vectorized: mask diagonal to -inf for all rows at once
         masked_sim = sim_matrix.clone()
-        masked_sim.masked_fill_(diag_mask, -3e4)
+        masked_sim.masked_fill_(diag_mask, -torch.finfo(torch.float32).max)
         log_denom = torch.logsumexp(masked_sim, dim=1)  # (B,)
         s_pos = sim_matrix.diag()  # (B,)
         loss_per_sample = -(s_pos - log_denom)  # (B,)
@@ -725,7 +721,7 @@ class HDIMTrainer:
         eye = torch.eye(B, dtype=torch.bool, device=self.device)
         denom_mask = ~eye  # (B, B)
 
-        log_denom = torch.logsumexp(sim_matrix.masked_fill(eye, -3e4), dim=-1)  # safe for fp16
+        log_denom = torch.logsumexp(sim_matrix.masked_fill(eye, -torch.finfo(torch.float32).max), dim=-1)  # safe for fp16
 
         # Vectorized: for each sample, average over positive similarities
         num_pos = pos_mask.sum(dim=1).clamp(min=1)  # (B,) — at least 1 to avoid div by 0
@@ -1013,18 +1009,18 @@ class HDIMTrainer:
             if regime.mode == "paired":
                 pair_texts = self._extract_texts(batch, "pair_text")
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
+                # Encode source once (was double-encoded by transfer_text_pairs + _encode_texts)
+                _src_enc, _src_scales = self._encode_texts(texts, collect_matryoshka=True)
                 output, routing_weights, invariant, aux_state = (
-                    self.model.transfer_text_pairs(
-                        texts,
+                    self.model.core_model.transfer_pairs(
+                        _src_enc,
                         domain_id,
                         pair_domain_id,
                         update_memory=regime.update_memory,
                         memory_mode=regime.memory_mode,
                     )
                 )
-                # For negative pairs: recon_target = source encoding
                 _prl = batch.get("pair_relation_label")
-                _src_enc, _src_scales = self._encode_texts(texts, collect_matryoshka=True)
                 _tgt_enc, _tgt_scales = self._encode_texts(pair_texts, collect_matryoshka=True)
                 # Apply embedding augmentation to pair (non-anchor) side
                 if self._augmenter is not None:
@@ -1269,7 +1265,7 @@ class HDIMTrainer:
         torch.save(checkpoint, path)
 
     def load_checkpoint(self, path: str, scaler=None) -> None:
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self._step = checkpoint.get("step", 0)

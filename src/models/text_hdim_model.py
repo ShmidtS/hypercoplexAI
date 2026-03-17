@@ -277,7 +277,7 @@ class TextHDIMModel(nn.Module):
         self.core_model.enable_expert_ortho()
 
     def compute_expert_ortho_loss(self) -> "torch.Tensor":
-        return self.core_model.compute_expert_ortho_loss()
+        return self.core_model.pipeline.moe.expert_orthogonalization_loss()
 
     def encode_texts(
         self,
@@ -311,10 +311,6 @@ class TextHDIMModel(nn.Module):
             device = next(self.core_model.parameters()).device
 
         raw = self.text_encoder(texts, device=device, dtype=dtype)
-        if isinstance(raw, dict):
-            max_dim = max(raw.keys())
-            full = raw[max_dim]
-            return full, raw
         return raw, None
 
     def forward_texts(

@@ -6,6 +6,8 @@ REM   - --weight_decay 0.05: stronger regularization (was default 1e-4)
 REM   - --early_stopping_patience 3: stop fast if no improvement (was 50)
 REM   - --dropout 0.3: increased dropout for regularization (was default 0.1)
 REM   - --lambda_sts 0.5: increased STS weight in loss (was 0.25)
+REM   - --real_pairs data\real_pairs_v10.json: 1036 pairs (was 330 in v8)
+REM   - --augment_factor 8: reduced (v10 has 3x more real data)
 REM   - Output dir: phase25b (not overwriting phase25)
 REM   - Added --freeze_sbert flag (via freeze_sbert_bottom_frac)
 REM Hardware: RTX 3070 Laptop 8.6GB, CUDA 12.4
@@ -25,8 +27,8 @@ python scripts\gpu_train.py ^
     --pretrained_encoder ^
     --freeze_sbert_bottom_frac 0.5 ^
     --soft_router ^
-    --real_pairs data\real_pairs_v8.json ^
-    --augment_factor 25 ^
+    --real_pairs data\real_pairs_v10.json ^
+    --augment_factor 8 ^
     --lambda_pair 0.45 ^
     --lambda_angle 0.4 ^
     --lambda_sts 0.5 ^
@@ -44,7 +46,6 @@ python scripts\gpu_train.py ^
     --t_mult 2 ^
     --warmup_epochs 3 ^
     --gradient_checkpointing ^
-    --similarity_preserving_router ^
     --early_stopping_patience 3 ^
     --eval_every 5 ^
     --save_every 25 ^

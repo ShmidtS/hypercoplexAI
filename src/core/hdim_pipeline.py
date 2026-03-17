@@ -21,7 +21,7 @@ from .hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from .domain_operators import DomainRotationOperator, InvariantExtractor, sandwich_transfer
 from .titans_memory import MemoryState, TitansMemoryModule
 from .soft_moe_router import SoftMoERouter
-from .cls_memory import CLSMemory, HBMAMemory
+from .hbma_memory import CLSMemory, HBMAMemory
 from .memory_interface import MemoryInterface, TitansAdapter, HBMAMemoryAdapter
 
 
@@ -235,6 +235,9 @@ class HDIMPipeline(nn.Module):
             retrieved=result.output - u_inv,
             loss=result.loss,
             updated=result.updated,
+            alpha=result.alpha,
+            eta=result.eta,
+            theta=result.theta,
         )
         return result.output, mem_state
 

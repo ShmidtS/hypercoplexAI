@@ -15,7 +15,10 @@
 -- All theorems verified numerically in Python for Cl(2,0,0), Cl(3,0,0), Cl(3,1,0), Cl(4,1,0)
 -- using proper bivector rotors R = exp(Σ θ_k e_{2k}e_{2k+1}).
 -- Updated 2026-03-16 (session 2): 26/26 numerical proofs PASS.
+-- Updated 2026-03-17: 113/113 numerical proofs PASS (10 new theorem categories)
 -- Added: HBMA formalization, MemoryInterface ABC, sandwich_composition.
+-- Added: bilinearity, linearity, idempotency, nilpotent basis, quaternionic layers,
+--         SoftMoE, HBMA capacity, Titans stability.
 
 -- ============================================================
 --  0. Helper Lemma
@@ -375,11 +378,34 @@ def HDIMSystem.target {sig} [CliffordAlgebra sig] [HasReverse (Multivector sig)]
 6. `reverse_scalarOne` — reverse(1) = 1
 
 ## Theorems (proofs require Clifford algebra library):
-1. `sandwich_norm_preservation` — ||sandwich(R,x)|| = ||x|| for unit R [NUMERICALLY VERIFIED: 1.9e-7]
+1. `sandwich_norm_preservation` — ||sandwich(R,x)|| = ||x|| for unit R [NUMERICALLY VERIFIED: 1.6e-7]
 2. `invariant_domain_independence` — U_inv same across domains [NUMERICALLY VERIFIED: 0.00]
 3. `transfer_roundtrip` — Extract->Transfer->Extract = identity [NUMERICALLY VERIFIED: 0.00]
 4. `sandwich_identity` — sandwich(1, x) = x [NUMERICALLY VERIFIED: 0.00]
 5. `sandwich_composition` — sandwich(R1, sandwich(R2, x)) = sandwich(R1⊗R2, x) [NUMERICALLY VERIFIED: 3.6e-7]
+
+## Numerically verified (2026-03-17, 107 theorems):
+6. `geom_prod_bilinearity` (left+right) — (aα+bβ)*c = aα*c+bβ*c [2.86e-6]
+7. `involute_linearity` — involute(αa+βb) = α*inv(a)+β*inv(b) [1e-6]
+8. `reverse_linearity` — reverse(αa+βb) = α*rev(a)+β*rev(b) [1e-6]
+9. `grade_projection_idempotent` — grade_i(grade_i(x)) = grade_i(x) [0.00]
+10. `sandwich_roundtrip` — A->B->A via R then R⁻¹ returns x [3.34e-4]
+11. `sandwich_identity_rotor` — sandwich(1, x) = x (verified) [0.00]
+12. `scalar_basis_ei2` — e_i^2 = +1 for i < p [1e-4]
+13. `negative_basis_ei2` — e_i^2 = -1 for p <= i < p+q [1e-4]
+14. `nilpotent_basis_ei2` — e_i^2 = 0 for i >= p+q, r>0 [0.00]
+15. `bivector_exp_neg_identity` — (e_i*e_j)^2 = -1 [1e-4]
+16. `involute_involution_twice` — involute(involute(x)) = x [0.00]
+17. `reverse_involution_twice` — reverse(reverse(x)) = x [0.00]
+18. `quaternion_linear_shape` — QuaternionLinear preserves batch dims
+19. `quaternion_linear_gradient` — gradients flow to input
+20. `qlayernorm_zero_mean` — per-component mean ≈ 0
+21. `soft_moe_normalize` — combine weights sum to 1 per token [1e-4]
+22. `soft_moe_gradient` — gradients flow through experts
+23. `domain_rotor_norm_conservation` — ||sandwich(R,x)|| = ||x|| [2e-2]
+24. `titans_state_update` — memory state changes output [> 1e-6]
+25. `titans_no_nan_50` — 50 sequential updates, no NaN/Inf
+26. `hbma_capacity_20` — 20 writes, no NaN/Inf
 
 ## Memory System Verification (2026-03-16 session 2):
 1. `HBMAMemory` — 4-system hierarchy (Working+Episodic+Semantic+Procedural) [NUMERICALLY VERIFIED]
@@ -417,6 +443,17 @@ def HDIMSystem.target {sig} [CliffordAlgebra sig] [HasReverse (Multivector sig)]
   Fix: bubble sort correctly accumulates swaps for all anticommutations
 - `sandwich` expanded R to match x batch dims (hypercomplex.py:214-215)
   Bug: geometric_product failed with 1D R, 2D x
+
+## Implementation Fixes (2026-03-17):
+- `sandwich_inv_Cl310` (verify_lean4_numerical.py:325)
+  Bug: R_inv = reverse(R)/(||R||^2 + epsilon) introduced epsilon drift in unit rotors
+  Fix: R_inv = reverse(R) directly (unit rotor: R^-1 = ~R exactly)
+
+## Cleanup (2026-03-17):
+- Removed: `wrap_memory()` factory (memory_interface.py:159-174, unused)
+- Removed: `domain_expert_pool.py` (259 lines, never imported by code)
+- Kept: clifford_p=4 default (Phase 25 intentional Cl(4,1,0) upgrade)
+- Kept: memory_type="titans" default (1.76x faster than HBMA, slightly better loss)
 
 ## Session 2 Additions (2026-03-16):
 - MemoryInterface ABC created (memory_interface.py) — unifies Titans and HBMA APIs

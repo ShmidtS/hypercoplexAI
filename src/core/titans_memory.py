@@ -202,14 +202,3 @@ class TitansMemoryModule(nn.Module):
                 if norm > self._MEMORY_MAX_NORM:
                     self.momentum_S.mul_(self._MEMORY_MAX_NORM / (norm + 1e-8))
 
-    def stabilize_momentum(self) -> bool:
-        """Принудительная нормировка momentum_S. Вызывать при LR restarts.
-
-        Returns True если была применена нормировка.
-        """
-        with torch.no_grad():
-            norm = self.momentum_S.norm()
-            if norm > self._MEMORY_MAX_NORM * 0.5:
-                self.momentum_S.mul_(self._MEMORY_MAX_NORM * 0.5 / (norm + 1e-8))
-                return True
-        return False

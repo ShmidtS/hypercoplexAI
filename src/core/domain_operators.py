@@ -84,13 +84,6 @@ class InvariantExtractor(nn.Module):
         step1 = self.algebra.geometric_product(R_inv.expand(*G_source.shape), G_source)
         return self.algebra.geometric_product(step1, R_n.expand(*G_source.shape))
 
-    def extract(
-        self,
-        G_source: torch.Tensor,
-        R: DomainRotationOperator,
-    ) -> torch.Tensor:
-        return self.forward(G_source, R)
-
 
 def sandwich_transfer(
     algebra: CliffordAlgebra,

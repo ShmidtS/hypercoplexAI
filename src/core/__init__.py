@@ -12,7 +12,7 @@ from .domain_operators import (
     sandwich_transfer,
 )
 from .titans_memory import TitansMemoryModule
-from .cls_memory import HippocampusMemory, NeocortexMemory, CLSMemory, HBMAMemory, WorkingMemory, EpisodicMemory, SemanticMemory, ProceduralMemory
+from .hbma_memory import HippocampusMemory, NeocortexMemory, CLSMemory, HBMAMemory, WorkingMemory, EpisodicMemory, SemanticMemory, ProceduralMemory
 from .hdim_pipeline import HDIMPipeline, HDIMEncoder, HDIMDecoder
 
 __all__ = [

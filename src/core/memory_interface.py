@@ -26,6 +26,9 @@ class MemoryResult:
     output: torch.Tensor       # memory-augmented representation [B, D]
     loss: torch.Tensor         # auxiliary memory loss (scalar)
     updated: bool              # whether memory was updated this step
+    alpha: Optional[torch.Tensor] = None  # memory blend gate (Titans)
+    eta: Optional[torch.Tensor] = None    # momentum learning rate (Titans)
+    theta: Optional[torch.Tensor] = None  # gradient step size (Titans)
 
 
 class MemoryInterface(nn.Module, ABC):
@@ -93,14 +96,17 @@ class TitansAdapter(MemoryInterface):
         update_memory: bool = False,
     ) -> MemoryResult:
         k = self.key_proj(x)
-        retrieved, loss = self.titans(k, x, update_memory=update_memory)
-        self._last_loss = loss.detach()
+        mem_state = self.titans.retrieve_and_update(k, x, update_memory=update_memory)
+        self._last_loss = mem_state.loss.detach()
         gate_val = torch.sigmoid(self.gate(x))
-        gated_output = x + gate_val * retrieved
+        gated_output = x + gate_val * mem_state.retrieved
         return MemoryResult(
             output=gated_output,
-            loss=loss,
-            updated=update_memory,
+            loss=mem_state.loss,
+            updated=mem_state.updated,
+            alpha=mem_state.alpha,
+            eta=mem_state.eta,
+            theta=mem_state.theta,
         )
 
     def reset(self, strategy: str = 'geometric') -> None:
@@ -135,13 +141,17 @@ class HBMAMemoryAdapter(MemoryInterface):
         x: torch.Tensor,
         update_memory: bool = False,
     ) -> MemoryResult:
-        # HBMA manages its own internal update logic
+        # HBMA does not expose update_memory — its state mutations happen
+        # inside forward() during training.  In inference mode HBMA is
+        # effectively read-only because BatchNorm/dropout layers are frozen.
         output = self.hbma(x)
         loss = self.hbma.memory_loss() if hasattr(self.hbma, 'memory_loss') else torch.tensor(0.0, device=x.device)
+        # HBMA updates internally whenever self.hbma.training is True
+        actually_updated = update_memory and self.hbma.training
         return MemoryResult(
             output=output,
             loss=loss,
-            updated=True,  # HBMA always updates internally
+            updated=actually_updated,
         )
 
     def reset(self, strategy: str = 'geometric') -> None:
@@ -154,21 +164,3 @@ class HBMAMemoryAdapter(MemoryInterface):
         if hasattr(self.hbma, 'memory_loss'):
             return self.hbma.memory_loss()
         return torch.tensor(0.0)
-
-
-def wrap_memory(module: nn.Module, memory_type: str) -> MemoryInterface:
-    """
-    Factory: wrap any memory module to MemoryInterface.
-
-    Args:
-        module: TitansMemoryModule, HBMAMemory, or CLSMemory instance
-        memory_type: 'titans', 'hbma', 'cls', 'hippocampus'
-
-    Returns:
-        MemoryInterface-wrapped module
-    """
-    if memory_type == 'titans':
-        return TitansAdapter(module)
-    else:
-        # hbma, cls, hippocampus, neocortex — all use HBMA interface
-        return HBMAMemoryAdapter(module)

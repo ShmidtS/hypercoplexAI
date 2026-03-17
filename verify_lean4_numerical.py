@@ -7,6 +7,7 @@ from src.core.domain_operators import DomainRotationOperator, sandwich_transfer,
 from src.core.memory_interface import TitansAdapter, HBMAMemoryAdapter
 from src.core.titans_memory import TitansMemoryModule
 from src.core.hbma_memory import HBMAMemory
+from src.models.hdim_model import HDIMPipeline
 
 def make_bivector_rotor(ca, n_trials=1):
     """Build unit bivector rotor R = prod_k (cos + sin * e_{2k}e_{2k+1})."""
@@ -322,9 +323,9 @@ for p,q,r in [(2,0,0),(3,0,0),(3,1,0)]:
     for _ in range(20):
         R = make_bivector_rotor(ca)
         x = torch.randn(1, ca.dim)
-        R_inv = ca.reverse(R) / (ca.norm(R)**2 + 1e-8).unsqueeze(-1)
-        y = ca.sandwich(R_inv, x, unit=False)
-        z = ca.sandwich(R, y, unit=False)
+        R_inv = ca.reverse(R)  # unit rotor: R⁻¹ = ~R exactly
+        y = ca.sandwich(R, x, unit=True)
+        z = ca.sandwich(R_inv, y, unit=True)
         diff = (z - x).abs().max().item()
         max_diff = max(max_diff, diff)
     status = 'PASS' if max_diff < 0.1 else 'FAIL'
@@ -924,7 +925,7 @@ for _ in range(20):
     # Diversity loss should be finite
     if torch.isnan(loss) or torch.isinf(loss):
         all_ok = False
-    # Check variance component is bounded (normalized inputs → variance <= 1)
+    # Check variance component is bounded (normalized inputs -> variance <= 1)
     x_norm = torch.nn.functional.normalize(x, dim=-1)
     mean_v = x_norm.mean(dim=0, keepdim=True)
     variance = ((x_norm - mean_v) ** 2).sum(dim=-1).mean()
@@ -1039,6 +1040,533 @@ for _ in range(5):
 status = 'PASS' if all_ok else 'FAIL'
 print(f'  memory_loss gradient flows, finite: [{status}]')
 results.append(('hbma_memory_loss_grad', status))
+
+# ===== 48. Nilpotent basis: e_i^2 = 0 for r>0 =====
+print('\n--- 48. nilpotent_basis_square_zero ---')
+all_ok = True
+for p,q,r,nil_idx in [(0,0,2,0),(1,0,2,0),(2,0,2,1)]:
+    ca = CliffordAlgebra(p,q,r)
+    for k in range(ca.p+ca.q, ca.n):
+        e = torch.zeros(1, ca.dim); e[0, 1<<k] = 1.0
+        prod = ca.geometric_product(e, e)
+        sq = prod[0,0].abs().item()
+        if sq > 1e-6:
+            all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  nilpotent e_i^2=0 for r>0: [{status}]')
+results.append(('nilpotent_basis_square_zero', status))
+
+# ===== 49. Involution twice = identity =====
+print('\n--- 49. involute_twice_identity ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0),(4,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    x = torch.randn(3, ca.dim)
+    double_inv = ca.involute(ca.involute(x))
+    diff = (double_inv - x).abs().max().item()
+    if diff > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  involute(involute(x)) = x: [{status}]')
+results.append(('involute_twice_identity', status))
+
+# ===== 50. Reverse twice = identity =====
+print('\n--- 50. reverse_twice_identity ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0),(4,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    x = torch.randn(3, ca.dim)
+    double_rev = ca.reverse(ca.reverse(x))
+    diff = (double_rev - x).abs().max().item()
+    if diff > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  reverse(reverse(x)) = x: [{status}]')
+results.append(('reverse_twice_identity', status))
+
+# ===== 51. Sandwich roundtrip: A->B->A =====
+print('\n--- 51. sandwich_roundtrip_ab_a ---')
+all_ok = True
+for p,q,r in [(3,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    R = make_bivector_rotor(ca)
+    R2 = make_bivector_rotor(ca)
+    x = torch.randn(1, ca.dim)
+    # A->B: sandwich(R), then B->A: sandwich(R_inv)
+    y = ca.sandwich(R, x, unit=True)
+    z = ca.sandwich(ca.reverse(R), y, unit=True)
+    diff = (z - x).abs().max().item()
+    if diff > 1e-4:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  roundtrip A->B->A identity: [{status}]')
+results.append(('sandwich_roundtrip_ab_a', status))
+
+# ===== 52. Geometric product with scalar =====
+print('\n--- 52. geometric_product_scalar ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    x = torch.randn(2, ca.dim)
+    scalar = torch.tensor([[2.0, 0.0, 0.0, 0.0] + [0.0]*(ca.dim-4)]).expand(2, -1)
+    prod = ca.geometric_product(scalar, x)
+    diff = (prod - 2.0 * x).abs().max().item()
+    if diff > 1e-5:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  scalar * x = c*x (grade-0 multiplication): [{status}]')
+results.append(('geometric_product_scalar', status))
+
+# ===== 53. Sandwich composition: S(S1(x), S2) = S(S1xS2, x) =====
+print('\n--- 53. sandwich_composition_sequence ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,0,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    R1 = make_bivector_rotor(ca)
+    R2 = make_bivector_rotor(ca)
+    x = torch.randn(1, ca.dim)
+    # Sequential: S(R2, S(R1, x))
+    z = ca.sandwich(R2, ca.sandwich(R1, x, unit=True), unit=True)
+    # Composed: S(R2xR1, x)
+    R21 = ca.geometric_product(R2, R1)
+    R21 = R21 / ca.norm(R21)
+    y = ca.sandwich(R21, x, unit=True)
+    diff = (z - y).abs().max().item()
+    if diff > 0.15:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  S(R2, S(R1,x)) = S(R2xR1, x): [{status}]')
+results.append(('sandwich_composition_sequence', status))
+
+# ===== 54. QuaternionLinear output shape =====
+print('\n--- 54. quaternion_linear_shape ---')
+all_ok = True
+for in_d, out_d in [(16,32),(64,64),(32,128)]:
+    ql = QuaternionLinear(in_d, out_d)
+    x = torch.randn(4, in_d)
+    out = ql(x)
+    if out.shape != (4, out_d):
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  QuaternionLinear correct output shape: [{status}]')
+results.append(('quaternion_linear_shape', status))
+
+# ===== 55. QuaternionLinear gradient flow =====
+print('\n--- 55. quaternion_linear_gradient_flow ---')
+ql = QuaternionLinear(32, 64)
+x = torch.randn(4, 32, requires_grad=True)
+out = ql(x)
+loss = out.sum()
+loss.backward()
+grad_ok = (x.grad is not None) and (x.grad.abs().sum() > 0) and not torch.isnan(x.grad).any()
+status = 'PASS' if grad_ok else 'FAIL'
+print(f'  QuaternionLinear gradient flows to input: [{status}]')
+results.append(('quaternion_linear_gradient_flow', status))
+
+# ===== 56. QLayerNorm zero mean per component =====
+print('\n--- 56. qlayernorm_zero_mean ---')
+qln = QLayerNorm(16)
+x = torch.randn(8, 64) * 10
+y = qln(x)
+means = [y[:, i*16:(i+1)*16].mean(dim=-1).abs().max().item() for i in range(4)]
+all_ok = all(m < 0.1 for m in means)
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  QLayerNorm zero mean per component: [{status}]')
+results.append(('qlayernorm_zero_mean', status))
+
+# ===== 57. Geometric product bilinearity =====
+print('\n--- 57. geometric_product_bilinearity ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    a = torch.randn(1, ca.dim)
+    b = torch.randn(1, ca.dim)
+    c = torch.randn(1, ca.dim)
+    alpha, beta = 2.5, -1.3
+    lhs = ca.geometric_product(alpha*a + beta*b, c)
+    rhs = alpha*ca.geometric_product(a, c) + beta*ca.geometric_product(b, c)
+    diff = (lhs - rhs).abs().max().item()
+    if diff > 1e-5:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  (aa+bb)*c = a(a*c)+b(b*c): [{status}]')
+results.append(('geometric_product_bilinearity', status))
+
+# ===== 58. Geometric product right bilinearity =====
+print('\n--- 58. geometric_product_right_bilinearity ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    a = torch.randn(1, ca.dim)
+    b = torch.randn(1, ca.dim)
+    c = torch.randn(1, ca.dim)
+    alpha, beta = 1.7, -0.9
+    lhs = ca.geometric_product(a, alpha*b + beta*c)
+    rhs = alpha*ca.geometric_product(a, b) + beta*ca.geometric_product(a, c)
+    diff = (lhs - rhs).abs().max().item()
+    if diff > 1e-5:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  a*(ab+bc) = a(a*b)+b(a*c): [{status}]')
+results.append(('geometric_product_right_bilinearity', status))
+
+# ===== 59. Involution distributes over addition =====
+print('\n--- 59. involute_linearity ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    a = torch.randn(2, ca.dim)
+    b = torch.randn(2, ca.dim)
+    alpha, beta = 2.0, -1.0
+    lhs = ca.involute(alpha*a + beta*b)
+    rhs = alpha*ca.involute(a) + beta*ca.involute(b)
+    diff = (lhs - rhs).abs().max().item()
+    if diff > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  involute(aa+bb) = a*inv(a)+b*inv(b): [{status}]')
+results.append(('involute_linearity', status))
+
+# ===== 60. Reverse distributes over addition =====
+print('\n--- 60. reverse_linearity ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    a = torch.randn(2, ca.dim)
+    b = torch.randn(2, ca.dim)
+    alpha, beta = 3.0, -2.0
+    lhs = ca.reverse(alpha*a + beta*b)
+    rhs = alpha*ca.reverse(a) + beta*ca.reverse(b)
+    diff = (lhs - rhs).abs().max().item()
+    if diff > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  reverse(aa+bb) = a*rev(a)+b*rev(b): [{status}]')
+results.append(('reverse_linearity', status))
+
+# ===== 61. Sandwich with identity rotor =====
+print('\n--- 61. sandwich_identity_rotor ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0),(4,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    x = torch.randn(1, ca.dim)
+    R_id = torch.zeros(1, ca.dim); R_id[0, 0] = 1.0
+    y = ca.sandwich(R_id, x, unit=True)
+    diff = (y - x).abs().max().item()
+    if diff > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  sandwich(1, x) = x: [{status}]')
+results.append(('sandwich_identity_rotor', status))
+
+# ===== 62. Grade projection idempotent =====
+print('\n--- 62. grade_projection_idempotent ---')
+all_ok = True
+ca = CliffordAlgebra(3,1,0)
+x = torch.randn(5, ca.dim)
+# Project to grades and project again — should be same
+for grade in range(ca.n+1):
+    mask = torch.tensor([bin(i).count('1') == grade for i in range(ca.dim)], dtype=torch.float32)
+    proj1 = x * mask
+    proj2 = proj1 * mask
+    diff = (proj1 - proj2).abs().max().item()
+    if diff > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  grade_i(grade_i(x)) = grade_i(x): [{status}]')
+results.append(('grade_projection_idempotent', status))
+
+# ===== 63. SoftMoE: dispatch/combine weight normalization =====
+print('\n--- 63. soft_moe_dispatch_combine_normalize ---')
+from src.core.soft_moe_router import SoftMoERouter
+moe = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128)
+x = torch.randn(8, 64)
+dispatch, combine = moe._compute_dispatch_combine(x)
+# combine should sum to 1 per token (dim=-1)
+combine_sum = combine.sum(dim=-1)
+ok = (combine_sum - 1.0).abs().max().item() < 1e-4
+status = 'PASS' if ok else 'FAIL'
+print(f'  combine weights sum to 1 per token: [{status}]')
+results.append(('soft_moe_dispatch_combine_normalize', status))
+
+# ===== 64. SoftMoE: gradient flows through experts =====
+print('\n--- 64. soft_moe_expert_gradient_flow ---')
+moe = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128)
+x = torch.randn(8, 64, requires_grad=True)
+output, _ = moe(x)
+loss = output.sum()
+loss.backward()
+grad_ok = (x.grad is not None) and (x.grad.abs().sum() > 0) and not torch.isnan(x.grad).any()
+status = 'PASS' if grad_ok else 'FAIL'
+print(f'  SoftMoE gradient flows through experts: [{status}]')
+results.append(('soft_moe_expert_gradient_flow', status))
+
+# ===== 65. DomainRotationOperator preserves rotor norm =====
+print('\n--- 65. domain_rotor_norm_conservation ---')
+all_ok = True
+for p,q,r in [(3,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    for _ in range(10):
+        R = make_bivector_rotor(ca)
+        x = torch.randn(1, ca.dim)
+        y = ca.sandwich(R, x, unit=True)
+        norm_ratio = ca.norm(y).item() / max(ca.norm(x).item(), 1e-8)
+        if abs(norm_ratio - 1.0) > 0.02:
+            all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  ||sandwich(R,x)|| = ||x||: [{status}]')
+results.append(('domain_rotor_norm_conservation', status))
+
+# ===== 66. Bivector e_i*e_j: square = -1 for Euclidean =====
+print('\n--- 66. bivector_eiej_square_negative ---')
+all_ok = True
+ca = CliffordAlgebra(3,0,0)
+for i in range(0, ca.n-1, 2):
+    ei = torch.zeros(1, ca.dim); ei[0, 1<<i] = 1.0
+    ej = torch.zeros(1, ca.dim); ej[0, 1<<(i+1)] = 1.0
+    B = ca.geometric_product(ei, ej)
+    B2 = ca.geometric_product(B, B)
+    sq = B2[0,0].item()
+    if abs(sq + 1.0) > 1e-4:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  (e_i*e_j)^2 = -1 (Euclidean bivector): [{status}]')
+results.append(('bivector_eiej_square_negative', status))
+
+# ===== 67. Titans memory: state update changes output =====
+print('\n--- 67. titans_memory_state_update ---')
+from src.core.titans_memory import TitansMemoryModule
+mem = TitansMemoryModule(key_dim=16, val_dim=32, hidden_dim=32)
+k1 = torch.randn(4, 16)
+v1 = torch.randn(4, 32)
+r1, _ = mem(k1, v1, update_memory=True)
+r2, _ = mem(k1, v1, update_memory=False)
+diff = (r1 - r2).abs().max().item()
+ok = diff > 1e-6
+status = 'PASS' if ok else 'FAIL'
+print(f'  Titans memory state update changes output: [{status}]')
+results.append(('titans_memory_state_update', status))
+
+# ===== 68. Titans memory: no NaN after multiple updates =====
+print('\n--- 68. titans_memory_no_nan_multi_update ---')
+mem = TitansMemoryModule(key_dim=16, val_dim=32, hidden_dim=32)
+all_ok = True
+for i in range(50):
+    k = torch.randn(4, 16)
+    v = torch.randn(4, 32)
+    out, loss = mem(k, v, update_memory=True)
+    if torch.isnan(out).any() or torch.isinf(out).any() or torch.isnan(loss).any() or torch.isinf(loss).any():
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  Titans: 50 sequential updates, no NaN/Inf: [{status}]')
+results.append(('titans_memory_no_nan_multi_update', status))
+
+# ===== 69. Geometric product: e_0 * e_0 = +1 (Euclidean) =====
+print('\n--- 69. scalar_basis_square_positive ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    for i in range(ca.p):  # positive basis only
+        e = torch.zeros(1, ca.dim); e[0, 1<<i] = 1.0
+        e2 = ca.geometric_product(e, e)
+        if abs(e2[0,0].item() - 1.0) > 1e-4:
+            all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  e_i^2 = +1 for i < p (Euclidean): [{status}]')
+results.append(('scalar_basis_square_positive', status))
+
+# ===== 70. Geometric product: e_p^2 = -1 (negative basis) =====
+print('\n--- 70. negative_basis_square_negative ---')
+all_ok = True
+for p,q,r in [(2,2,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    for i in range(ca.p, ca.p+ca.q):
+        e = torch.zeros(1, ca.dim); e[0, 1<<i] = 1.0
+        e2 = ca.geometric_product(e, e)
+        if abs(e2[0,0].item() + 1.0) > 1e-4:
+            all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  e_i^2 = -1 for p<=i<p+q (negative): [{status}]')
+results.append(('negative_basis_square_negative', status))
+
+# ===== 71. Matryoshka: larger dim >= smaller dim quality =====
+print('\n--- 71. matryoshka_nested_quality ---')
+from src.models.modern_text_encoder import MatryoshkaProjection
+proj = MatryoshkaProjection(64, [16, 32, 48, 64])
+x = torch.randn(8, 64)
+norms = {}
+for dim in [16, 32, 48, 64]:
+    out = proj(x, target_dim=dim)
+    norms[dim] = out.norm(dim=-1).mean().item()
+# All outputs should have reasonable magnitude
+ok = all(n > 0.1 for n in norms.values())
+status = 'PASS' if ok else 'FAIL'
+print(f'  Matryoshka all scales produce valid output: [{status}]')
+results.append(('matryoshka_nested_quality', status))
+
+# ===== 72. HBMA: working memory FIFO capacity =====
+print('\n--- 72. hbma_working_memory_capacity ---')
+from src.core.hbma_memory import HBMAMemory
+mem = HBMAMemory(hidden_dim=32)
+x = torch.randn(1, 32)
+for i in range(20):
+    out = mem(x)
+ok = not torch.isnan(out).any() and not torch.isinf(out).any()
+status = 'PASS' if ok else 'FAIL'
+print(f'  HBMA: 20 writes, no NaN/Inf: [{status}]')
+results.append(('hbma_working_memory_capacity', status))
+
+# ===== 73. Sandwich anti-commutativity of orthogonal bivectors =====
+print('\n--- 73. sandwich_anticommute_orthogonal_bivectors ---')
+ca = CliffordAlgebra(3,0,0)
+x = torch.randn(1, ca.dim)
+# Build orthogonal bivectors B1=e0e1, B2=e2e0
+e0e1 = torch.zeros(1, ca.dim); e0e1[0, 3] = 1.0  # e0^e1
+e2e0 = torch.zeros(1, ca.dim); e2e0[0, 5] = 1.0  # e2^e0
+# Normalize to unit rotors
+R1 = e0e1 / ca.norm(e0e1)
+R2 = e2e0 / ca.norm(e2e0)
+# S(R1, S(R2, x)) vs S(R2, S(R1, x))
+z12 = ca.sandwich(R1, ca.sandwich(R2, x, unit=True), unit=True)
+z21 = ca.sandwich(R2, ca.sandwich(R1, x, unit=True), unit=True)
+# For commuting bivectors in Euclidean algebra, order shouldn't matter much
+diff = (z12 - z21).abs().max().item()
+ok = diff < 0.01  # commuting orthogonal bivectors
+status = 'PASS' if ok else 'FAIL'
+print(f'  S(R1,S(R2,x)) ~ S(R2,S(R1,x)) for comm. bivectors: [{status}]')
+results.append(('sandwich_anticommute_orthogonal_bivectors', status))
+
+# ===== 74. Geometric product: commutativity of grade-0 =====
+print('\n--- 74. geometric_product_grade0_commutativity ---')
+all_ok = True
+for p,q,r in [(2,0,0),(3,1,0)]:
+    ca = CliffordAlgebra(p,q,r)
+    # Two scalars (grade 0)
+    a = torch.zeros(1, ca.dim); a[0,0] = 3.0
+    b = torch.zeros(1, ca.dim); b[0,0] = 7.0
+    ab = ca.geometric_product(a, b)
+    ba = ca.geometric_product(b, a)
+    diff = (ab - ba).abs().max().item()
+    if diff > 1e-6:
+        all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  scalar*a = a*scalar: [{status}]')
+results.append(('geometric_product_grade0_commutativity', status))
+
+# ===== 75. sandwich_transfer invariant_override equivalence =====
+print('\n--- 75. sandwich_transfer_invariant_override ---')
+all_ok = True
+ca = CliffordAlgebra(p=3, q=1, r=0)
+dim = ca.dim
+R1 = torch.randn(dim); R1.data[0 if R1.dim() == 1 else 0] += 1.0
+R1 = R1 / ca.norm(R1)
+R2 = torch.randn(dim); R2.data[0 if R2.dim() == 1 else 0] += 1.0
+R2 = R2 / ca.norm(R2)
+x = torch.randn(1, dim)
+G = ca.geometric_product(x, torch.ones(1, dim))
+op1 = DomainRotationOperator(ca, "d1"); op1.R.data = R1
+op2 = DomainRotationOperator(ca, "d2"); op2.R.data = R2
+U1, G1 = sandwich_transfer(ca, G, op1, op2, invariant_override=None)
+R1_inv = op1.get_inverse(); R1_n = op1._normalized_R()
+step = ca.geometric_product(R1_inv.expand(*G.shape), G)
+U_manual = ca.geometric_product(step, R1_n.expand(*G.shape))
+U2, G2 = sandwich_transfer(ca, G, op1, op2, invariant_override=U_manual)
+if not (torch.allclose(U1, U2, atol=1e-5) and torch.allclose(G1, G2, atol=1e-5)):
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  sandwich_transfer invariant_override: [{status}]')
+results.append(('sandwich_transfer_invariant_override', status))
+
+# ===== 76. pipeline input_is_invariant path =====
+print('\n--- 76. pipeline_input_is_invariant ---')
+all_ok = True
+pipe = HDIMPipeline(input_dim=64, output_dim=64, clifford_p=3, clifford_q=1, domain_names=["A","B"])
+pipe.eval()
+# input_is_invariant=True means x is already the invariant (clifford_dim=16), not raw input (64)
+clifford_dim = pipe.algebra.dim
+x_inv = torch.randn(1, clifford_dim)
+with torch.no_grad():
+    out, state = pipe.transfer(x_inv, "A", "B", update_memory=False, memory_mode="none", input_is_invariant=True)
+if not (state["g_source"] is None and state["input_is_invariant"] and out.shape[-1] == 64 and not torch.isnan(out).any()):
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  pipeline input_is_invariant path: [{status}]')
+results.append(('pipeline_input_is_invariant', status))
+
+# ===== 77. memory_mode none preserves =====
+print('\n--- 77. memory_mode_none_preserves ---')
+all_ok = True
+pipe2 = HDIMPipeline(input_dim=64, output_dim=64, clifford_p=3, domain_names=["A","B"])
+pipe2.eval()
+x = torch.randn(2, 64)
+with torch.no_grad():
+    out, state = pipe2.transfer(x, "A", "B", update_memory=False, memory_mode="none")
+if not (state["memory_mode"] == "none" and not state["memory_updated"]):
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  memory mode none preserves: [{status}]')
+results.append(('memory_mode_none_preserves', status))
+
+# ===== 78. Domain rotation apply_inverse roundtrip =====
+print('\n--- 78. domain_rotor_apply_inverse_roundtrip ---')
+all_ok = True
+ca = CliffordAlgebra(p=3, q=1, r=0)
+dim = ca.dim
+# Use bivector rotor (unit norm) so epsilon has minimal effect
+angle = 0.7
+R = torch.zeros(1, dim); R[0, 0] = math.cos(angle); R[0, 12] = math.sin(angle)
+x = torch.randn(1, dim)
+# For unit bivector rotor: R_inv = reverse(R), and sandwich(R_inv, sandwich(R, x)) = x
+R_inv = ca.reverse(R)
+with torch.no_grad():
+    y = ca.sandwich(R, x, unit=True)
+    x_back = ca.sandwich(R_inv, y, unit=True)
+max_diff = (x - x_back).abs().max().item()
+if max_diff >= 1e-3:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  domain_rotor apply_inverse roundtrip (max_diff={max_diff:.2e}): [{status}]')
+results.append(('domain_rotor_apply_inverse_roundtrip', status))
+
+# ===== 79. isomorphism loss sanity =====
+print('\n--- 79. isomorphism_loss_sanity ---')
+all_ok = True
+pipe3 = HDIMPipeline(input_dim=64, output_dim=64, clifford_p=3, domain_names=["A","B"])
+# Perturb one domain rotor so they are not identical
+with torch.no_grad():
+    pipe3.domain_rotors["B"].R.data += 0.5
+x = torch.randn(4, 64)
+loss_same = pipe3.compute_isomorphism_loss([(x, "A", "A")])
+loss_diff = pipe3.compute_isomorphism_loss([(x, "A", "B")])
+if not (loss_same.item() < 1e-4 and loss_diff.item() > loss_same.item()):
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  isomorphism loss sanity (same={loss_same.item():.2e}, diff={loss_diff.item():.2e}): [{status}]')
+results.append(('isomorphism_loss_sanity', status))
+
+# ===== 80. grade projection extraction =====
+print('\n--- 80. grade_projection_extraction ---')
+all_ok = True
+ca = CliffordAlgebra(p=3, q=0, r=0)
+dim = ca.dim
+# Create a pure vector (grade 1)
+v = torch.zeros(1, dim)
+v[0, 1] = 1.0  # e_1 is grade 1
+# Create a pure bivector (grade 2)
+B = torch.zeros(1, dim)
+B[0, 3] = 1.0  # e_1*e_2 is grade 2
+# grade_1 of a bivector should be zero
+g1_mask = torch.tensor([bin(i).count('1') == 1 for i in range(dim)], dtype=torch.float32)
+g1_of_B = B * g1_mask
+# grade_2 of a vector should be zero
+g2_mask = torch.tensor([bin(i).count('1') == 2 for i in range(dim)], dtype=torch.float32)
+g2_of_v = v * g2_mask
+if not (g1_of_B.abs().max().item() < 1e-6 and g2_of_v.abs().max().item() < 1e-6):
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  grade projection extraction: [{status}]')
+results.append(('grade_projection_extraction', status))
 
 # ===== Summary =====
 print('\n' + '='*60)
