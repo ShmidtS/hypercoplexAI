@@ -59,11 +59,12 @@ class DomainRotationOperator(nn.Module):
         return R_rev / (norm_sq + 1e-8)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # _normalized_R() возвращает ||R||≈1, используем unit=True для теоремной корректности
-        return self.algebra.sandwich(self._normalized_R(), x, unit=True)
+        # unit=False: epsilon для численной стабильности под AMP (fp16 optimizer
+        # может деградировать норму ротора к ~0, unit=True даёт деление на 0 → inf)
+        return self.algebra.sandwich(self._normalized_R(), x, unit=False)
 
     def apply_inverse(self, x: torch.Tensor) -> torch.Tensor:
-        return self.algebra.sandwich(self.get_inverse(), x, unit=True)
+        return self.algebra.sandwich(self.get_inverse(), x, unit=False)
 
 
 class InvariantExtractor(nn.Module):
