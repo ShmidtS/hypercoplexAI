@@ -251,37 +251,42 @@ class HDIMPipeline(nn.Module):
         """
         Полный кроссдоменный перенос: source → target.
         """
-        if input_is_invariant:
-            g_source = None
-            u_inv = x
-        else:
-            g_source, u_inv = self.encode_domain(x, source_domain)
+        # Run entire pipeline in fp32: geometric_product returns float32, and
+        # autocast would cast to fp16 causing gradient overflow in Linear layers.
+        # Encoder (SBERT/ModernBERT) also runs in fp32 — no significant perf loss
+        # since Clifford algebra dims (16-32) are small compared to ModernBERT (384M).
+        with torch.autocast(device_type='cuda', enabled=False):
+            if input_is_invariant:
+                g_source = None
+                u_inv = x
+            else:
+                g_source, u_inv = self.encode_domain(x, source_domain)
 
-        u_mem, memory_state = self._apply_memory(
-            u_inv,
-            update_memory=update_memory,
-            memory_mode=memory_mode,
-        )
-        if self._use_gradient_checkpointing and self.training:
-            u_route, router_state = checkpoint(
-                self.moe, u_mem,
-                use_reentrant=False,
+            u_mem, memory_state = self._apply_memory(
+                u_inv,
+                update_memory=update_memory,
+                memory_mode=memory_mode,
             )
-        else:
-            u_route, router_state = self.moe(u_mem)
-        r_source = self.domain_rotors[source_domain]
-        r_target = self.domain_rotors[target_domain]
-        if input_is_invariant:
-            g_target = r_target(u_route)
-        else:
-            _, g_target = sandwich_transfer(
-                self.algebra,
-                g_source,
-                r_source,
-                r_target,
-                invariant_override=u_route,
-            )
-        output = self.decoder(g_target)
+            if self._use_gradient_checkpointing and self.training:
+                u_route, router_state = checkpoint(
+                    self.moe, u_mem,
+                    use_reentrant=False,
+                )
+            else:
+                u_route, router_state = self.moe(u_mem)
+            r_source = self.domain_rotors[source_domain]
+            r_target = self.domain_rotors[target_domain]
+            if input_is_invariant:
+                g_target = r_target(u_route)
+            else:
+                _, g_target = sandwich_transfer(
+                    self.algebra,
+                    g_source,
+                    r_source,
+                    r_target,
+                    invariant_override=u_route,
+                )
+            output = self.decoder(g_target)
 
         transfer_state = TransferState(
             g_source=g_source,
