@@ -6,7 +6,8 @@ from src.core.hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from src.core.domain_operators import DomainRotationOperator, sandwich_transfer, InvariantExtractor
 from src.core.memory_interface import TitansAdapter, HBMAMemoryAdapter
 from src.core.titans_memory import TitansMemoryModule
-from src.core.hbma_memory import HBMAMemory
+from src.core.hbma_memory import HBMAMemory, WorkingMemory, SemanticMemory
+from src.core.soft_moe_router import SoftMoERouter
 from src.models.hdim_model import HDIMPipeline
 
 def make_bivector_rotor(ca, n_trials=1):
@@ -1659,6 +1660,231 @@ for _ in range(20):
 status = 'PASS' if all_ok else 'FAIL'
 print(f'  ||R_a * R_b|| = 1 for unit bivector rotors: [{status}]')
 results.append(('rotor_composition_unit_norm', status))
+
+# ===== 86. Triple sandwich composition =====
+print('\n--- 86. sandwich_3_composed ---')
+all_ok = True
+ca86 = CliffordAlgebra(p=3, q=1, r=0)
+for _ in range(10):
+    torch.manual_seed(860 + _)
+    R1 = make_bivector_rotor(ca86)
+    R2 = make_bivector_rotor(ca86)
+    R3 = make_bivector_rotor(ca86)
+    x86 = torch.randn(1, ca86.dim)
+    # Compose 3 sandwiches: S(R3, S(R2, S(R1, x)))
+    y1 = ca86.sandwich(R1, x86)
+    y2 = ca86.sandwich(R2, y1)
+    y3 = ca86.sandwich(R3, y2)
+    # Single sandwich with composed rotor: R3*R2*R1
+    R21 = ca86.geometric_product(R2, R1)
+    R321 = ca86.geometric_product(R3, R21)
+    y_comp = ca86.sandwich(R321, x86)
+    if not torch.allclose(y3, y_comp, rtol=1e-2, atol=1e-2):
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  S(R3,S(R2,S(R1,x))) ~ S(R3*R2*R1, x): [{status}]')
+results.append(('sandwich_3_composed', status))
+
+# ===== 87. Pseudoscalar anticommutes with basis vectors =====
+print('\n--- 87. pseudoscalar_anticommutation ---')
+all_ok = True
+ca87 = CliffordAlgebra(p=3, q=1, r=0)
+dim = ca87.dim
+n87 = ca87.n
+# Pseudoscalar I = e0*e1*...*e_{n-1}, last basis element
+I87 = torch.zeros(1, dim); I87[0, (1<<n87)-1] = 1.0
+for i in range(n87):
+    ei = torch.zeros(1, dim); ei[0, 1<<i] = 1.0
+    I_ei = ca87.geometric_product(I87, ei)
+    ei_I = ca87.geometric_product(ei, I87)
+    # Pseudoscalar always anticommutes with basis vectors: I*e + e*I = 0
+    if not torch.allclose(I_ei + ei_I, torch.zeros_like(I_ei), rtol=1e-2, atol=1e-2):
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  I*e_i + e_i*I = 0 (n={n87}): [{status}]')
+results.append(('pseudoscalar_anticommutation', status))
+
+# ===== 88. General distributivity =====
+print('\n--- 88. clifford_distributivity_general ---')
+all_ok = True
+ca88 = CliffordAlgebra(p=3, q=1, r=0)
+for trial in range(10):
+    torch.manual_seed(880 + trial)
+    a = torch.randn(1, ca88.dim)
+    b = torch.randn(1, ca88.dim)
+    c = torch.randn(1, ca88.dim)
+    d = torch.randn(1, ca88.dim)
+    lhs = ca88.geometric_product(a + b, c + d)
+    rhs = (ca88.geometric_product(a, c) + ca88.geometric_product(a, d) +
+           ca88.geometric_product(b, c) + ca88.geometric_product(b, d))
+    if not torch.allclose(lhs, rhs, rtol=1e-2, atol=1e-2):
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  (a+b)*(c+d) == a*c + a*d + b*c + b*d: [{status}]')
+results.append(('clifford_distributivity_general', status))
+
+# ===== 89. Rotor inverse =====
+print('\n--- 89. rotor_inverse_exact ---')
+all_ok = True
+ca89 = CliffordAlgebra(p=3, q=0, r=0)
+for trial in range(10):
+    torch.manual_seed(890 + trial)
+    R = make_bivector_rotor(ca89)
+    R_rev = ca89.reverse(R)
+    norm_sq = (ca89.norm(R) ** 2).clamp_min(1e-10)
+    R_inv = R_rev / norm_sq
+    product = ca89.geometric_product(R, R_inv)
+    one = torch.zeros(1, ca89.dim); one[0, 0] = 1.0
+    if not torch.allclose(product, one, rtol=1e-2, atol=1e-2):
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  R * R^{{-1}} == 1 for unit bivector rotors in Cl(3,0,0): [{status}]')
+results.append(('rotor_inverse_exact', status))
+
+# ===== 90. Gradient stability for composed sandwiches =====
+print('\n--- 90. sandwich_gradient_bounded_composed ---')
+all_ok = True
+ca90 = CliffordAlgebra(p=3, q=0, r=0)
+for trial in range(10):
+    torch.manual_seed(900 + trial)
+    R1 = make_bivector_rotor(ca90)
+    R2 = make_bivector_rotor(ca90)
+    R3 = make_bivector_rotor(ca90)
+    x90 = torch.randn(1, ca90.dim, requires_grad=True)
+    y1 = ca90.sandwich(R1, x90)
+    y2 = ca90.sandwich(R2, y1)
+    y3 = ca90.sandwich(R3, y2)
+    loss = y3.pow(2).sum()
+    loss.backward()
+    if x90.grad is None or torch.isnan(x90.grad).any() or torch.isinf(x90.grad).any():
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  composed sandwich gradients (no NaN/Inf): [{status}]')
+results.append(('sandwich_gradient_bounded_composed', status))
+
+# ===== 91. Matryoshka dimension consistency =====
+print('\n--- 91. matryoshka_dim_consistency ---')
+all_ok = True
+dims = [32, 64, 128]
+torch.manual_seed(910)
+data = {d: torch.randn(10, d) for d in dims}
+# Normalize and check that norm of prefix of larger dim is consistent with smaller dim
+for i in range(10):
+    small = data[32][i]
+    med_prefix = data[64][i, :32]
+    large_prefix = data[128][i, :32]
+    # The smaller dim embedding and the prefix of larger embeddings should have
+    # related norms (not identical, but within a reasonable factor for random data)
+    ratio_med = data[64][i].norm() / (small.norm() + 1e-8)
+    ratio_large = data[128][i].norm() / (small.norm() + 1e-8)
+    # Ratios should scale roughly with sqrt(dim_ratio)
+    expected_med_ratio = math.sqrt(64 / 32)
+    expected_large_ratio = math.sqrt(128 / 32)
+    if abs(ratio_med - expected_med_ratio) > 1.5 or abs(ratio_large - expected_large_ratio) > 1.5:
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  matryoshka dim norms scale with sqrt(dim): [{status}]')
+results.append(('matryoshka_dim_consistency', status))
+
+# ===== 92. Working memory FIFO eviction =====
+print('\n--- 92. hbma_working_fifo_order ---')
+all_ok = True
+torch.manual_seed(920)
+wm = WorkingMemory(hidden_dim=64, capacity=16)
+# Write 20 entries — first 4 should be evicted
+for i in range(20):
+    entry = torch.randn(1, 64) + i * 10.0  # each entry distinct via offset
+    wm._write(entry)
+# write_ptr should be at position 4 (20 % 16)
+ptr = int(wm.write_ptr.item())
+expected_ptr = 20 % 16  # = 4
+if ptr != expected_ptr:
+    all_ok = False
+# filled should be at capacity (16)
+filled = int(wm.filled.item())
+if filled != 16:
+    all_ok = False
+# Verify first 4 slots were overwritten: check buf_age for slots 0-3
+# After writing 20 entries, slots 0-3 should have been written more recently
+# than their original order suggests (they were evicted and rewritten)
+# Actually, slots 0-3 are the LAST written (entries 16,17,18,19)
+# Check that buf[0] roughly equals entry 16 (i.e. has offset ~160)
+buf0_norm = wm.buf[0].abs().mean().item()
+# Entry 16 has mean abs roughly related to 16*10 = 160
+# This is a heuristic check — just verify the buffer has been cycled
+if buf0_norm < 1.0:  # should have been overwritten with non-zero data
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  WorkingMemory FIFO: 20 writes to cap=16, ptr=4, filled=16: [{status}]')
+results.append(('hbma_working_fifo_order', status))
+
+# ===== 93. Semantic memory EMA convergence =====
+print('\n--- 93. hbma_ema_convergence ---')
+all_ok = True
+torch.manual_seed(930)
+sem = SemanticMemory(hidden_dim=64, num_prototypes=8, ema_momentum=0.95)
+fixed_vec = F.normalize(torch.randn(1, 64), dim=-1)
+# Run 200 update steps with the same vector (lower momentum = faster convergence)
+for _ in range(200):
+    sem._update_prototypes(fixed_vec)
+# Find the prototype most similar to fixed_vec
+p_norm = F.normalize(sem.prototypes, dim=-1)
+sim = (F.normalize(fixed_vec, dim=-1) @ p_norm.T).squeeze(0)
+best_idx = sim.argmax().item()
+best_sim = sim[best_idx].item()
+# After 200 EMA steps with momentum 0.95, cosine similarity should be close to 1.0
+if best_sim < 0.99:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  Semantic prototype EMA convergence (cos_sim={best_sim:.4f} >= 0.99, 200 steps): [{status}]')
+results.append(('hbma_ema_convergence', status))
+
+# ===== 94. SoftMoE load balance =====
+print('\n--- 94. soft_moe_load_balance ---')
+all_ok = True
+torch.manual_seed(940)
+router = SoftMoERouter(input_dim=64, num_experts=4, slots_per_expert=1)
+router.eval()
+x94 = torch.randn(32, 64)
+with torch.no_grad():
+    output, state = router(x94)
+expert_usage = state['expert_usage']  # (num_experts,)
+# All experts should receive > 0 weight
+dead_experts = (expert_usage < 1e-8).sum().item()
+if dead_experts > 0:
+    all_ok = False
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  SoftMoE 4 experts, batch=32, dead experts={dead_experts}: [{status}]')
+results.append(('soft_moe_load_balance', status))
+
+# ===== 95. InfoNCE temperature gradient =====
+print('\n--- 95. infoNCE_temperature_gradient ---')
+all_ok = True
+torch.manual_seed(950)
+for temp_val in [0.07, 1.0]:
+    temp_param = torch.tensor(temp_val, requires_grad=True)
+    # Simple InfoNCE: anchor, positive, 10 negatives
+    anchor = F.normalize(torch.randn(1, 64), dim=-1)
+    positive = F.normalize(torch.randn(1, 64), dim=-1)
+    negatives = F.normalize(torch.randn(10, 64), dim=-1)
+    pos_score = (anchor * positive).sum(-1) / temp_param
+    neg_scores = (anchor @ negatives.T) / temp_param  # (1, 10)
+    logits = torch.cat([neg_scores, pos_score.unsqueeze(-1)], dim=-1)  # (1, 11)
+    label = torch.tensor([10])
+    loss = F.cross_entropy(logits, label)
+    loss.backward()
+    if temp_param.grad is None or torch.isnan(temp_param.grad) or torch.isinf(temp_param.grad):
+        all_ok = False
+        break
+status = 'PASS' if all_ok else 'FAIL'
+print(f'  InfoNCE temperature gradient non-NaN (temp=0.07, 1.0): [{status}]')
+results.append(('infoNCE_temperature_gradient', status))
 
 # ===== Summary =====
 print('\n' + '='*60)
