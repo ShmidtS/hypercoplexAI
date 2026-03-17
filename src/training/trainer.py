@@ -622,7 +622,8 @@ class HDIMTrainer:
         diag_mask = torch.eye(B, dtype=torch.bool, device=self.device)
 
         # Vectorized: mask diagonal to -inf for all rows at once
-        masked_sim = sim_matrix.clone()
+        # Use float32 to avoid fp16 overflow with large negative values under AMP
+        masked_sim = sim_matrix.float()
         masked_sim.masked_fill_(diag_mask, -torch.finfo(torch.float32).max)
         log_denom = torch.logsumexp(masked_sim, dim=1)  # (B,)
         s_pos = sim_matrix.diag()  # (B,)
@@ -721,7 +722,7 @@ class HDIMTrainer:
         eye = torch.eye(B, dtype=torch.bool, device=self.device)
         denom_mask = ~eye  # (B, B)
 
-        log_denom = torch.logsumexp(sim_matrix.masked_fill(eye, -torch.finfo(torch.float32).max), dim=-1)  # safe for fp16
+        log_denom = torch.logsumexp(sim_matrix.float().masked_fill(eye, -torch.finfo(torch.float32).max), dim=-1)  # float32 for fp16 overflow safety
 
         # Vectorized: for each sample, average over positive similarities
         num_pos = pos_mask.sum(dim=1).clamp(min=1)  # (B,) — at least 1 to avoid div by 0
