@@ -1,6 +1,7 @@
 # HDIM Diagrams & Flow Charts
 
-> **Дата:** 2026-03-13  
+> **Дата:** 2026-03-17
+> **Verification:** Lean4 148/148 PASS | pytest 123 PASS  
 > **Формат:** Mermaid diagrams с clickable ссылками на код
 
 ---
