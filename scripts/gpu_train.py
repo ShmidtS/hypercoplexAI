@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.hdim_model import HDIMConfig
 from src.models.metrics import compute_all_metrics
-from src.models.model_factory import build_hdim_model, build_text_hdim_model, build_sbert_hdim_model, build_modernbert_hdim_model
+from src.models.model_factory import build_hdim_model, build_text_hdim_model, build_sbert_hdim_model, build_modernbert_hdim_model, _patch_moe_kernel
 from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
@@ -157,6 +157,14 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             print(f"  + Freeze bottom {_freeze_frac*100:.0f}% SBERT layers")
         if args.soft_router:
             print("  + SoftMoERouter")
+        if getattr(args, 'moe_kernel', False):
+            _patch_moe_kernel(
+                model.core_model,
+                expert_names=["math", "language", "code", "science"],
+                z_loss_weight=getattr(args, 'lambda_z', 0.01),
+                ortho_loss_weight=getattr(args, 'lambda_expert_ortho', 0.01),
+            )
+            print("  + MoEKernel (domain experts: math/language/code/science)")
         return model
 
     if args.soft_router:
@@ -865,6 +873,8 @@ def main() -> None:
     parser.add_argument("--sc_temperature", action="store_true", default=False,
                         help="SC-InfoNCE cluster-aware temperature scaling")
     # Phase 26: MoE Expert features
+    parser.add_argument("--moe_kernel", action="store_true", default=False,
+                        help="Replace pipeline.moe with MoEKernel (domain experts: math/language/code/science)")
     parser.add_argument("--shared_expert", action="store_true", default=False,
                         help="Enable DeepSeek-V3 always-on shared expert in SoftMoERouter")
     parser.add_argument("--aux_loss_free", action="store_true", default=False,
