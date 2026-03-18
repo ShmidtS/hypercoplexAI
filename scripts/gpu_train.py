@@ -762,12 +762,12 @@ def main() -> None:
                         help="Enable gradient checkpointing to reduce activation memory")
     # Model arch
     parser.add_argument("--hidden_dim", type=int, default=None,
-    help="Model hidden dim (None=auto from encoder_type via AutoConfig)")
- parser.add_argument("--num_experts", type=int, default=None,
- help="Number of experts (None=auto from expert_names via AutoConfig)")
- parser.add_argument("--encoder_type", type=str, default="sbert",
- choices=["sbert", "modernbert", "custom"],
- help="Encoder type for AutoConfig (sbert=768, modernbert=768)")
+                        help="Model hidden dim (None=auto from encoder_type via AutoConfig)")
+    parser.add_argument("--num_experts", type=int, default=None,
+                        help="Number of experts (None=auto from expert_names via AutoConfig)")
+    parser.add_argument("--encoder_type", type=str, default="sbert",
+                        choices=["sbert", "modernbert", "custom"],
+                        help="Encoder type for AutoConfig (sbert=768, modernbert=768)")
     parser.add_argument("--num_domains", type=int, default=4)
     parser.add_argument("--clifford_p", type=int, default=4,
                         help="Clifford algebra positive bases (default=4, Cl(4,1,0) dim=32)")
@@ -925,19 +925,19 @@ def main() -> None:
     # AutoConfig: derive hidden_dim and num_experts if not provided
     encoder_type = getattr(args, 'encoder_type', 'sbert')
     if args.hidden_dim is None or args.num_experts is None:
-    from src.core.auto_config import AutoConfig
- auto_cfg = AutoConfig(encoder_type=encoder_type, num_experts=args.num_experts)
- hidden_dim = args.hidden_dim if args.hidden_dim is not None else auto_cfg.hidden_dim_resolved
- num_experts = args.num_experts if args.num_experts is not None else auto_cfg.num_experts_resolved
- print(f"AutoConfig: encoder_type={encoder_type} -> hidden_dim={hidden_dim}, num_experts={num_experts}")
- else:
- hidden_dim = args.hidden_dim
- num_experts = args.num_experts
+        from src.core.auto_config import AutoConfig
+        auto_cfg = AutoConfig(encoder_type=encoder_type, num_experts=args.num_experts, strict_validation=False)
+        hidden_dim = args.hidden_dim if args.hidden_dim is not None else auto_cfg.hidden_dim_resolved
+        num_experts = args.num_experts if args.num_experts is not None else auto_cfg.num_experts_resolved
+        print(f"AutoConfig: encoder_type={encoder_type} -> hidden_dim={hidden_dim}, num_experts={num_experts}")
+    else:
+        hidden_dim = args.hidden_dim
+        num_experts = args.num_experts
 
- _dropout_override = getattr(args, 'dropout', None)
- cfg = HDIMConfig(
- hidden_dim=hidden_dim,
- num_experts=num_experts,
+    _dropout_override = getattr(args, 'dropout', None)
+    cfg = HDIMConfig(
+        hidden_dim=hidden_dim,
+        num_experts=num_experts,
         num_domains=args.num_domains,
         dropout=_dropout_override if _dropout_override is not None else 0.1,
         clifford_p=args.clifford_p,
