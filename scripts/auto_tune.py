@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-HDIM Auto-Tuner v27 — Optuna hyperparameter search for Phase 26 config.
+HDIM Auto-Tuner v28 — Optuna hyperparameter search with AutoConfig.
 
 Запуск:
   python scripts/auto_tune.py                        # 20 trials, 30 эпох каждый
@@ -26,16 +26,16 @@ Optuna подбирает:
   - focal_gamma
   - warmup_epochs, t_mult
 
-Зафиксировано:
-  - hidden_dim=256, num_experts=4 (Phase8e рекорд)
-  - soft_router, pretrained_encoder
-  - learnable_temperature=True
-  - shared_expert + aux_loss_free + expert_ortho (Phase 26)
+AutoConfig (v28):
+- hidden_dim auto-detects from encoder_type (sbert=768, modernbert=768)
+- num_experts derives from expert_names (default: 4 domain experts)
+- clifford_dim computes from signature Cl(p,q,r)
 
 История рекордов:
   Phase 26a: score=1.1063 @ ep45 (augment=3, no sts/dcl)
   Phase 26b: score=1.1513 @ ep15 (augment=5, sts=0.15, dcl=0.2, learnable_temp)
   Phase 26c: score=1.1542 @ ep15 (augment=5, sts=0.3, uniformity=0.1)
+ Phase 28:  Lean4 159/159 PASS, AutoConfig integration
 """
 from __future__ import annotations
 
@@ -48,6 +48,11 @@ import time
 from pathlib import Path
 
 import optuna
+
+# AutoConfig for parameter derivation
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.core.auto_config import AutoConfig, get_encoder_dim
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -235,6 +240,11 @@ def main():
     parser.add_argument("--study_name", type=str, default=STUDY_NAME)
     parser.add_argument("--db",         type=str, default=STUDY_DB)
     parser.add_argument(
+        "--encoder", type=str, default="sbert",
+        choices=["sbert", "modernbert", "custom"],
+        help="Encoder type for AutoConfig (default: sbert=768)",
+    )
+    parser.add_argument(
         "--phase", type=str, default=None,
         choices=["micro", "quick", "standard", "deep"],
         help="Preset: micro=5ep, quick=10ep, standard=30ep, deep=60ep",
@@ -266,11 +276,12 @@ def main():
     if not args.no_seeds:
         enqueue_sota_seeds(study)
 
-    print(f"HDIM Auto-Tuner v27 | n_trials={args.n_trials} | epochs={args.epochs}/trial")
+    print(f"HDIM Auto-Tuner v28 | n_trials={args.n_trials} | epochs={args.epochs}/trial")
     print(f"Study: {args.study_name} | DB: {args.db}")
 
     print(f"Data: {DATA_PATH} (v10, 1036 pairs: 636 pos / 400 neg)")
-    print(f"Fixed: hidden=256, experts=4, soft_router, pretrained_encoder,")
+    print(f"AutoConfig: hidden_dim from encoder, num_experts from expert_names")
+    print(f"Fixed: soft_router, pretrained_encoder,")
     print(f"       shared_expert, aux_loss_free, expert_ortho, learnable_temperature")
     print(f"SOTA baseline: Phase 26c score=1.1542 @ ep15")
     print()
