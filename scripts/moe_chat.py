@@ -3,13 +3,13 @@
 Интерактивный чат с MoEKernel domain experts.
 
 Показывает как модель маршрутизирует тексты по доменам:
-  math / language / code / science
+ math / language / code / science
 
 Команды:
-  :transfer <домен>  -- перенести последний текст в другой домен
-  :compare <текст2>  -- сравнить сходство с последним текстом
-  :experts           -- показать текущую нагрузку экспертов
-  :quit              -- выход
+ :transfer <домен> -- перенести последний текст в другой домен
+ :compare <текст2> -- сравнить сходство с последним текстом
+ :experts -- показать текущую нагрузку экспертов
+ :quit -- выход
 """
 from __future__ import annotations
 import sys
@@ -68,7 +68,7 @@ def build_model():
 
 
 def encode_text(model, text: str):
-    """Encode text and run through HDIMModel. Returns (invariant, expert_weights, dominant_expert)."""
+    """Encode text and run through HDIMModel. Returns (exported_invariant, expert_weights, dominant_expert, out, aux_state)."""
     text = str(text)  # ensure str, not bytes
     with torch.no_grad():
         enc = model.encode_texts([text], device=DEVICE)  # (1, 64)
@@ -76,9 +76,11 @@ def encode_text(model, text: str):
         out, routing_weights, invariant, aux_state = model(
             enc, dom, return_state=True, memory_mode="none"
         )
-    expert_weights = aux_state.expert_usage.cpu()  # (4,)
-    top_idx = expert_weights.argmax().item()
-    return invariant, expert_weights, DOMAIN_NAMES[top_idx], out
+        expert_weights = aux_state.expert_usage.cpu()  # (4,)
+        top_idx = expert_weights.argmax().item()
+        # Return exported_invariant (clifford space) for domain transfer operations
+        exported_inv = aux_state.exported_invariant
+        return exported_inv, expert_weights, DOMAIN_NAMES[top_idx], out, aux_state
 
 
 def format_bar(weights, width=20):
@@ -86,7 +88,7 @@ def format_bar(weights, width=20):
     for i, (name, w) in enumerate(zip(DOMAIN_NAMES, weights.tolist())):
         filled = int(w * width)
         bar = "#" * filled + "-" * (width - filled)
-        bars.append(f"  {name:8s} [{bar}] {w:.3f}")
+        bars.append(f" {name:8s} [{bar}] {w:.3f}")
     return "\n".join(bars)
 
 
@@ -98,9 +100,9 @@ def main():
     model = build_model()
     print()
     print("=" * 55)
-    print("  MoEKernel Interactive Chat")
-    print("  Experts: math | language | code | science")
-    print("  Commands: :transfer <domain> | :compare <text> | :experts | :quit")
+    print(" MoEKernel Interactive Chat")
+    print(" Experts: math | language | code | science")
+    print(" Commands: :transfer <domain> | :compare <text> | :experts | :quit")
     print("=" * 55)
     print()
 
@@ -143,16 +145,16 @@ def main():
             if last_invariant is None:
                 print("[error] Enter a text first.")
                 continue
-            # Transfer invariant to target domain
+            # Transfer invariant to target domain (last_invariant is now in clifford space)
             with torch.no_grad():
                 pipeline = model.core_model.pipeline
                 tgt_name = f"domain_{DOMAIN_IDX[target]}"
                 r_target = pipeline.domain_rotors[tgt_name]
                 g_target = r_target(last_invariant)
                 transferred = pipeline.decoder(g_target)
-            print(f"[transfer -> {target}] embedding shape: {transferred.shape}")
-            print(f"  Cosine sim to original: {cosine_sim(last_invariant, transferred):.4f}")
-            print(f"  Norm ratio: {transferred.norm().item():.4f} / {last_invariant.norm().item():.4f}")
+                print(f"[transfer -> {target}] embedding shape: {transferred.shape}")
+                print(f" Cosine sim to original: {cosine_sim(last_invariant, g_target):.4f}")
+                print(f" Norm ratio: {g_target.norm().item():.4f} / {last_invariant.norm().item():.4f}")
             continue
 
         if user_input.startswith(":compare "):
@@ -163,28 +165,28 @@ def main():
             if last_invariant is None:
                 print("[error] Enter a text first.")
                 continue
-            inv2, ew2, dom2, _ = encode_text(model, text2)
+            inv2, ew2, dom2, _, _ = encode_text(model, text2)
             sim = cosine_sim(last_invariant, inv2)
             print(f"[compare]")
-            print(f"  Text 1: \"{last_text[:60]}\"")
-            print(f"  Text 2: \"{text2[:60]}\"")
-            print(f"  Cosine similarity (invariant space): {sim:.4f}")
-            print(f"  Text 1 dominant expert: {last_expert_weights.argmax() and DOMAIN_NAMES[last_expert_weights.argmax().item()]}")
-            print(f"  Text 2 dominant expert: {dom2}")
-            print(f"  Expert weights (text 2):")
+            print(f" Text 1: \"{last_text[:60]}\"")
+            print(f" Text 2: \"{text2[:60]}\"")
+            print(f" Cosine similarity (invariant space): {sim:.4f}")
+            print(f" Text 1 dominant expert: {last_expert_weights.argmax() and DOMAIN_NAMES[last_expert_weights.argmax().item()]}")
+            print(f" Text 2 dominant expert: {dom2}")
+            print(f" Expert weights (text 2):")
             print(format_bar(ew2))
             continue
 
         # --- Regular text encoding ---
-        invariant, expert_weights, dominant, out = encode_text(model, user_input)
+        invariant, expert_weights, dominant, out, aux_state = encode_text(model, user_input)
         last_invariant = invariant
         last_text = user_input
         last_expert_weights = expert_weights
 
         print(f"\nModel:")
-        print(f"  Dominant expert : {dominant.upper()}")
-        print(f"  Invariant norm  : {invariant.norm().item():.4f}")
-        print(f"  Expert routing  :")
+        print(f" Dominant expert : {dominant.upper()}")
+        print(f" Invariant norm : {invariant.norm().item():.4f}")
+        print(f" Expert routing :")
         print(format_bar(expert_weights))
         print()
 
