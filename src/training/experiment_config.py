@@ -6,7 +6,7 @@ continue to deserialise without errors.
 Backward-compat notes
 ---------------------
 * ``lr`` is the canonical learning-rate field (matches train.py and older
-  manifests).  ``learning_rate`` is kept as an alias via ``__post_init__``.
+  manifests). ``learning_rate`` is kept as an alias via ``__post_init__``.
 * All new Phase-2 fields default to False/None/0 so existing JSON manifests
   that omit them deserialise without errors.
 """
@@ -22,7 +22,7 @@ from typing import Any, Optional
 @dataclass
 class ExperimentConfig:
     # ------------------------------------------------------------------ #
-    # Legacy / core training fields (unchanged from Phase 1)              #
+    # Legacy / core training fields (unchanged from Phase 1) #
     # ------------------------------------------------------------------ #
     description: str = "baseline"
     epochs: int = 3
@@ -44,14 +44,15 @@ class ExperimentConfig:
     metadata: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
-    # Phase-2 model hyper-parameters                                      #
+    # Phase-2 model hyper-parameters
     # ------------------------------------------------------------------ #
     hidden_dim: int = 128
-    num_experts: int = 4
+    num_experts: Optional[int] = None  # None -> from expert_names or default
+    expert_names: Optional[list] = None  # Dynamic expert names
     num_domains: int = 4
 
     # ------------------------------------------------------------------ #
-    # Phase-2 loss coefficients                                           #
+    # Phase-2 loss coefficients
     # ------------------------------------------------------------------ #
     lambda_iso: float = 0.1
     lambda_pair: float = 0.1
@@ -59,14 +60,14 @@ class ExperimentConfig:
     lambda_memory: float = 0.01
 
     # ------------------------------------------------------------------ #
-    # Phase-2 training schedule extras                                    #
+    # Phase-2 training schedule extras
     # ------------------------------------------------------------------ #
     warmup_epochs: int = 3
     # Optional wall-clock budget in seconds; None means no limit.
     time_budget_s: Optional[float] = None
 
     # ------------------------------------------------------------------ #
-    # Phase-2 optional advanced components                                #
+    # Phase-2 optional advanced components
     # ------------------------------------------------------------------ #
     soft_router: bool = False
     modernbert_encoder: bool = False
@@ -77,7 +78,7 @@ class ExperimentConfig:
     matryoshka_dims: Optional[list] = None
 
     # ------------------------------------------------------------------ #
-    # Misc extras                                                         #
+    # Misc extras
     # ------------------------------------------------------------------ #
     experiment_name: str = "hdim_experiment"
     log_interval: int = 10
@@ -85,7 +86,7 @@ class ExperimentConfig:
     data_path: str = "data"
 
     # ------------------------------------------------------------------ #
-    # Serialisation helpers (unchanged from Phase 1)                      #
+    # Serialisation helpers (unchanged from Phase 1)
     # ------------------------------------------------------------------ #
     @classmethod
     def from_json(cls, path: str | Path) -> "ExperimentConfig":
@@ -103,12 +104,17 @@ class ExperimentConfig:
         return hashlib.sha256(encoded).hexdigest()[:12]
 
     # ------------------------------------------------------------------ #
-    # HDIMConfig bridge                                                   #
+    # HDIMConfig bridge
     # ------------------------------------------------------------------ #
     def to_hdim_config_kwargs(self) -> dict[str, Any]:
         """Return the subset of fields relevant to HDIMConfig construction."""
-        return dict(
+        kwargs = dict(
             hidden_dim=self.hidden_dim,
-            num_experts=self.num_experts,
             num_domains=self.num_domains,
         )
+        # Pass expert_names if provided, otherwise pass num_experts
+        if self.expert_names is not None:
+            kwargs["expert_names"] = self.expert_names
+        elif self.num_experts is not None:
+            kwargs["num_experts"] = self.num_experts
+        return kwargs

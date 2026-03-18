@@ -87,7 +87,7 @@ class HDIMConfig:
     Attributes:
         hidden_dim: Input/output feature dimensionality (must be divisible by 4).
         num_domains: Number of named domains to register domain rotors for.
-        num_experts: Number of MoE experts in the R3MoERouter.
+        num_experts: Number of MoE experts in the R3MoERouter. If None, computed from expert_names.
         dropout: Dropout probability applied after the encoder.
         clifford_p: Positive basis vectors for Cl_{p,q,r} algebra.
         clifford_q: Negative basis vectors.
@@ -97,11 +97,12 @@ class HDIMConfig:
         memory_type: Memory module type: titans | hippocampus | neocortex | cls | hbma.
         domain_names: Explicit domain name list. If None, auto-generates
             ['domain_0', 'domain_1', ...] up to num_domains.
+        expert_names: Explicit expert name list. If provided, num_experts is computed from it.
     """
 
     hidden_dim: int = 64
     num_domains: int = 4
-    num_experts: int = 4
+    num_experts: Optional[int] = None  # None -> computed from expert_names or default
     dropout: float = 0.1
     clifford_p: int = 4  # Phase 25: Cl(4,1,0) dim=32 vs old Cl(3,1,0) dim=16
     clifford_q: int = 1
@@ -110,7 +111,21 @@ class HDIMConfig:
     memory_key_dim: int = 32
     memory_type: str = "titans"  # titans | hippocampus | neocortex | cls | hbma
     domain_names: Optional[List[str]] = None
+    expert_names: Optional[List[str]] = None  # New field for dynamic expert names
     text: HDIMTextConfig = field(default_factory=HDIMTextConfig)
+
+    def __post_init__(self):
+        # Compute num_experts from expert_names if provided
+        if self.expert_names is not None:
+            computed = len(self.expert_names)
+            if self.num_experts is not None and self.num_experts != computed:
+                raise ValueError(
+                    f"num_experts={self.num_experts} conflicts with "
+                    f"len(expert_names)={computed}"
+                )
+            self.num_experts = computed
+        elif self.num_experts is None:
+            self.num_experts = 4  # sensible default
 
     def get_domain_names(self) -> List[str]:
         """Return the resolved list of domain names."""

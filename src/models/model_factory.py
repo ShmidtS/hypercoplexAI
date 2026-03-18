@@ -1,16 +1,16 @@
 """Single authoritative factory for all HDIM model variants.
 
 This is the *only* place where HDIMModel / TextHDIMModel instances are
-assembled with optional components.  Call sites should import
+assembled with optional components. Call sites should import
 from here rather than wiring models by hand.
 
 Public API
 ----------
-build_hdim_model(cfg)                    -> HDIMModel
-build_text_hdim_model(cfg, ...)          -> TextHDIMModel
-build_sbert_hdim_model(cfg, ...)         -> TextHDIMModel (with frozen SBERT encoder)
-build_modernbert_hdim_model(cfg, ...)    -> TextHDIMModel (with ModernBERT encoder)
-model_from_experiment_config(exp)        -> TextHDIMModel | HDIMModel
+build_hdim_model(cfg) -> HDIMModel
+build_text_hdim_model(cfg, ...) -> TextHDIMModel
+build_sbert_hdim_model(cfg, ...) -> TextHDIMModel (with frozen SBERT encoder)
+build_modernbert_hdim_model(cfg, ...) -> TextHDIMModel (with ModernBERT encoder)
+model_from_experiment_config(exp) -> TextHDIMModel | HDIMModel
 """
 from __future__ import annotations
 
@@ -38,10 +38,12 @@ def _patch_soft_router(core_model: HDIMModel, z_loss_weight: float = 0.0) -> Non
     # R3MoERouter operates on clifford-space vectors
     input_dim: int = pipeline.clifford_dim
     expert_dim: int = input_dim * 2  # sensible default
+    # num_experts is guaranteed to be set after __post_init__
+    num_experts = cfg.num_experts or 4
 
     new_moe = SoftMoERouter(
         input_dim=input_dim,
-        num_experts=cfg.num_experts,
+        num_experts=num_experts,
         expert_dim=expert_dim,
         top_k=cfg.top_k,
         z_loss_weight=z_loss_weight,
@@ -99,8 +101,6 @@ def _patch_modernbert_encoder(
     text_model.text_encoder = new_encoder  # type: ignore[assignment]
 
 
-
-
 def _patch_moe_kernel(
     core_model: HDIMModel,
     *,
@@ -111,8 +111,29 @@ def _patch_moe_kernel(
     """Replace pipeline.moe with MoEKernel (wrapped as drop-in) in-place.
 
     MoEKernel returns (output, MoEKernelState), but HDIMPipeline expects
-    (output, router_state_dict).  The inner MoEKernelRouterAdapter bridges
+    (output, router_state_dict). The inner MoEKernelRouterAdapter bridges
     the gap so the pipeline contract is fully preserved.
+
+    Supports both built-in experts (math, language, code, science) and
+    custom experts registered via `register_expert()` from moe_kernel.
+
+    num_experts is computed from expert_names if provided, otherwise from
+    core_model.config.num_experts.
+
+    Args:
+        core_model: HDIMModel instance to patch
+        expert_names: List of expert domain names. Built-in: math, language,
+            code, science. Custom names must be registered via register_expert()
+            before calling. Unknown names use generic DomainExpert.
+        z_loss_weight: Weight for router Z-loss regularization
+        ortho_loss_weight: Weight for expert orthogonalization loss
+
+    Example:
+        >>> from src.core.moe_kernel import register_expert, DomainExpert
+        >>> class MedicalExpert(DomainExpert):
+        ...     pass  # custom implementation
+        >>> register_expert("medical", MedicalExpert)
+        >>> _patch_moe_kernel(model, expert_names=["math", "medical"])
     """
     import torch.nn as nn
     from src.core.moe_kernel import MoEKernel, MoEKernelConfig
@@ -121,17 +142,24 @@ def _patch_moe_kernel(
     cfg = core_model.config
     input_dim: int = pipeline.clifford_dim
 
-    if expert_names is None:
-        expert_names = ["math", "language", "code", "science"][: cfg.num_experts]
-        if len(expert_names) < cfg.num_experts:
+    # Compute num_experts from expert_names if provided
+    if expert_names is not None:
+        num_experts = len(expert_names)
+    else:
+        # Use config.num_experts (guaranteed to be set after __post_init__)
+        num_experts = cfg.num_experts or 4
+        # Default expert names for built-in experts
+        expert_names = ["math", "language", "code", "science"][:num_experts]
+        # Pad with generic names if needed
+        if len(expert_names) < num_experts:
             expert_names += [
-                f"expert_{i}" for i in range(len(expert_names), cfg.num_experts)
+                f"expert_{i}" for i in range(len(expert_names), num_experts)
             ]
 
     kernel_cfg = MoEKernelConfig(
         input_dim=input_dim,
         expert_hidden_dim=input_dim * 2,
-        num_experts=cfg.num_experts,
+        num_experts=num_experts,
         slots_per_expert=1,
         temperature=1.0,
         z_loss_weight=z_loss_weight,
@@ -279,11 +307,17 @@ def model_from_experiment_config(
     """
     # Build HDIMConfig from the experiment settings.
     # We forward only the fields that HDIMConfig actually accepts.
-    cfg = HDIMConfig(
+    cfg_kwargs = dict(
         hidden_dim=exp.hidden_dim,
-        num_experts=exp.num_experts,
         num_domains=exp.num_domains,
     )
+    # Pass expert_names if provided, otherwise pass num_experts
+    if exp.expert_names is not None:
+        cfg_kwargs["expert_names"] = exp.expert_names
+    elif exp.num_experts is not None:
+        cfg_kwargs["num_experts"] = exp.num_experts
+
+    cfg = HDIMConfig(**cfg_kwargs)
 
     needs_text = (
         exp.text_mode

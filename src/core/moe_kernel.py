@@ -2,21 +2,21 @@
 HDIM — MoE Kernel: полноценное ядро Mixture-of-Experts роутера.
 
 Реализует архитектуру с доменно-специализированными лёгкими экспертами:
-  - MathExpert: алгебраические и численные паттерны
-  - LanguageExpert: лингвистические и семантические паттерны
-  - CodeExpert: структурные и логические паттерны программирования
-  - ScienceExpert: физические и инженерные паттерны
+ - MathExpert: алгебраические и численные паттерны
+ - LanguageExpert: лингвистические и семантические паттерны
+ - CodeExpert: структурные и логические паттерны программирования
+ - ScienceExpert: физические и инженерные паттерны
 
 Архитектура:
-  Input → DomainRouter (soft dispatch) → [Expert_0..Expert_K] → combine → Output
-  SharedExpert (DeepSeek-V3 стиль) → residual добавляется к output
+ Input → DomainRouter (soft dispatch) → [Expert_0..Expert_K] → combine → Output
+ SharedExpert (DeepSeek-V3 стиль) → residual добавляется к output
 
 Особенности:
-  - Auxiliary-Loss-Free балансировка (DeepSeek-V3, arXiv:2412.19437)
-  - Expert Orthogonalization (arXiv:2505.22323)
-  - Z-loss регуляризация (ST-MoE)
-  - Similarity-Preserving routing (SIMBAL, arXiv:2506.14038)
-  - Soft MoE dispatch/combine (Puigcerver et al., ICLR 2024)
+ - Auxiliary-Loss-Free балансировка (DeepSeek-V3, arXiv:2412.19437)
+ - Expert Orthogonalization (arXiv:2505.22323)
+ - Z-loss регуляризация (ST-MoE)
+ - Similarity-Preserving routing (SIMBAL, arXiv:2506.14038)
+ - Soft MoE dispatch/combine (Puigcerver et al., ICLR 2024)
 """
 
 from __future__ import annotations
@@ -31,15 +31,18 @@ import torch.nn.functional as F
 
 
 # ============================================================
-#  Конфигурация
+# Конфигурация
 # ============================================================
 
 @dataclass
 class MoEKernelConfig:
-    """Конфигурация MoE-ядра."""
+    """Конфигурация MoE-ядра.
+
+    num_experts вычисляется автоматически из expert_names если не указан явно.
+    """
     input_dim: int = 128
     expert_hidden_dim: int = 256
-    num_experts: int = 4
+    num_experts: Optional[int] = None  # None -> вычисляется из expert_names
     slots_per_expert: int = 1
     temperature: float = 1.0
     z_loss_weight: float = 0.01
@@ -52,12 +55,20 @@ class MoEKernelConfig:
     expert_names: Optional[List[str]] = None
 
     def __post_init__(self):
-        if self.expert_names is None:
+        # Если expert_names задан, num_experts вычисляется из него
+        if self.expert_names is not None:
+            computed_num = len(self.expert_names)
+            if self.num_experts is not None and self.num_experts != computed_num:
+                raise ValueError(
+                    f"num_experts={self.num_experts} conflicts with "
+                    f"len(expert_names)={computed_num}"
+                )
+            self.num_experts = computed_num
+        else:
+            # Если expert_names не задан, используем num_experts или default
+            if self.num_experts is None:
+                self.num_experts = 4  # sensible default
             self.expert_names = [f"expert_{i}" for i in range(self.num_experts)]
-        if len(self.expert_names) != self.num_experts:
-            raise ValueError(
-                f"expert_names length {len(self.expert_names)} != num_experts {self.num_experts}"
-            )
 
 
 @dataclass
@@ -67,13 +78,13 @@ class MoEKernelState:
     router_loss: torch.Tensor
     z_loss: torch.Tensor
     ortho_loss: torch.Tensor
-    expert_weights: torch.Tensor       # (B, num_experts) — средние веса по batch
-    expert_usage: torch.Tensor         # (num_experts,) — средняя нагрузка
-    routing_entropy: torch.Tensor      # скаляр — энтропия маршрутизации
-    dispatch_weights: torch.Tensor     # (B, num_slots)
-    combine_weights: torch.Tensor      # (B, num_slots)
+    expert_weights: torch.Tensor  # (B, num_experts) — средние веса по batch
+    expert_usage: torch.Tensor  # (num_experts,) — средняя нагрузка
+    routing_entropy: torch.Tensor  # скаляр — энтропия маршрутизации
+    dispatch_weights: torch.Tensor  # (B, num_slots)
+    combine_weights: torch.Tensor  # (B, num_slots)
     expert_names: List[str]
-    top_expert_idx: torch.Tensor       # (B,) — индекс наиболее используемого эксперта
+    top_expert_idx: torch.Tensor  # (B,) — индекс наиболее используемого эксперта
 
     def total_loss(self) -> torch.Tensor:
         return self.router_loss + self.z_loss + self.ortho_loss
@@ -84,7 +95,7 @@ class MoEKernelState:
 
 
 # ============================================================
-#  Доменные эксперты
+# Доменные эксперты
 # ============================================================
 
 class DomainExpert(nn.Module):
@@ -190,12 +201,55 @@ class ScienceExpert(DomainExpert):
 
 
 # Реестр фабричных функций для создания экспертов по имени домена
+# Встроенные эксперты: math, language, code, science
+# Кастомные эксперты могут быть добавлены через register_expert()
 EXPERT_REGISTRY: Dict[str, type] = {
     "math": MathExpert,
     "language": LanguageExpert,
     "code": CodeExpert,
     "science": ScienceExpert,
 }
+
+
+def register_expert(name: str, expert_cls: type) -> None:
+    """Регистрирует новый тип эксперта в глобальном реестре.
+
+    Args:
+        name: Имя домена (например, "medical", "legal", "history")
+        expert_cls: Класс эксперта (должен наследовать DomainExpert)
+
+    Raises:
+        TypeError: Если expert_cls не наследует DomainExpert
+
+    Example:
+        >>> from src.core.moe_kernel import DomainExpert, register_expert
+        >>> class MedicalExpert(DomainExpert):
+        ...     def __init__(self, input_dim, hidden_dim, dropout=0.1):
+        ...         super().__init__(input_dim, hidden_dim, dropout, name="medical")
+        ...         self.net = nn.Sequential(
+        ...             nn.Linear(input_dim, hidden_dim),
+        ...             nn.Tanh(),
+        ...             nn.Dropout(dropout),
+        ...             nn.Linear(hidden_dim, input_dim),
+        ...         )
+        >>> register_expert("medical", MedicalExpert)
+    """
+    if not issubclass(expert_cls, DomainExpert):
+        raise TypeError(f"{expert_cls.__name__} must inherit from DomainExpert")
+    EXPERT_REGISTRY[name] = expert_cls
+
+
+def get_registered_expert_names() -> List[str]:
+    """Возвращает список всех зарегистрированных экспертов.
+
+    Returns:
+        Список имен доменов, доступных для использования в MoEKernel.
+
+    Example:
+        >>> get_registered_expert_names()
+        ['math', 'language', 'code', 'science']
+    """
+    return list(EXPERT_REGISTRY.keys())
 
 
 def create_expert(name: str, input_dim: int, hidden_dim: int, dropout: float) -> DomainExpert:
@@ -207,7 +261,7 @@ def create_expert(name: str, input_dim: int, hidden_dim: int, dropout: float) ->
 
 
 # ============================================================
-#  MoE Kernel — основное ядро
+# MoE Kernel — основное ядро
 # ============================================================
 
 class MoEKernel(nn.Module):
@@ -215,17 +269,17 @@ class MoEKernel(nn.Module):
     Полноценное ядро MoE-роутера с доменными экспертами.
 
     Реализует Soft MoE dispatch/combine (Puigcerver ICLR 2024) с расширениями:
-      - Auxiliary-Loss-Free балансировка per-expert bias (DeepSeek-V3)
-      - Expert Orthogonalization loss (arXiv:2505.22323)
-      - Shared Expert residual (DeepSeek-V3)
-      - Router Z-loss (ST-MoE)
-      - Similarity-Preserving routing через ортогонализацию весов
+    - Auxiliary-Loss-Free балансировка per-expert bias (DeepSeek-V3)
+    - Expert Orthogonalization loss (arXiv:2505.22323)
+    - Shared Expert residual (DeepSeek-V3)
+    - Router Z-loss (ST-MoE)
+    - Similarity-Preserving routing через ортогонализацию весов
 
     Soft MoE формула:
-      Φ = softmax(X · Θ / τ)         [T × num_slots] — dispatch weights
-      X̃_s = Φ[:, s]ᵀ · X            [num_slots × D] — slot inputs
-      ỹ_s = Expert_e(X̃_s)           [num_slots × D] — expert outputs
-      Y_t = Σ_s Φ[t, s] · ỹ_s       [T × D]         — combined output
+        Φ = softmax(X · Θ / τ) [T × num_slots] — dispatch weights
+        X̃_s = Φ[:, s]ᵀ · X [num_slots × D] — slot inputs
+        ỹ_s = Expert_e(X̃_s) [num_slots × D] — expert outputs
+        Y_t = Σ_s Φ[t, s] · ỹ_s [T × D] — combined output
 
     Args:
         config: MoEKernelConfig с параметрами
@@ -234,8 +288,9 @@ class MoEKernel(nn.Module):
     def __init__(self, config: MoEKernelConfig):
         super().__init__()
         self.config = config
-        self.num_experts = config.num_experts
-        self.num_slots = config.num_experts * config.slots_per_expert
+        # num_experts гарантированно установлен после __post_init__
+        self.num_experts = config.num_experts  # type: ignore[assignment]
+        self.num_slots = config.num_experts * config.slots_per_expert  # type: ignore[operator]
         self.slots_per_expert = config.slots_per_expert
         self.input_dim = config.input_dim
         self.expert_names = config.expert_names
@@ -252,7 +307,7 @@ class MoEKernel(nn.Module):
                 hidden_dim=config.expert_hidden_dim,
                 dropout=config.dropout,
             )
-            for i in range(config.num_experts)
+            for i in range(config.num_experts)  # type: ignore[arg-type]
         ])
 
         # --- Shared Expert (DeepSeek-V3 стиль) ---
@@ -269,7 +324,7 @@ class MoEKernel(nn.Module):
         # --- Auxiliary-Loss-Free: per-expert bias ---
         if config.use_aux_loss_free:
             self._expert_bias = nn.Parameter(
-                torch.zeros(config.num_experts), requires_grad=False
+                torch.zeros(config.num_experts), requires_grad=False  # type: ignore[arg-type]
             )
             self._aux_lr = config.aux_lr
         else:
@@ -278,12 +333,12 @@ class MoEKernel(nn.Module):
         # --- EMA train scores для мониторинга ---
         self.register_buffer(
             "train_scores",
-            torch.ones(config.num_experts) / config.num_experts,
+            torch.ones(config.num_experts) / config.num_experts,  # type: ignore[operator]
         )
         # --- Target uniform load ---
         self.register_buffer(
             "_target_load",
-            torch.ones(config.num_experts) / config.num_experts,
+            torch.ones(config.num_experts) / config.num_experts,  # type: ignore[operator]
         )
 
         self.temperature = config.temperature
@@ -292,7 +347,7 @@ class MoEKernel(nn.Module):
         self.use_expert_ortho = config.use_expert_ortho
 
     # ----------------------------------------------------------
-    #  Dispatch / Combine
+    # Dispatch / Combine
     # ----------------------------------------------------------
 
     def _compute_dispatch_combine(
@@ -303,8 +358,8 @@ class MoEKernel(nn.Module):
 
         Returns:
             dispatch : (T, num_slots) — нормализация по dim=0 (токены → слоты)
-            combine  : (T, num_slots) — нормализация по dim=-1 (слоты → токены)
-            z_loss   : скаляр
+            combine : (T, num_slots) — нормализация по dim=-1 (слоты → токены)
+            z_loss : скаляр
         """
         logits = self.router_proj(x) / self.temperature  # (T, num_slots)
 
@@ -315,7 +370,7 @@ class MoEKernel(nn.Module):
 
         # Z-loss (ST-MoE): штраф за большие логиты
         if self.z_loss_weight > 0:
-            lse = torch.logsumexp(logits, dim=-1)          # (T,)
+            lse = torch.logsumexp(logits, dim=-1)  # (T,)
             z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
         else:
             z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
@@ -325,13 +380,13 @@ class MoEKernel(nn.Module):
             # Граничный случай: единственный токен → равномерный dispatch
             dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype) / self.num_slots
         else:
-            dispatch = F.softmax(logits, dim=0)   # нормализация по токенам
-        combine = F.softmax(logits, dim=-1)        # нормализация по слотам
+            dispatch = F.softmax(logits, dim=0)  # нормализация по токенам
+        combine = F.softmax(logits, dim=-1)  # нормализация по слотам
 
         return dispatch, combine, z_loss
 
     # ----------------------------------------------------------
-    #  Expert execution
+    # Expert execution
     # ----------------------------------------------------------
 
     def _run_experts(self, slot_inputs: torch.Tensor) -> torch.Tensor:
@@ -347,8 +402,8 @@ class MoEKernel(nn.Module):
         for e_idx, expert in enumerate(self.experts):
             start = e_idx * self.slots_per_expert
             end = start + self.slots_per_expert
-            expert_input = slot_inputs[start:end]   # (slots_per_expert, D)
-            expert_output = expert(expert_input)     # (slots_per_expert, D)
+            expert_input = slot_inputs[start:end]  # (slots_per_expert, D)
+            expert_output = expert(expert_input)  # (slots_per_expert, D)
             # Защита от NaN/Inf
             expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=10.0, neginf=-10.0)
             expert_output = torch.clamp(expert_output, -10.0, 10.0)
@@ -356,29 +411,29 @@ class MoEKernel(nn.Module):
         return torch.cat(outputs, dim=0)  # (num_slots, D)
 
     # ----------------------------------------------------------
-    #  Load balance loss (Switch Transformer стиль)
+    # Load balance loss (Switch Transformer стиль)
     # ----------------------------------------------------------
 
     def _load_balance_loss(self, combine: torch.Tensor) -> torch.Tensor:
         """
         Switch Transformer load balance loss:
-          L_lb = E * Σ_e f_e.detach() * mean_usage_e
+            L_lb = E * Σ_e f_e.detach() * mean_usage_e
         """
         T = combine.shape[0]
         # (T, E)
         expert_w = combine.reshape(T, self.num_experts, self.slots_per_expert).mean(-1)
-        f_e = expert_w.mean(0).detach()   # (E,) — stop-gradient
-        mean_usage = expert_w.mean(0)     # (E,) — gradient flows
+        f_e = expert_w.mean(0).detach()  # (E,) — stop-gradient
+        mean_usage = expert_w.mean(0)  # (E,) — gradient flows
         return self.num_experts * (f_e * mean_usage).sum()
 
     # ----------------------------------------------------------
-    #  Expert Orthogonalization loss
+    # Expert Orthogonalization loss
     # ----------------------------------------------------------
 
     def expert_orthogonalization_loss(self) -> torch.Tensor:
         """
         Штраф за коллинеарность экспертов (arXiv:2505.22323).
-        L_o = ||W_flat @ W_flat^T - I||_F^2  (усреднено по экспертам)
+        L_o = ||W_flat @ W_flat^T - I||_F^2 (усреднено по экспертам)
 
         Собирает первый Linear слой каждого эксперта.
         Усекает все веса до минимальной плоской размерности для совместимости
@@ -399,12 +454,12 @@ class MoEKernel(nn.Module):
 
         W = torch.cat(weights, dim=0)  # (E, min_len)
         E = W.shape[0]
-        gram = W @ W.T                 # (E, E)
+        gram = W @ W.T  # (E, E)
         I = torch.eye(E, device=W.device, dtype=W.dtype)
         return ((gram - I) ** 2).mean()
 
     # ----------------------------------------------------------
-    #  Router projection orthogonalization (SIMBAL стиль)
+    # Router projection orthogonalization (SIMBAL стиль)
     # ----------------------------------------------------------
 
     def router_similarity_loss(self) -> torch.Tensor:
@@ -415,12 +470,12 @@ class MoEKernel(nn.Module):
         для семантически похожих токенов.
         """
         W = F.normalize(self.router_proj.weight, dim=-1)  # (num_slots, D)
-        gram = W @ W.T                                      # (num_slots, num_slots)
+        gram = W @ W.T  # (num_slots, num_slots)
         I = torch.eye(self.num_slots, device=W.device, dtype=W.dtype)
         return ((gram - I) ** 2).mean()
 
     # ----------------------------------------------------------
-    #  Forward
+    # Forward
     # ----------------------------------------------------------
 
     def forward(
@@ -434,7 +489,7 @@ class MoEKernel(nn.Module):
             x: (batch_size, input_dim) или (batch, seq, input_dim)
         Returns:
             output : тот же shape что x
-            state  : MoEKernelState с метриками и лоссами
+            state : MoEKernelState с метриками и лоссами
         """
         orig_shape = x.shape
         x_flat = x.reshape(-1, self.input_dim)  # (T, D)
@@ -445,13 +500,13 @@ class MoEKernel(nn.Module):
         # dispatch: (T, S), combine: (T, S)
 
         # 2. Агрегация токенов в слоты: X̃ = dispatch^T @ X
-        slot_inputs = dispatch.T @ x_flat   # (S, D)
+        slot_inputs = dispatch.T @ x_flat  # (S, D)
 
         # 3. Запуск экспертов
-        slot_outputs = self._run_experts(slot_inputs)   # (S, D)
+        slot_outputs = self._run_experts(slot_inputs)  # (S, D)
 
         # 4. Combine: Y = combine @ slot_outputs
-        output = combine @ slot_outputs   # (T, D)
+        output = combine @ slot_outputs  # (T, D)
         output = torch.nan_to_num(output, nan=0.0, posinf=10.0, neginf=-10.0)
         output = torch.clamp(output, -10.0, 10.0)
 
@@ -473,10 +528,10 @@ class MoEKernel(nn.Module):
 
         # 7. Метрики нагрузки
         combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
-        expert_weights_per_token = combine_reshaped.mean(-1)   # (T, E)
+        expert_weights_per_token = combine_reshaped.mean(-1)  # (T, E)
         expert_usage = expert_weights_per_token.mean(0).detach()  # (E,)
         routing_entropy = -(expert_weights_per_token * (expert_weights_per_token + 1e-8).log()).sum(-1).mean()
-        top_expert_idx = expert_weights_per_token.argmax(-1)    # (T,)
+        top_expert_idx = expert_weights_per_token.argmax(-1)  # (T,)
 
         # 8. EMA train_scores + bias update (только во время обучения)
         if self.training:

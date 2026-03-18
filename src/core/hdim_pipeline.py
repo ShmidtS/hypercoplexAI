@@ -141,7 +141,8 @@ class HDIMPipeline(nn.Module):
         clifford_q: int = 1,
         clifford_r: int = 0,
         domain_names: Optional[List[str]] = None,
-        num_experts: int = 4,
+        num_experts: Optional[int] = None,  # None -> auto from expert_names or default
+        expert_names: Optional[List[str]] = None,  # New field
         top_k: int = 2,
         memory_key_dim: int = 32,
         memory_type: str = 'titans',
@@ -154,6 +155,12 @@ class HDIMPipeline(nn.Module):
         self.algebra = CliffordAlgebra(p=clifford_p, q=clifford_q, r=clifford_r)
         clifford_dim = self.algebra.dim
         self.clifford_dim = clifford_dim
+
+        # Compute num_experts from expert_names if provided
+        if expert_names is not None:
+            num_experts = len(expert_names)
+        elif num_experts is None:
+            num_experts = 4  # sensible default
 
         self.memory_type = memory_type
         self.encoder = HDIMEncoder(input_dim, clifford_dim)

@@ -89,8 +89,10 @@ def _apply_experiment_defaults(
     # present as explicit CLI args -- we check for non-default values).
     if experiment.hidden_dim != 128:   # non-default -> forward as model_override
         args.model_override.append(f"hidden_dim={experiment.hidden_dim}")
-    if experiment.num_experts != 4:
+    if experiment.num_experts is not None and experiment.num_experts != 4:
         args.model_override.append(f"num_experts={experiment.num_experts}")
+    if experiment.expert_names is not None:
+        args.model_override.append(f"expert_names={experiment.expert_names}")
 
     return args
 

@@ -10,6 +10,41 @@
  :compare <текст2> -- сравнить сходство с последним текстом
  :experts -- показать текущую нагрузку экспертов
  :quit -- выход
+
+Пример регистрации кастомных экспертов:
+ ------------------------------
+ from src.core.moe_kernel import DomainExpert, register_expert
+ import torch.nn as nn
+
+ class HistoryExpert(DomainExpert):
+     '''Expert for historical and temporal patterns.'''
+     def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
+         super().__init__(input_dim, hidden_dim, dropout, name="history")
+         self.net = nn.Sequential(
+             nn.Linear(input_dim, hidden_dim),
+             nn.GELU(),
+             nn.Dropout(dropout),
+             nn.Linear(hidden_dim, input_dim),
+         )
+
+ class MedicalExpert(DomainExpert):
+     '''Expert for medical and biological patterns.'''
+     def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
+         super().__init__(input_dim, hidden_dim, dropout, name="medical")
+         self.net = nn.Sequential(
+             nn.Linear(input_dim, hidden_dim),
+             nn.Tanh(),
+             nn.Dropout(dropout),
+             nn.Linear(hidden_dim, input_dim),
+         )
+
+ # Register custom experts before building model
+ register_expert("history", HistoryExpert)
+ register_expert("medical", MedicalExpert)
+
+ # Then use in _patch_moe_kernel:
+ # _patch_moe_kernel(model.core_model, expert_names=["math", "medical", "history", "science"])
+ ------------------------------
 """
 from __future__ import annotations
 import sys
@@ -19,10 +54,11 @@ import torch.nn.functional as F
 
 # Fix Windows console encoding for Cyrillic input via pipe
 import io
-if hasattr(sys.stdin, 'reconfigure'):
-    sys.stdin.reconfigure(encoding='utf-8', errors='replace')
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -34,7 +70,13 @@ DOMAIN_NAMES = ["math", "language", "code", "science"]
 DOMAIN_IDX = {n: i for i, n in enumerate(DOMAIN_NAMES)}
 
 
-CHECKPOINT_PATH = Path(__file__).resolve().parents[1] / "artifacts" / "gpu_training" / "checkpoints" / "best.pt"
+CHECKPOINT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "artifacts"
+    / "gpu_training"
+    / "checkpoints"
+    / "best.pt"
+)
 
 
 def build_model():
@@ -55,9 +97,13 @@ def build_model():
         score = ckpt.get("score", None)
         epoch = ckpt.get("current_epoch", ckpt.get("epoch", "?"))
         score_str = f", score={score:.4f}" if score is not None else ""
-        print(f"[init] Checkpoint loaded: epoch={epoch}{score_str} ({len(result.missing_keys)} missing keys)")
+        print(
+            f"[init] Checkpoint loaded: epoch={epoch}{score_str} ({len(result.missing_keys)} missing keys)"
+        )
     else:
-        print(f"[init] WARNING: checkpoint not found at {CHECKPOINT_PATH} — using random weights")
+        print(
+            f"[init] WARNING: checkpoint not found at {CHECKPOINT_PATH} — using random weights"
+        )
     model.to(DEVICE)
     model.eval()
     print("[init] Model ready.")
@@ -131,7 +177,11 @@ def main():
 
         if user_input == ":experts":
             if last_expert_weights is not None:
-                print(f"Expert load for: \"{last_text[:50]}...\"" if last_text and len(last_text) > 50 else f"Expert load for: \"{last_text}\"")
+                print(
+                    f'Expert load for: "{last_text[:50]}..."'
+                    if last_text and len(last_text) > 50
+                    else f'Expert load for: "{last_text}"'
+                )
                 print(format_bar(last_expert_weights))
             else:
                 print("[no text encoded yet]")
@@ -153,8 +203,12 @@ def main():
                 g_target = r_target(last_invariant)
                 transferred = pipeline.decoder(g_target)
                 print(f"[transfer -> {target}] embedding shape: {transferred.shape}")
-                print(f" Cosine sim to original: {cosine_sim(last_invariant, g_target):.4f}")
-                print(f" Norm ratio: {g_target.norm().item():.4f} / {last_invariant.norm().item():.4f}")
+                print(
+                    f" Cosine sim to original: {cosine_sim(last_invariant, g_target):.4f}"
+                )
+                print(
+                    f" Norm ratio: {g_target.norm().item():.4f} / {last_invariant.norm().item():.4f}"
+                )
             continue
 
         if user_input.startswith(":compare "):
@@ -168,17 +222,21 @@ def main():
             inv2, ew2, dom2, _, _ = encode_text(model, text2)
             sim = cosine_sim(last_invariant, inv2)
             print(f"[compare]")
-            print(f" Text 1: \"{last_text[:60]}\"")
-            print(f" Text 2: \"{text2[:60]}\"")
+            print(f' Text 1: "{last_text[:60]}"')
+            print(f' Text 2: "{text2[:60]}"')
             print(f" Cosine similarity (invariant space): {sim:.4f}")
-            print(f" Text 1 dominant expert: {last_expert_weights.argmax() and DOMAIN_NAMES[last_expert_weights.argmax().item()]}")
+            print(
+                f" Text 1 dominant expert: {last_expert_weights.argmax() and DOMAIN_NAMES[last_expert_weights.argmax().item()]}"
+            )
             print(f" Text 2 dominant expert: {dom2}")
             print(f" Expert weights (text 2):")
             print(format_bar(ew2))
             continue
 
         # --- Regular text encoding ---
-        invariant, expert_weights, dominant, out, aux_state = encode_text(model, user_input)
+        invariant, expert_weights, dominant, out, aux_state = encode_text(
+            model, user_input
+        )
         last_invariant = invariant
         last_text = user_input
         last_expert_weights = expert_weights
