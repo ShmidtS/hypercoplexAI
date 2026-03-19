@@ -214,13 +214,16 @@ class SoftMoERouter(MoERouter):
         if self.training:
             with torch.no_grad():
                 expert_load = combine_reshaped.sum(-1).mean(0) # (num_experts,)
-                # Используем atomic update для thread safety (исправление race condition)
-                self.train_scores = 0.9 * self.train_scores + 0.1 * expert_load
+                # Thread-safe EMA update (fixes race condition in multi-worker DataLoader)
+                with self._ema_lock:
+                    self.train_scores = 0.9 * self.train_scores + 0.1 * expert_load
 
                 # Phase 26: Auxiliary-Loss-Free bias update (DeepSeek-V3)
                 if self.use_aux_loss_free:
                     delta = torch.sign(expert_load - self._target_load)
-                    self._expert_bias.data -= self._aux_lr * delta
+                    with self._ema_lock:
+
+                        self._expert_bias.data -= self._aux_lr * delta
 
         # Router loss: load balance
         router_loss = self._entropy_load_balance_loss(combine)
