@@ -1284,8 +1284,25 @@ class HDIMTrainer:
             checkpoint["scaler_state_dict"] = scaler.state_dict()
         torch.save(checkpoint, path)
 
+    def _load_checkpoint_safe(self, path: str) -> dict:
+        """Safely load checkpoint with weights_only=True (OWASP A08 fix).
+
+        Prevents arbitrary code execution via pickle deserialization.
+        Only tensor data is loaded, no Python objects.
+        """
+        import io
+
+        with open(path, "rb") as f:
+            data = f.read()
+
+        return torch.load(
+            io.BytesIO(data),
+            map_location=self.device,
+            weights_only=True,
+        )
+
     def load_checkpoint(self, path: str, scaler=None) -> None:
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = self._load_checkpoint_safe(path)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self._step = checkpoint.get("step", 0)

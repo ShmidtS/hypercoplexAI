@@ -8,7 +8,7 @@
 
 > **Best Score:** 1.1542 (Phase 26c, epoch 15) — `pair_margin=0.993`, `STS=0.537`
 > **Phase 28:** MoEKernel score=1.0671 | pair_margin=0.9018 | STS=0.5512 (+355% vs SoftMoERouter baseline)
-> **Verification:** 159/159 Lean4 theorems PASS | 168 pytest tests PASS
+> **Numerical validation:** 159/159 Python tests PASS | 168 pytest tests PASS
 > **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + SIMBAL
 
 ---
@@ -130,9 +130,9 @@ G_B = R_B ⊗ U_inv ⊗ R_B⁻¹
 
 This reconstructs the target domain representation from the invariant.
 
-### Verification: 159 Lean4 Theorems
+### Verification: 159 Numerical Tests
 
-All mathematical properties are numerically verified in `verify_lean4_numerical.py`:
+All mathematical properties are numerically verified in `verify_lean4_numerical.py` (tolerance-based Python tests):
 
 
 | Category              | Theorems | Status         |
@@ -486,7 +486,7 @@ python scripts/auto_tune.py \
 ### Run All Tests
 
 ```bash
-# Lean4 numerical verification (159 theorems, Phase 28)
+# Numerical verification (159 tests, Phase 28)
 python verify_lean4_numerical.py
 
 # pytest suite (168 tests: 45 moe_kernel + 123 existing)
@@ -705,7 +705,7 @@ If you use HDIM in your research, please cite:
   author = {HypercoplexAI Team},
   year = {2026},
   url = {https://github.com/your-org/hypercoplexAI},
-  note = {Phase 28: 159 Lean4-verified theorems, 168 tests passing, MoEKernel score=1.067}
+  note = {Phase 28: 159 numerical tests PASS, 168 pytest PASS, MoEKernel score=1.067}
 }
 ```
 

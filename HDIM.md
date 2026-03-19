@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 27.0 | Дата: 2026-03-17 | Рекорд: score=1.1542 (Phase 26c, ep15, margin=0.993, STS=0.537) | Phase 27: Lean4 148/148 PASS + pytest 123 PASS + auto_tune v27 + dead code cleanup*
+*Версия: 27.0 | Дата: 2026-03-17 | Рекорд: score=1.1542 (Phase 26c, ep15, margin=0.993, STS=0.537) | Phase 27: Numerical tests 148/148 PASS + pytest 123 PASS + auto_tune v27 + dead code cleanup*
 
 ---
 

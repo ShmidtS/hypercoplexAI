@@ -62,6 +62,33 @@ class TitansMemoryModule(nn.Module):
         self.use_adaptive_forgetting: bool = False
         self._last_surprise: float = 0.0
 
+        # Phase 29: RAG-compatible freeze state
+        self._frozen: bool = False
+
+    # ==================== Phase 29: RAG-compatible API ====================
+
+    def freeze_memory(self) -> None:
+        """Freeze memory weights for RAG inference.
+
+        После вызова:
+        - retrieve() работает без обновления
+        - Memory weights не изменяются
+        - Embeddings детерминированы
+        """
+        self.memory.weight.requires_grad_(False)
+        self._frozen = True
+
+    def unfreeze_memory(self) -> None:
+        """Unfreeze for training."""
+        self.memory.weight.requires_grad_(True)
+        self._frozen = False
+
+    def is_frozen(self) -> bool:
+        """Check if memory is frozen."""
+        return self._frozen
+
+    # =========================================================================
+
     def retrieve(
         self,
         k: torch.Tensor,
@@ -145,6 +172,10 @@ class TitansMemoryModule(nn.Module):
         v: torch.Tensor,
         update_memory: bool = True,
     ) -> MemoryState:
+        # Phase 29: Force disable update when frozen (RAG mode)
+        if self._frozen and update_memory:
+            update_memory = False
+
         state = self.retrieve(k, v)
         if update_memory and self.training:
             alpha, eta, theta = self.update(k, v)
