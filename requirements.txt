@@ -1,5 +1,23 @@
-SQLAlchemy
-alembic
-pytest
-sentence-transformers
-torch
+# Core ML
+torch==2.6.0
+sentence-transformers==2.7.0
+transformers==4.39.0
+numpy==1.26.4
+
+# Training
+accelerate==0.28.0
+safetensors==0.4.2
+
+# Database
+SQLAlchemy==2.0.28
+alembic==1.13.1
+
+# Testing
+pytest==8.1.0
+pytest-cov==4.1.0
+
+# Type checking
+mypy==1.8.0
+
+# Linting
+ruff==0.3.0
