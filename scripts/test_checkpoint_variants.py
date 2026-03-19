@@ -251,7 +251,7 @@ def load_checkpoint(model, checkpoint_path: Path, device: str):
     if not checkpoint_path.exists():
         return f"Checkpoint not found: {checkpoint_path}"
 
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     state_dict = ckpt.get("model_state_dict", ckpt)
 
     # Load with strict=False to handle architecture differences

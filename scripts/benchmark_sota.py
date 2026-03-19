@@ -223,7 +223,7 @@ def build_hdim_model_with_checkpoint(device: str) -> Tuple[HDIMModel, str]:
 
     # Load checkpoint if available
     if CHECKPOINT_PATH.exists():
-        ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
         model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
         notes = f"Loaded checkpoint: {CHECKPOINT_PATH.name}"
     else:

@@ -18,6 +18,8 @@ Roller Routing Replay совместим: train_scores обновляются ч
 
 from __future__ import annotations
 
+import threading
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -110,6 +112,9 @@ class SoftMoERouter(MoERouter):
 
         # Phase 26: Expert Orthogonalization loss flag
         self.use_expert_ortho = False
+
+        # Thread safety lock for EMA updates (multi-worker DataLoader)
+        self._ema_lock = threading.Lock()
 
     def _compute_dispatch_combine(
         self, x: torch.Tensor

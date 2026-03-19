@@ -122,7 +122,7 @@ def build_moe_kernel_model(device: str) -> tuple:
 
     # Load trained checkpoint if available
     if CHECKPOINT_PATH.exists():
-        ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
         model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
         notes = "Loaded trained checkpoint (best.pt)"
     else:
