@@ -124,6 +124,12 @@ class CliffordAlgebra(nn.Module):
         Note: arithmetic is always done in float32 to prevent fp16 overflow
         from the dim×dim outer product (Cl(p,q,r) dim=16 for p+q+r=4).
         """
+        # Валидация размерностей входных тензоров
+        if a.shape[-1] != self.dim:
+            raise ValueError(f"Expected a.shape[-1] == {self.dim}, got {a.shape[-1]}")
+        if b.shape[-1] != self.dim:
+            raise ValueError(f"Expected b.shape[-1] == {self.dim}, got {b.shape[-1]}")
+
         D = self.dim
         device = a.device
         signs = self.cayley_signs      # (D, D)

@@ -604,3 +604,168 @@ class TestRegisterExpert:
 
         # Restore original
         EXPERT_REGISTRY["math"] = original
+    
+    
+    # ============================================================
+    # MoE Interface and Adapter Tests
+    # ============================================================
+    
+    class TestMoERouterInterface:
+        """Tests for MoERouter abstract interface."""
+    
+        def test_moe_kernel_adapter_implements_interface(self):
+            """MoEKernelAdapter must inherit from MoERouter."""
+            from src.core.moe_interface import MoERouter
+            from src.core.moe_kernel_adapter import MoEKernelAdapter
+    
+            assert issubclass(MoEKernelAdapter, MoERouter)
+    
+        def test_soft_moe_router_implements_interface(self):
+            """SoftMoERouter must inherit from MoERouter."""
+            from src.core.moe_interface import MoERouter
+            from src.core.soft_moe_router import SoftMoERouter
+    
+            assert issubclass(SoftMoERouter, MoERouter)
+    
+        def test_adapter_forward_returns_tuple(self, config):
+            """MoEKernelAdapter.forward() must return (Tensor, Dict)."""
+            from src.core.moe_kernel_adapter import MoEKernelAdapter
+    
+            kernel = MoEKernel(config)
+            adapter = MoEKernelAdapter(kernel)
+            adapter.eval()
+    
+            x = torch.randn(2, config.input_dim)
+            output, info = adapter(x)
+    
+            assert isinstance(output, torch.Tensor)
+            assert isinstance(info, dict)
+            assert output.shape == x.shape
+            assert "expert_load" in info
+            assert "router_loss" in info
+    
+        def test_adapter_get_expert_load(self, config):
+            """MoEKernelAdapter.get_expert_load() must return Tensor[num_experts]."""
+            from src.core.moe_kernel_adapter import MoEKernelAdapter
+    
+            kernel = MoEKernel(config)
+            adapter = MoEKernelAdapter(kernel)
+    
+            load = adapter.get_expert_load()
+            assert isinstance(load, torch.Tensor)
+            assert load.shape == (config.num_experts,)
+            # Initial load should be uniform
+            assert torch.allclose(load, torch.ones(config.num_experts) / config.num_experts)
+    
+        def test_adapter_expert_orthogonalization_loss(self, config):
+            """MoEKernelAdapter.expert_orthogonalization_loss() must return scalar."""
+            from src.core.moe_kernel_adapter import MoEKernelAdapter
+    
+            kernel = MoEKernel(config)
+            adapter = MoEKernelAdapter(kernel)
+    
+            loss = adapter.expert_orthogonalization_loss()
+            assert isinstance(loss, torch.Tensor)
+            assert loss.ndim == 0  # scalar
+    
+        def test_adapter_reset_training_state(self, config):
+            """MoEKernelAdapter.reset_training_state() must reset EMA."""
+            from src.core.moe_kernel_adapter import MoEKernelAdapter
+    
+            kernel = MoEKernel(config)
+            adapter = MoEKernelAdapter(kernel)
+    
+            # Modify train_scores
+            kernel.train_scores.fill_(0.5)
+            adapter.reset_training_state()
+    
+            # Should be uniform again
+            expected = torch.ones(config.num_experts) / config.num_experts
+            assert torch.allclose(kernel.train_scores, expected)
+    
+        def test_soft_moe_router_get_expert_load(self):
+            """SoftMoERouter.get_expert_load() must return Tensor[num_experts]."""
+            from src.core.soft_moe_router import SoftMoERouter
+    
+            router = SoftMoERouter(
+                input_dim=64,
+                num_experts=4,
+                expert_dim=128,
+            )
+    
+            load = router.get_expert_load()
+            assert isinstance(load, torch.Tensor)
+            assert load.shape == (4,)
+            assert torch.allclose(load, torch.ones(4) / 4)
+    
+        def test_soft_moe_router_reset_training_state(self):
+            """SoftMoERouter.reset_training_state() must reset EMA."""
+            from src.core.soft_moe_router import SoftMoERouter
+    
+            router = SoftMoERouter(
+                input_dim=64,
+                num_experts=4,
+                expert_dim=128,
+            )
+    
+            # Modify train_scores
+            router.train_scores.fill_(0.5)
+            router.reset_training_state()
+    
+            # Should be uniform again
+            expected = torch.ones(4) / 4
+            assert torch.allclose(router.train_scores, expected)
+    
+        def test_adapter_info_dict_contents(self, config):
+            """MoEKernelAdapter forward info dict must contain all required keys."""
+            from src.core.moe_kernel_adapter import MoEKernelAdapter
+    
+            kernel = MoEKernel(config)
+            adapter = MoEKernelAdapter(kernel)
+            adapter.eval()
+    
+            x = torch.randn(2, config.input_dim)
+            _, info = adapter(x)
+    
+            required_keys = [
+                "expert_load",
+                "aux_loss",
+                "router_loss",
+                "z_loss",
+                "ortho_loss",
+                "expert_usage",
+                "routing_entropy",
+                "expert_weights",
+                "expert_names",
+            ]
+    
+            for key in required_keys:
+                assert key in info, f"Missing key: {key}"
+    
+        def test_polymorphic_usage(self, config):
+            """Both MoEKernelAdapter and SoftMoERouter can be used as MoERouter."""
+            from src.core.moe_interface import MoERouter
+            from src.core.moe_kernel_adapter import MoEKernelAdapter
+            from src.core.soft_moe_router import SoftMoERouter
+    
+            kernel = MoEKernel(config)
+            adapter = MoEKernelAdapter(kernel)
+    
+            soft_router = SoftMoERouter(
+                input_dim=config.input_dim,
+                num_experts=config.num_experts,
+                expert_dim=config.expert_hidden_dim,
+            )
+    
+            # Both should be instances of MoERouter
+            assert isinstance(adapter, MoERouter)
+            assert isinstance(soft_router, MoERouter)
+    
+            # Both should work with same input shape
+            x = torch.randn(2, config.input_dim)
+    
+            out1, info1 = adapter(x)
+            out2, info2 = soft_router(x)
+    
+            assert out1.shape == x.shape
+            assert out2.shape == x.shape

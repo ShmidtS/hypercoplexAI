@@ -23,8 +23,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Dict, Tuple
 
+from .moe_interface import MoERouter
 
-class SoftMoERouter(nn.Module):
+
+class SoftMoERouter(MoERouter):
     """
     Soft Mixture of Experts Router.
 
@@ -206,8 +208,9 @@ class SoftMoERouter(nn.Module):
         # Update EMA train scores (для R3 совместимости)
         if self.training:
             with torch.no_grad():
-                expert_load = combine_reshaped.sum(-1).mean(0)  # (num_experts,)
-                self.train_scores.mul_(0.9).add_(0.1 * expert_load)
+                expert_load = combine_reshaped.sum(-1).mean(0) # (num_experts,)
+                # Используем atomic update для thread safety (исправление race condition)
+                self.train_scores = 0.9 * self.train_scores + 0.1 * expert_load
 
                 # Phase 26: Auxiliary-Loss-Free bias update (DeepSeek-V3)
                 if self.use_aux_loss_free:
@@ -292,6 +295,18 @@ class SoftMoERouter(nn.Module):
         loss2 = ((gram2 - I) ** 2).mean()
 
         return (loss1 + loss2) * 0.5
+
+    def get_expert_load(self) -> torch.Tensor:
+        """Return current expert load statistics (EMA train_scores).
+
+        Returns:
+            Tensor[num_experts]: EMA load for each expert
+        """
+        return self.train_scores.clone()
+
+    def reset_training_state(self) -> None:
+        """Reset EMA train_scores to uniform distribution."""
+        self.train_scores.fill_(1.0 / self.num_experts)
 
     def enable_shared_expert(self) -> None:
         """Enable DeepSeek-V3 always-on shared expert."""

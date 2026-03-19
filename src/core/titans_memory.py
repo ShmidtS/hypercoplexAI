@@ -40,22 +40,33 @@ class TitansMemoryModule(nn.Module):
         hidden_dim: размерность проекции для вычисления гейтов α, η, θ
     """
 
-    def __init__(self, key_dim: int, val_dim: int, hidden_dim: int = 64):
+    def __init__(
+        self,
+        key_dim: int,
+        val_dim: int,
+        hidden_dim: int = 64,
+        memory_max_norm: float = 5.0,
+        ttt_lr_scale: float = 0.005,
+    ):
         super().__init__()
         self.key_dim = key_dim
         self.val_dim = val_dim
 
+        # Параметры конфигурации (ранее hardcoded)
+        self.memory_max_norm = memory_max_norm
+        self.ttt_lr_scale = ttt_lr_scale
+
         # Память M реализована как линейный слой (матрица весов)
         self.memory = nn.Linear(key_dim, val_dim, bias=False)
-        nn.init.normal_(self.memory.weight, std=0.01)  # small random init
+        nn.init.normal_(self.memory.weight, std=0.01) # small random init
 
         # Momentum state S (не параметр, а буфер)
         self.register_buffer('momentum_S', torch.zeros(val_dim, key_dim))
 
         # Гейты α (forget), η (momentum), θ (lr) — проекции из входа
-        self.gate_proj = nn.Linear(key_dim + val_dim, 3, bias=True)  # 3 скаляра
+        self.gate_proj = nn.Linear(key_dim + val_dim, 3, bias=True) # 3 скаляра
         nn.init.zeros_(self.gate_proj.weight)
-        nn.init.constant_(self.gate_proj.bias, 0.5)  # начальные значения ~0.5
+        nn.init.constant_(self.gate_proj.bias, 0.5) # начальные значения ~0.5
 
         # Phase 22: gradient-based surprise + adaptive forgetting
         self.use_gradient_surprise: bool = False
@@ -87,6 +98,15 @@ class TitansMemoryModule(nn.Module):
         """Check if memory is frozen."""
         return self._frozen
 
+    # Backward compatibility properties (tests access these)
+    @property
+    def _MEMORY_MAX_NORM(self) -> float:
+        return self.memory_max_norm
+
+    @property
+    def _TTT_LR_SCALE(self) -> float:
+        return self.ttt_lr_scale
+
     # =========================================================================
 
     def retrieve(
@@ -110,11 +130,6 @@ class TitansMemoryModule(nn.Module):
         """High surprise → less forgetting."""
         surprise_norm = torch.sigmoid(surprise - 1.0)  # centered sigmoid
         return base_alpha * (1.0 - 0.5 * surprise_norm)  # 50-100% of base alpha
-
-    # Максимальная норма весов памяти — предотвращает TTT взрыв
-    _MEMORY_MAX_NORM: float = 5.0
-    # Масштаб шага TTT — снижен для стабильности (Phase 19)
-    _TTT_LR_SCALE: float = 0.005
 
     def update(
         self,
@@ -145,11 +160,11 @@ class TitansMemoryModule(nn.Module):
         # Clamp gradient to prevent explosive TTT update
         grad_clamped = grad.detach().clamp(-1.0, 1.0)
         mom_fp32 = self.momentum_S.detach().float()
-        new_momentum = eta * mom_fp32 - self._TTT_LR_SCALE * theta * grad_clamped
+        new_momentum = eta * mom_fp32 - self.ttt_lr_scale * theta * grad_clamped
         # Clamp momentum norm
         momentum_norm = new_momentum.norm()
-        if momentum_norm > self._MEMORY_MAX_NORM:
-            new_momentum = new_momentum * (self._MEMORY_MAX_NORM / (momentum_norm + 1e-8))
+        if momentum_norm > self.memory_max_norm:
+            new_momentum = new_momentum * (self.memory_max_norm / (momentum_norm + 1e-8))
         self.momentum_S.copy_(new_momentum.to(self.momentum_S.dtype))
         # Phase 22: gradient-based surprise + adaptive forgetting
         effective_alpha = alpha

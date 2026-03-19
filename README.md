@@ -4,12 +4,13 @@
 [PyTorch 2.0+](https://pytorch.org/)  
 [Lean4](verify_lean4_numerical.py)
 [Tests](tests/)
-[Status]()
+[![Project Status](https://img.shields.io/badge/status-active-success.svg)](https://github.com/hypercoplex/hdim/issues) • [Contributing](CONTRIBUTING.md)
 
 > **Best Score:** 1.1542 (Phase 26c, epoch 15) — `pair_margin=0.993`, `STS=0.537`
 > **Phase 28:** MoEKernel score=1.0671 | pair_margin=0.9018 | STS=0.5512 (+355% vs SoftMoERouter baseline)
+> **Phase 29:** CliffordInteractionExpert + RAG freeze API + Security fix + Package setup
 > **Numerical validation:** 159/159 Python tests PASS | 168 pytest tests PASS
-> **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + SIMBAL
+> **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + SIMBAL + CliffordInteractionExpert
 
 ---
 
@@ -705,7 +706,7 @@ If you use HDIM in your research, please cite:
   author = {HypercoplexAI Team},
   year = {2026},
   url = {https://github.com/your-org/hypercoplexAI},
-  note = {Phase 28: 159 numerical tests PASS, 168 pytest PASS, MoEKernel score=1.067}
+  note = {Phase 29: CliffordInteractionExpert, RAG freeze API, security fix, package setup}
 }
 ```
 
@@ -717,4 +718,38 @@ TBD
 
 ---
 
-*Last updated: 2026-03-18 | Phase 28 Complete | Research prototype — API may evolve*
+## Phase 29 (2026-03-19) — Architecture Refactoring
+
+### CliffordInteractionExpert
+
+CAN-style expert without GELU on multivectors — preserves geometric structure during domain routing.
+
+```python
+# Key difference: raw multivector processing (no GELU)
+class CliffordInteractionExpert(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 16) multivector
+        return self.clifford_transform(x)  # No GELU activation
+```
+
+### RAG-Compatible Freeze API
+
+TitansMemory.freeze_memory() for deterministic embeddings in RAG pipelines.
+
+```python
+model = build_sbert_hdim_model(config)
+model.freeze_memory()  # Deterministic output for RAG
+```
+
+### Security Fix
+
+torch.load RCE vulnerability patched — weights_only=True enforced.
+
+### Package Setup
+
+- pyproject.toml with CLI entry points
+- SOTA benchmarks integration
+
+---
+
+*Last updated: 2026-03-19 | Phase 29 Complete | Research prototype — API may evolve*

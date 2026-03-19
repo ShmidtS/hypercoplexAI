@@ -185,10 +185,11 @@ class WorkingMemory(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, D] → memory-augmented [B, D]"""
         n = max(int(self.filled.item()), 1)
-        buf_snap = self.buf[:n].detach().clone()     # [N, D]
-        age_snap  = self.buf_age[:n].detach().clone()
-        freq_snap = self.buf_freq[:n].detach().clone()
-        imp_snap  = self.buf_imp[:n].detach().clone()
+        # buf_snap требует clone для градиентного вычисления; остальные - detach only
+        buf_snap = self.buf[:n].detach().clone() # [N, D] — нужен clone для k_proj/v_proj
+        age_snap = self.buf_age[:n].detach()  # read-only metadata
+        freq_snap = self.buf_freq[:n].detach()  # read-only metadata
+        imp_snap = self.buf_imp[:n].detach()  # read-only metadata
 
         q = self.q_proj(x)                           # [B, D]
         k = self.k_proj(buf_snap)                    # [N, D]
