@@ -769,3 +769,154 @@ class TestRegisterExpert:
     
             assert out1.shape == x.shape
             assert out2.shape == x.shape
+        
+        
+        # ============================================================
+        # CAN Experts (CliffordInteractionLayer)
+        # ============================================================
+        
+        class TestCANExperts:
+            """Tests for CAN-style experts using CliffordInteractionLayer."""
+        
+            def test_domain_expert_use_can_flag(self):
+                """DomainExpert with use_can=True uses CliffordInteractionLayer."""
+                expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
+                assert expert.use_can is True
+                assert hasattr(expert, 'interaction')
+                assert not hasattr(expert, 'net') or expert.net is None
+        
+            def test_domain_expert_use_can_false(self):
+                """DomainExpert with use_can=False uses standard FFN."""
+                expert = DomainExpert(input_dim=64, hidden_dim=128, use_can=False)
+                assert expert.use_can is False
+                assert hasattr(expert, 'net')
+        
+            def test_domain_expert_forward_can(self):
+                """Forward pass works with CAN-enabled expert."""
+                expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
+                expert.eval()
+                x = torch.randn(4, 16)
+                out = expert(x)
+                assert out.shape == (4, 16)
+                assert not torch.isnan(out).any()
+        
+            def test_domain_expert_forward_ffn(self):
+                """Forward pass works with standard FFN expert."""
+                expert = DomainExpert(input_dim=64, hidden_dim=128, use_can=False)
+                expert.eval()
+                x = torch.randn(4, 64)
+                out = expert(x)
+                assert out.shape == (4, 64)
+                assert not torch.isnan(out).any()
+        
+            def test_create_expert_with_can(self):
+                """create_expert function supports use_can parameter."""
+                expert = create_expert(
+                    name="custom",
+                    input_dim=16,
+                    hidden_dim=32,
+                    dropout=0.1,
+                    use_can=True,
+                )
+                assert expert.use_can is True
+                assert expert.input_dim == 16
+        
+            def test_moe_kernel_config_use_can_experts(self):
+                """MoEKernelConfig has use_can_experts parameter."""
+                cfg = MoEKernelConfig(
+                    input_dim=16,
+                    expert_hidden_dim=32,
+                    num_experts=2,
+                    use_can_experts=True,
+                )
+                assert cfg.use_can_experts is True
+        
+            def test_moe_kernel_with_can_experts(self):
+                """MoEKernel works with CAN-enabled experts."""
+                cfg = MoEKernelConfig(
+                    input_dim=16,
+                    expert_hidden_dim=32,
+                    num_experts=2,
+                    expert_names=["custom_0", "custom_1"],
+                    use_can_experts=True,
+                )
+                kernel = MoEKernel(cfg)
+                kernel.eval()
+        
+                # Verify experts use CAN
+                for expert in kernel.experts:
+                    assert expert.use_can is True
+        
+                # Forward pass
+                x = torch.randn(8, 16)
+                out, state = kernel(x)
+                assert out.shape == (8, 16)
+                assert not torch.isnan(out).any()
+        
+            def test_moe_kernel_backward_compatibility(self):
+                """MoEKernel with use_can_experts=False uses standard FFN."""
+                cfg = MoEKernelConfig(
+                    input_dim=64,
+                    expert_hidden_dim=128,
+                    num_experts=4,
+                    expert_names=["math", "language", "code", "science"],
+                    use_can_experts=False,
+                )
+                kernel = MoEKernel(cfg)
+                kernel.eval()
+        
+                # Verify experts use FFN
+                for expert in kernel.experts:
+                    assert expert.use_can is False
+        
+                # Forward pass
+                x = torch.randn(8, 64)
+                out, state = kernel(x)
+                assert out.shape == (8, 64)
+                assert not torch.isnan(out).any()
+        
+            def test_can_experts_gradient_flow(self):
+                """Gradients flow correctly through CAN experts."""
+                cfg = MoEKernelConfig(
+                    input_dim=16,
+                    expert_hidden_dim=32,
+                    num_experts=2,
+                    expert_names=["a", "b"],
+                    use_can_experts=True,
+                )
+                kernel = MoEKernel(cfg)
+                kernel.train()
+        
+                x = torch.randn(4, 16, requires_grad=True)
+                out, state = kernel(x)
+                loss = out.mean() + state.total_loss()
+                loss.backward()
+        
+                assert x.grad is not None
+                assert not torch.isnan(x.grad).any()
+        
+            def test_can_experts_with_sequence_input(self):
+                """CAN experts handle sequence input (B, T, D)."""
+                cfg = MoEKernelConfig(
+                    input_dim=16,
+                    expert_hidden_dim=32,
+                    num_experts=2,
+                    expert_names=["a", "b"],
+                    use_can_experts=True,
+                )
+                kernel = MoEKernel(cfg)
+                kernel.eval()
+        
+                # Sequence input: (batch=2, seq=4, dim=16)
+                x = torch.randn(2, 4, 16)
+                out, state = kernel(x)
+                assert out.shape == (2, 4, 16)
+                assert not torch.isnan(out).any()
+        
+            def test_mixed_expert_types_not_supported(self):
+                """Specialized experts (MathExpert, etc.) don't support use_can directly."""
+                # MathExpert, LanguageExpert etc. override net in __init__
+                # so use_can would need explicit support in each class
+                math_expert = MathExpert(input_dim=64, hidden_dim=128)
+                # These specialized experts use FFN by default
+                assert hasattr(math_expert, 'net')

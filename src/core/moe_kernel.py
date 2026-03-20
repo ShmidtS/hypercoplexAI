@@ -42,7 +42,7 @@ class MoEKernelConfig:
     """
     input_dim: int = 128
     expert_hidden_dim: int = 256
-    num_experts: Optional[int] = None  # None -> вычисляется из expert_names
+    num_experts: Optional[int] = None # None -> вычисляется из expert_names
     slots_per_expert: int = 1
     temperature: float = 1.0
     z_loss_weight: float = 0.01
@@ -53,6 +53,7 @@ class MoEKernelConfig:
     aux_lr: float = 0.001
     dropout: float = 0.1
     expert_names: Optional[List[str]] = None
+    use_can_experts: bool = False  # Использовать CliffordInteractionLayer вместо FFN
 
     def __post_init__(self):
         # Если expert_names задан, num_experts вычисляется из него
@@ -102,6 +103,9 @@ class DomainExpert(nn.Module):
     """
     Лёгкий FFN-эксперт с активацией GELU и Dropout.
     Архитектура: Linear(D→H) → GELU → Dropout → Linear(H→D)
+
+    При use_can=True использует CliffordInteractionLayer вместо FFN
+    для геометрических взаимодействий над 16D мультивекторами.
     """
 
     def __init__(
@@ -110,20 +114,32 @@ class DomainExpert(nn.Module):
         hidden_dim: int,
         dropout: float = 0.1,
         name: str = "expert",
+        use_can: bool = False,
     ):
         super().__init__()
         self.name = name
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, input_dim),
-        )
+        self.use_can = use_can
+
+        if use_can:
+            # CAN-style геометрический слой для 16D мультивекторов
+            from src.core.clifford_interaction import CliffordInteractionLayer
+            self.interaction = CliffordInteractionLayer(dim=input_dim, dropout=dropout)
+        else:
+            # Стандартный FFN
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, input_dim),
+            )
         self._init_weights()
 
     def _init_weights(self):
+        """Инициализация весов для FFN-слоёв (не применяется к CAN)."""
+        if self.use_can:
+            return  # CliffordInteractionLayer имеет свою инициализацию
         for module in self.net.modules():
             if isinstance(module, nn.Linear):
                 nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
@@ -133,6 +149,8 @@ class DomainExpert(nn.Module):
                     nn.init.uniform_(module.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_can:
+            return self.interaction(x)
         return self.net(x)
 
 
@@ -252,11 +270,33 @@ def get_registered_expert_names() -> List[str]:
     return list(EXPERT_REGISTRY.keys())
 
 
-def create_expert(name: str, input_dim: int, hidden_dim: int, dropout: float) -> DomainExpert:
-    """Создаёт эксперт по имени домена из реестра. При неизвестном имени — базовый DomainExpert."""
+def create_expert(
+    name: str,
+    input_dim: int,
+    hidden_dim: int,
+    dropout: float,
+    use_can: bool = False,
+) -> DomainExpert:
+    """Создаёт эксперт по имени домена из реестра.
+
+    Args:
+        name: Имя домена (math, language, code, science или кастомный)
+        input_dim: Размерность входа
+        hidden_dim: Размерность скрытого слоя FFN
+        dropout: Dropout rate
+        use_can: Если True, использует CliffordInteractionLayer вместо FFN
+
+    Returns:
+        DomainExpert с FFN или CAN-слоем
+    """
     cls = EXPERT_REGISTRY.get(name, DomainExpert)
     if cls is DomainExpert:
-        return DomainExpert(input_dim, hidden_dim, dropout, name=name)
+        return DomainExpert(input_dim, hidden_dim, dropout, name=name, use_can=use_can)
+    # Для специализированных экспертов (MathExpert, etc.) CAN не поддерживается
+    # без явного переопределения __init__
+    if use_can:
+        # Создаём базовый DomainExpert с CAN для неизвестных доменов
+        return DomainExpert(input_dim, hidden_dim, dropout, name=name, use_can=use_can)
     return cls(input_dim, hidden_dim, dropout)
 
 
@@ -306,8 +346,9 @@ class MoEKernel(nn.Module):
                 input_dim=config.input_dim,
                 hidden_dim=config.expert_hidden_dim,
                 dropout=config.dropout,
+                use_can=config.use_can_experts,
             )
-            for i in range(config.num_experts)  # type: ignore[arg-type]
+            for i in range(config.num_experts) # type: ignore[arg-type]
         ])
 
         # --- Shared Expert (DeepSeek-V3 стиль) ---
