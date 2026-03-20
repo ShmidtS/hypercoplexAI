@@ -107,6 +107,7 @@ def _patch_moe_kernel(
     expert_names: list | None = None,
     z_loss_weight: float = 0.01,
     ortho_loss_weight: float = 0.01,
+    use_can_experts: bool = False,
 ) -> None:
     """Replace pipeline.moe with MoEKernel (wrapped as drop-in) in-place.
 
@@ -168,6 +169,7 @@ def _patch_moe_kernel(
         use_aux_loss_free=True,
         use_expert_ortho=True,
         expert_names=expert_names,
+        use_can_experts=use_can_experts,
     )
 
     class MoEKernelRouterAdapter(nn.Module):

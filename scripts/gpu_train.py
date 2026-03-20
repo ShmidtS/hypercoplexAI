@@ -157,14 +157,17 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
             print(f"  + Freeze bottom {_freeze_frac*100:.0f}% SBERT layers")
         if args.soft_router:
             print("  + SoftMoERouter")
-        if getattr(args, 'moe_kernel', False):
-            _patch_moe_kernel(
-                model.core_model,
-                expert_names=["math", "language", "code", "science"],
-                z_loss_weight=getattr(args, 'lambda_z', 0.01),
-                ortho_loss_weight=getattr(args, 'lambda_expert_ortho', 0.01),
-            )
-            print("  + MoEKernel (domain experts: math/language/code/science)")
+            if getattr(args, 'moe_kernel', False):
+                use_can = getattr(args, 'can_experts', False)
+                _patch_moe_kernel(
+                    model.core_model,
+                    expert_names=["math", "language", "code", "science"],
+                    z_loss_weight=getattr(args, 'lambda_z', 0.01),
+                    ortho_loss_weight=getattr(args, 'lambda_expert_ortho', 0.01),
+                    use_can_experts=use_can,
+                )
+                expert_type = "CAN" if use_can else "FFN"
+                print(f" + MoEKernel ({expert_type} experts: math/language/code/science)")
         return model
 
     if args.soft_router:
@@ -890,6 +893,9 @@ def main() -> None:
                         help="Enable expert orthogonalization loss (arXiv:2505.22323)")
     parser.add_argument("--lambda_expert_ortho", type=float, default=0.0,
                         help="Weight for expert orthogonalization loss (try 0.01-0.05)")
+    # CAN (Clifford Attention Network) experts
+    parser.add_argument("--can_experts", action="store_true", default=False,
+                        help="Use CAN (Clifford Attention Network) experts instead of FFN")
     parser.add_argument("--memory_type", type=str, default="titans",
                         choices=["titans", "hippocampus", "neocortex", "cls", "hbma"],
                         help="Memory module type (default: titans)")
