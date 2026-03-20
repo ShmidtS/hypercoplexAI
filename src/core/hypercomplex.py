@@ -164,6 +164,68 @@ class CliffordAlgebra(nn.Module):
         # in sandwich/geometric_product chains (Cl410: dim=32, max²×32 > fp16).
         return result
 
+    def geometric_product_batch(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """
+        Batch geometric product where b has an extra leading dimension.
+
+        This is optimized for computing multiple geometric products in parallel,
+        e.g., when computing interactions across multiple shifts in CliffordInteractionLayer.
+
+        Args:
+            a: (..., D) — multivector (e.g., (B, T, D))
+            b: (N, ..., D) — N multivectors (e.g., (num_shifts, B, T, D))
+
+        Returns:
+            result: (N, ..., D) — N geometric products
+
+        This avoids a Python loop by broadcasting a to match b's leading dimension
+        and computing all products in a single tensor operation.
+        """
+        # Validate dimensions
+        if a.shape[-1] != self.dim:
+            raise ValueError(f"Expected a.shape[-1] == {self.dim}, got {a.shape[-1]}")
+        if b.shape[-1] != self.dim:
+            raise ValueError(f"Expected b.shape[-1] == {self.dim}, got {b.shape[-1]}")
+
+        D = self.dim
+        device = a.device
+        signs = self.cayley_signs  # (D, D)
+        indices = self.cayley_indices  # (D, D)
+
+        # Upcast to float32 for numerical stability
+        if a.dtype != torch.float32:
+            a = a.float()
+        if b.dtype != torch.float32:
+            b = b.float()
+
+        # a: (..., D), b: (N, ..., D)
+        # We need to compute geometric_product(a, b[i]) for all i
+        # Broadcast a to (N, ..., D)
+        a_broadcast = a.unsqueeze(0)  # (1, ..., D)
+
+        # outer: (N, ..., D, D)
+        outer = a_broadcast.unsqueeze(-1) * b.unsqueeze(-2)  # (N, ..., D, D)
+        weighted = outer * signs  # (N, ..., D, D)
+
+        # Scatter by indices
+        result_shape = b.shape  # (N, ..., D)
+        result = torch.zeros(result_shape, dtype=torch.float32, device=device)
+
+        # Flatten D,D -> D*D for scatter
+        flat_weighted = weighted.reshape(*b.shape[:-1], D * D)  # (N, ..., D*D)
+        flat_indices = indices.reshape(D * D)  # (D*D,)
+        result.scatter_add_(-1, flat_indices.expand(*b.shape[:-1], D * D), flat_weighted)
+
+        # Numerical stability
+        result = torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
+        result = torch.clamp(result, min=-1e3, max=1e3)
+
+        # Learnable metric scaling
+        if self.use_learnable_metric:
+            result = result * self.learnable_metric
+
+        return result
+
     def _build_sign_buffers(self):
         """Precompute involute and reverse sign vectors as buffers."""
         inv_signs = torch.ones(self.dim)
