@@ -23,6 +23,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Phase 2 MSA: Sparse retrieval for SemanticMemory
+from src.core.msa_attention import MSASparseIndex
+
 
 # ---------------------------------------------------------------------------
 # Plugin system — extensible 5th+ subsystem
@@ -723,19 +726,19 @@ class HBMAMemory(nn.Module):
     def __init__(
         self,
         hidden_dim: int,
-        # Working memory
-        wm_capacity: int = 16,
-        # Episodic memory
-        ep_slots: int = 64,
+        # Working memory (Phase 1 MSA: 4x capacity)
+        wm_capacity: int = 64,
+        # Episodic memory (Phase 1 MSA: 4x capacity)
+        ep_slots: int = 256,
         ep_key_dim: int = 32,
         ep_forgetting_rate: float = 0.05,
         ep_surprise_threshold: float = 0.4,
-        # Semantic memory
-        sem_prototypes: int = 64,
+        # Semantic memory (Phase 1 MSA: 4x capacity)
+        sem_prototypes: int = 256,
         sem_ema_momentum: float = 0.995,
         sem_temperature: float = 0.07,
-        # Procedural memory
-        proc_patterns: int = 32,
+        # Procedural memory (Phase 1 MSA: 4x capacity)
+        proc_patterns: int = 128,
         # Shared
         dropout: float = 0.1,
     ) -> None:
