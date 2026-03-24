@@ -24,7 +24,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Phase 2 MSA: Sparse retrieval for SemanticMemory
-from src.core.msa_attention import MSASparseIndex
+# Phase 3 MSA: Overflow buffer for EpisodicMemory
+from src.core.msa_attention import MSASparseIndex, MSAOverflowBuffer
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +252,10 @@ class EpisodicMemory(nn.Module):
         forgetting_rate: float = 0.05,
         surprise_threshold: float = 0.4,
         dropout: float = 0.1,
+ # Phase 3 MSA: Overflow feature flag
+ use_overflow: bool = False,
+ overflow_num_prototypes: int = 1024,
+ overflow_max_hops: int = 3,
     ) -> None:
         super().__init__()
         self.hidden_dim        = hidden_dim
@@ -258,6 +263,7 @@ class EpisodicMemory(nn.Module):
         self.key_dim           = key_dim
         self.forgetting_rate   = forgetting_rate
         self.surprise_threshold = surprise_threshold
+        self.use_overflow = use_overflow
 
         self.key_proj  = nn.Linear(hidden_dim, key_dim, bias=False)
         self.val_proj  = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -278,6 +284,16 @@ class EpisodicMemory(nn.Module):
         self.register_buffer("slot_order",  torch.arange(num_slots))
         self.register_buffer("step",        torch.zeros(1, dtype=torch.long))
         self._salience = SalienceScorer()
+         # Phase 3 MSA: Overflow buffer (disabled by default for backward compat)
+        if use_overflow:
+            self.overflow = MSAOverflowBuffer(
+                dim=hidden_dim,
+                key_dim=key_dim,
+                num_prototypes=overflow_num_prototypes,
+                max_hops=overflow_max_hops,
+            )
+        else:
+            self.overflow = None
 
     def _surprise(self, query_k: torch.Tensor) -> torch.Tensor:
         keys_norm  = F.normalize(self.mem_keys.detach(), dim=-1)
@@ -306,6 +322,14 @@ class EpisodicMemory(nn.Module):
 
         # LRU write target
         lru_slot = self.mem_age.argmax().item()
+        # Phase 3 MSA: Store evicted slot in overflow buffer
+        if self.overflow is not None and self.overflow.is_enabled():
+            # Store the evicted slot before overwriting
+            self.overflow.store(
+                self.mem_keys[lru_slot].detach(),
+                self.mem_vals[lru_slot].detach(),
+                self.mem_conf[lru_slot].detach(),
+            )
         best_idx = (surprise * write_mask.float()).argmax().item()
 
         self.mem_keys[lru_slot].copy_((1 - wr) * self.mem_keys[lru_slot] + wr * keys[best_idx])
@@ -340,6 +364,17 @@ class EpisodicMemory(nn.Module):
         attn = F.softmax(sal, dim=-1)
         retrieved = attn @ vals_snap
 
+        # Phase 3 MSA: Memory Interleave for overflow retrieval
+        if self.overflow is not None and self.overflow.is_enabled():
+            # Use confidence as primary result quality indicator
+            primary_conf = (attn * conf_snap.unsqueeze(0)).sum(dim=-1)  # [B]
+            retrieved, used_overflow = self.overflow.retrieve_with_interleave(
+                query=x,
+                primary_result=retrieved,
+                primary_confidence=primary_conf,
+                threshold=0.5,
+            )
+
         combined = torch.cat([x, retrieved], dim=-1)
         gate_val = torch.sigmoid(self.gate(combined))
         blended  = gate_val * retrieved + (1 - gate_val) * x
@@ -359,6 +394,8 @@ class EpisodicMemory(nn.Module):
         self.mem_imp.fill_(0.5)
         self.slot_order.copy_(torch.arange(self.num_slots))
         self.step.zero_()
+        if self.use_overflow:
+            self.overflow.clear()
 
 
 # ---------------------------------------------------------------------------

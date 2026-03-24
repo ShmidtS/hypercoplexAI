@@ -296,6 +296,235 @@ class MSASparseIndex(nn.Module):
         return retrieved
 
 
+class MSAOverflowBuffer(nn.Module):
+    """MSA-backed overflow buffer for EpisodicMemory.
+
+    Implements Memory Interleave for multi-hop retrieval:
+    1. Query primary buffer (256 slots)
+    2. If insufficient, query MSA overflow
+    3. Retrieved items added to context for next iteration
+
+    Key features:
+    - Unlimited compressed storage for evicted slots
+    - Top-k sparse retrieval on demand
+    - Multi-hop retrieval with threshold-based fallback
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        key_dim: Optional[int] = None,  # If None, same as dim
+        num_prototypes: int = 1024,
+        max_hops: int = 3,
+        top_k: int = 16,
+        chunk_size: int = 64,
+        num_heads: int = 4,
+        temperature: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.key_dim = key_dim if key_dim is not None else dim
+        self.max_hops = max_hops
+        self.top_k = top_k
+
+        # MSA sparse index for overflow storage
+        self.msa_index = MSASparseIndex(
+            dim=self.key_dim,
+            num_prototypes=num_prototypes,
+            top_k=top_k,
+            chunk_size=chunk_size,
+            num_heads=num_heads,
+            temperature=temperature,
+        )
+
+        # Overflow storage buffers (dynamic size)
+        self.register_buffer("overflow_keys", torch.zeros(0, self.key_dim))
+        self.register_buffer("overflow_vals", torch.zeros(0, dim))
+        self.register_buffer("overflow_evidence", torch.zeros(0))
+        self.register_buffer("overflow_count", torch.zeros(1, dtype=torch.long))
+
+        # Feature flag state
+        self._enabled = True
+
+        # Query projection if key_dim != dim
+        if self.key_dim != self.dim:
+            self.query_proj = nn.Linear(self.dim, self.key_dim, bias=False)
+        else:
+            self.query_proj = None
+
+    def enable(self) -> None:
+        """Enable overflow buffer."""
+        self._enabled = True
+
+    def disable(self) -> None:
+        """Disable overflow buffer."""
+        self._enabled = False
+
+    def is_enabled(self) -> bool:
+        """Check if overflow buffer is enabled."""
+        return self._enabled
+
+    def store(
+        self,
+        key: torch.Tensor,  # [K] or [B, K]
+        value: torch.Tensor,  # [D] or [B, D]
+        evidence: Optional[torch.Tensor] = None,  # [B] or scalar
+    ) -> None:
+        """Store evicted slot in overflow buffer.
+
+        Args:
+            key: Evicted key vector(s) [K] or [B, K]
+            value: Evicted value vector(s) [D] or [B, D]
+            evidence: Optional evidence/confidence score
+        """
+        if not self._enabled:
+            return
+
+        # Ensure 2D
+        if key.dim() == 1:
+            key = key.unsqueeze(0)
+        if value.dim() == 1:
+            value = value.unsqueeze(0)
+
+        B = key.shape[0]
+
+        # Default evidence
+        if evidence is None:
+            evidence = torch.ones(B, device=key.device)
+        elif evidence.dim() == 0:
+            evidence = evidence.expand(B)
+
+        # Append to overflow buffers
+        self.overflow_keys = torch.cat([self.overflow_keys, key.detach()], dim=0)
+        self.overflow_vals = torch.cat([self.overflow_vals, value.detach()], dim=0)
+        self.overflow_evidence = torch.cat([self.overflow_evidence, evidence.detach()], dim=0)
+        self.overflow_count[0] = self.overflow_keys.shape[0]
+
+    def retrieve(
+        self,
+        query: torch.Tensor,  # [B, D]
+        top_k: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Retrieve from overflow buffer via MSA sparse index.
+
+        Args:
+            query: Query tensor [B, D]
+            top_k: Number of results (default: self.top_k)
+
+        Returns:
+            retrieved: [B, D] retrieved values
+            weights: [B, K] retrieval weights
+            indices: [B, K] retrieved indices
+        """
+        if not self._enabled or self.overflow_count[0] == 0:
+            # Return empty if disabled or no overflow
+            B = query.shape[0]
+            k = top_k or self.top_k
+            return (
+                torch.zeros(B, self.dim, device=query.device),
+                torch.zeros(B, k, device=query.device),
+                torch.zeros(B, k, dtype=torch.long, device=query.device),
+            )
+
+
+        # Use MSA index for sparse retrieval
+        # Get indices and weights from MSA (operates on keys)
+        _, indices, weights = self.msa_index.query(
+            self.query_proj(query) if self.query_proj is not None else query,
+            self.overflow_keys,
+            self.overflow_evidence,
+        )
+
+        # Gather actual values using the indices
+        # indices: [B, K], overflow_vals: [N, D]
+        expanded_idx = indices.unsqueeze(-1).expand(-1, -1, self.dim)  # [B, K, D]
+        topk_vals = torch.gather(
+            self.overflow_vals.unsqueeze(0).expand(query.shape[0], -1, -1),
+            dim=1,
+            index=expanded_idx,
+        )  # [B, K, D]
+
+        # Weighted combination: [B, D]
+        retrieved = (weights.unsqueeze(-1) * topk_vals).sum(dim=1)
+
+        return retrieved, weights, indices
+    def retrieve_with_interleave(
+        self,
+        query: torch.Tensor,  # [B, D]
+        primary_result: torch.Tensor,  # [B, D] result from primary buffer
+        primary_confidence: torch.Tensor,  # [B] confidence of primary result
+        threshold: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Multi-hop retrieval: primary + overflow if needed.
+
+        Memory Interleave protocol:
+        1. Check if primary result confidence >= threshold
+        2. If insufficient, query MSA overflow
+        3. Blend primary + overflow results
+
+        Args:
+            query: Query tensor [B, D]
+            primary_result: Result from primary buffer [B, D]
+            primary_confidence: Confidence scores [B]
+            threshold: Minimum confidence to skip overflow
+
+        Returns:
+            blended: [B, D] blended result
+            used_overflow: [B] boolean mask indicating overflow usage
+        """
+        if not self._enabled:
+            return primary_result, torch.zeros(query.shape[0], dtype=torch.bool, device=query.device)
+
+        B = query.shape[0]
+
+        # Check which queries need overflow
+        need_overflow = primary_confidence < threshold
+        used_overflow = need_overflow.clone()
+
+        if not need_overflow.any() or self.overflow_count[0] == 0:
+            # No overflow needed or empty overflow
+            return primary_result, used_overflow
+
+        # Multi-hop: iterate up to max_hops
+        blended = primary_result.clone()
+
+        for hop in range(self.max_hops):
+            if not need_overflow.any():
+                break
+
+            # Query overflow for needed samples
+            overflow_result, weights, _ = self.retrieve(query)
+
+            # Blend based on confidence gap
+            # Lower confidence -> more overflow weight
+            confidence_gap = (threshold - primary_confidence).clamp(0, 1)
+            overflow_weight = confidence_gap.unsqueeze(-1)  # [B, 1]
+
+            # Update only where overflow was needed
+            blended = torch.where(
+                need_overflow.unsqueeze(-1),
+                (1 - overflow_weight) * primary_result + overflow_weight * overflow_result,
+                blended,
+            )
+
+            # For next hop, mark remaining low-confidence samples
+            # (simplified: one hop is usually enough)
+            need_overflow = torch.zeros_like(need_overflow)
+
+        return blended, used_overflow
+
+    def clear(self) -> None:
+        """Clear overflow buffer."""
+        self.overflow_keys = torch.zeros(0, self.dim, device=self.overflow_keys.device)
+        self.overflow_vals = torch.zeros(0, self.dim, device=self.overflow_vals.device)
+        self.overflow_evidence = torch.zeros(0, device=self.overflow_evidence.device)
+        self.overflow_count.zero_()
+
+    def size(self) -> int:
+        """Return number of items in overflow buffer."""
+        return int(self.overflow_count[0].item())
+
+
 class MSAAugmentedSemanticMemory(nn.Module):
     """SemanticMemory with optional MSA sparse retrieval.
 

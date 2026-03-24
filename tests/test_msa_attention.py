@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from src.core.msa_attention import (
+    MSAOverflowBuffer,
     MSAConfig,
     MSASparseIndex,
     MSAAugmentedSemanticMemory,
@@ -408,3 +409,196 @@ class TestMSAEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+from src.core.hbma_memory import EpisodicMemory
+
+
+class TestMSAOverflowBuffer:
+    """Test suite for MSAOverflowBuffer."""
+
+    @pytest.fixture
+    def overflow_buffer(self):
+        """Create default overflow buffer for testing."""
+        return MSAOverflowBuffer(
+            dim=64,
+            key_dim=32,
+            num_prototypes=128,
+            top_k=8,
+            max_hops=3,
+        )
+
+    @pytest.fixture
+    def batch_data(self):
+        """Generate test batch data."""
+        B, key_dim, val_dim = 4, 32, 64
+        keys = torch.randn(B, key_dim)
+        values = torch.randn(B, val_dim)
+        evidence = torch.rand(B)
+        return keys, values, evidence
+
+    def test_initialization(self, overflow_buffer):
+        """Test that overflow buffer initializes correctly."""
+        assert overflow_buffer.dim == 64
+        assert overflow_buffer.key_dim == 32
+        assert overflow_buffer.max_hops == 3
+        assert overflow_buffer.top_k == 8
+        assert overflow_buffer.is_enabled()
+
+    def test_store_single_item(self, overflow_buffer):
+        """Test storing a single item in overflow buffer."""
+        key = torch.randn(32)
+        value = torch.randn(64)
+
+        overflow_buffer.store(key, value)
+
+        assert overflow_buffer.size() == 1
+        assert overflow_buffer.overflow_keys.shape == (1, 32)
+        assert overflow_buffer.overflow_vals.shape == (1, 64)
+
+    def test_store_batch(self, overflow_buffer, batch_data):
+        """Test storing a batch of items."""
+        keys, values, evidence = batch_data
+        B = keys.shape[0]
+
+        overflow_buffer.store(keys, values, evidence)
+
+        assert overflow_buffer.size() == B
+        assert overflow_buffer.overflow_keys.shape == (B, 32)
+        assert overflow_buffer.overflow_vals.shape == (B, 64)
+
+    def test_retrieve_from_empty(self, overflow_buffer):
+        """Test retrieval from empty buffer returns zeros."""
+        query = torch.randn(2, 64)
+
+        retrieved, weights, indices = overflow_buffer.retrieve(query)
+
+        assert retrieved.shape == (2, 64)
+        assert weights.shape == (2, 8)
+        assert indices.shape == (2, 8)
+        assert torch.allclose(retrieved, torch.zeros_like(retrieved))
+
+    def test_retrieve_after_store(self, overflow_buffer):
+        """Test retrieval after storing items."""
+        for _ in range(10):
+            key = torch.randn(32)
+            value = torch.randn(64)
+            overflow_buffer.store(key, value)
+
+        query = torch.randn(2, 64)
+        retrieved, weights, indices = overflow_buffer.retrieve(query)
+
+        assert retrieved.shape == (2, 64)
+        assert weights.shape == (2, 8)
+
+    def test_enable_disable(self, overflow_buffer):
+        """Test enable/disable functionality."""
+        assert overflow_buffer.is_enabled()
+
+        overflow_buffer.disable()
+        assert not overflow_buffer.is_enabled()
+
+        key = torch.randn(32)
+        value = torch.randn(64)
+        overflow_buffer.store(key, value)
+        assert overflow_buffer.size() == 0
+
+        overflow_buffer.enable()
+        assert overflow_buffer.is_enabled()
+
+    def test_clear(self, overflow_buffer):
+        """Test clearing the overflow buffer."""
+        for _ in range(5):
+            key = torch.randn(32)
+            value = torch.randn(64)
+            overflow_buffer.store(key, value)
+
+        assert overflow_buffer.size() == 5
+
+        overflow_buffer.clear()
+        assert overflow_buffer.size() == 0
+
+    def test_backward_compatibility_default_params(self):
+        """Test that default parameters work (backward compat)."""
+        buffer = MSAOverflowBuffer(dim=64)
+        assert buffer.dim == 64
+        assert buffer.key_dim == 64
+
+        key = torch.randn(64)
+        value = torch.randn(64)
+        buffer.store(key, value)
+        assert buffer.size() == 1
+
+
+class TestEpisodicMemoryOverflow:
+    """Test suite for EpisodicMemory with overflow integration."""
+
+    @pytest.fixture
+    def episodic_with_overflow(self):
+        """Create EpisodicMemory with overflow enabled."""
+        return EpisodicMemory(
+            hidden_dim=64,
+            num_slots=32,
+            key_dim=32,
+            use_overflow=True,
+            overflow_num_prototypes=128,
+        )
+
+    @pytest.fixture
+    def episodic_without_overflow(self):
+        """Create EpisodicMemory without overflow."""
+        return EpisodicMemory(
+            hidden_dim=64,
+            num_slots=32,
+            key_dim=32,
+            use_overflow=False,
+        )
+
+    def test_overflow_disabled_by_default(self):
+        """Test that overflow is disabled by default."""
+        mem = EpisodicMemory(hidden_dim=64, num_slots=32)
+        assert mem.use_overflow is False
+        assert mem.overflow is None
+
+    def test_overflow_enabled_when_requested(self, episodic_with_overflow):
+        """Test that overflow is enabled when requested."""
+        assert episodic_with_overflow.use_overflow is True
+        assert episodic_with_overflow.overflow is not None
+
+    def test_forward_with_overflow(self, episodic_with_overflow):
+        """Test forward pass with overflow enabled."""
+        x = torch.randn(4, 64)
+        out = episodic_with_overflow(x)
+        assert out.shape == x.shape
+
+    def test_forward_without_overflow(self, episodic_without_overflow):
+        """Test forward pass without overflow."""
+        x = torch.randn(4, 64)
+        out = episodic_without_overflow(x)
+        assert out.shape == x.shape
+
+    def test_overflow_stores_evicted_slots(self, episodic_with_overflow):
+        """Test that overflow stores evicted slots."""
+        mem = episodic_with_overflow
+        mem.train()
+
+        for _ in range(100):
+            x = torch.randn(2, 64)
+            _ = mem(x)
+
+        assert mem.overflow.size() > 0
+
+    def test_reset_clears_overflow(self, episodic_with_overflow):
+        """Test that reset clears overflow buffer."""
+        mem = episodic_with_overflow
+        mem.train()
+
+        for _ in range(50):
+            x = torch.randn(2, 64)
+            _ = mem(x)
+
+        initial_size = mem.overflow.size()
+        assert initial_size > 0
+
+        mem.reset()
+        assert mem.overflow.size() == 0
+
