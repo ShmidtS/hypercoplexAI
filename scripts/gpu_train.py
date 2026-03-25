@@ -391,20 +391,28 @@ def run_gpu_training(
     print(f"Model parameters: {total_params:,}")
 
     # Build param groups: separate LR for unfrozen SBERT layers
+    # Note: _sbert is stored via object.__setattr__ (not in nn.Module registry),
+    # so we need to access it directly with object.__getattribute__
     _unfreeze_str = getattr(args, 'unfreeze_sbert_layers', None)
     _freeze_frac = getattr(args, 'freeze_sbert_bottom_frac', None)
     _sbert_lr = getattr(args, 'sbert_lr', 1e-5)
-    _has_sbert = hasattr(model, 'text_encoder') and hasattr(model.text_encoder, '_sbert')
-    if _has_sbert and (_unfreeze_str or _freeze_frac is not None):
-        sbert_params = []
-        other_params = []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if 'text_encoder._sbert' in name:
-                sbert_params.append(param)
-            else:
-                other_params.append(param)
+
+    # Get SBERT encoder (stored outside nn.Module registry)
+    _sbert_encoder = None
+    if hasattr(model, 'text_encoder'):
+        try:
+            _sbert_encoder = object.__getattribute__(model.text_encoder, '_sbert')
+        except AttributeError:
+            pass
+
+    if _sbert_encoder is not None and (_unfreeze_str or _freeze_frac is not None):
+        sbert_params = [p for p in _sbert_encoder.parameters() if p.requires_grad]
+        other_params = [p for n, p in model.named_parameters() if p.requires_grad]
+
+        # Remove SBERT params from other_params to avoid duplicates
+        sbert_param_ids = {id(p) for p in sbert_params}
+        other_params = [p for p in other_params if id(p) not in sbert_param_ids]
+
         wd = getattr(args, 'weight_decay', 1e-4)
         param_groups = [
             {'params': other_params, 'lr': args.lr, 'weight_decay': wd},
@@ -541,14 +549,18 @@ def run_gpu_training(
 
     # HDIM_NUM_WORKERS=0 отключает workers (используется auto_tune для экономии RAM)
     import os as _os
+    import platform as _platform
     _nw_env = _os.environ.get("HDIM_NUM_WORKERS")
     if _nw_env is not None:
         _num_workers = int(_nw_env)
     else:
-        _num_workers = min(4, _os.cpu_count() or 1) if device.type == "cuda" else 0
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
-    metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=(device.type == "cuda"), num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+        if _platform.system() == "Windows":
+            _num_workers = 0
+        else:
+            _num_workers = min(4, _os.cpu_count() or 1) if device.type == "cuda" else 0
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=False, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=False, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+    metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=False, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
     print(f"DataLoader: num_workers={_num_workers}, pin_memory={device.type == chr(99)+chr(117)+chr(100)+chr(97)}")
 
     print(f"Dataset: {len(train_ds)} train / {len(val_ds)} val")

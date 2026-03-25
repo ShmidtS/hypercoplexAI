@@ -112,6 +112,8 @@ class HDIMConfig:
     memory_type: str = "titans"  # titans | hippocampus | neocortex | cls | hbma
     domain_names: Optional[List[str]] = None
     expert_names: Optional[List[str]] = None  # New field for dynamic expert names
+    use_msa: bool = False  # Phase 29: MSA sparse index for SemanticMemory
+    use_overflow: bool = False  # Phase 29: MSA overflow buffer for EpisodicMemory
     text: HDIMTextConfig = field(default_factory=HDIMTextConfig)
 
     def __post_init__(self):

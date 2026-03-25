@@ -62,7 +62,7 @@ class SBERTEncoder(nn.Module):
                 param.requires_grad = False
             # Partial unfreezing: re-enable specific layers
             # Also needs registry when freeze_bottom_frac will unfreeze some params
-            _needs_registry = bool(self.unfreeze_layers) or (freeze_bottom_frac is not None and 0.0 < freeze_bottom_frac < 1.0)
+            _needs_registry = bool(self.unfreeze_layers) or (freeze_bottom_frac is not None and 0.0 <= freeze_bottom_frac < 1.0)
             if _needs_registry:
                 for name, param in _sbert_model.named_parameters():
                     if any(layer in name for layer in self.unfreeze_layers):
@@ -85,7 +85,7 @@ class SBERTEncoder(nn.Module):
         # freeze_bottom_frac: freeze bottom N% of transformer layers
         # e.g. freeze_bottom_frac=0.5 freezes layers 0..N//2-1, unfreezes N//2..N-1
         self.freeze_bottom_frac = freeze_bottom_frac
-        if freeze_bottom_frac is not None and 0.0 < freeze_bottom_frac < 1.0:
+        if freeze_bottom_frac is not None and 0.0 <= freeze_bottom_frac < 1.0:
             self._freeze_bottom_layers(_sbert_model, freeze_bottom_frac)
 
         # Trainable projection SBERT_DIM → output_dim (simple MLP, Phase 9 рекорд)
