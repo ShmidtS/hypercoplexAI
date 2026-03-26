@@ -26,26 +26,26 @@ class HDIMTrainer:
         model: HDIMModel,
         optimizer: Optimizer,
         device: str | torch.device = "cpu",
-        lambda_iso: float = 0.1,
-        lambda_routing: float = 0.05,
-        lambda_pair: float = 0.1,
-        lambda_memory: float = 0.05,
+        lambda_iso: float = 0.0,  # DISABLED: conflicts with pair_loss, suppresses margin
+        lambda_routing: float = 0.05,  # MoE load balance (SoftMoERouter aux loss)
+        lambda_pair: float = 0.4,  # InfoNCE contrastive (optimal from Run 18)
+        lambda_memory: float = 0.05,  # memory regularization (EMA stability)
         negative_margin: float = 1.0,
         ranking_margin: float = 0.2,
         use_infonce: bool = True,
         infonce_temperature: float = 0.15,
-        lambda_sts: float = 0.0,
+        lambda_sts: float = 0.0,  # DISABLED: duplicates InfoNCE semantics
         lambda_angle: float = 0.0,
         lambda_supcon: float = 0.0,
-        lambda_z: float = 0.0,
-        lambda_expert_ortho: float = 0.0,
+        lambda_z: float = 0.01,  # MoE z-loss (prevents router collapse)
+        lambda_expert_ortho: float = 0.01,  # expert orthogonalization (Phase 26)
         learnable_temperature: bool = False,
         lambda_dcl: float = 0.0,
         lambda_uniformity: float = 0.0,
-        lambda_diversity_var: float = 0.01,
-        lambda_diversity_ortho: float = 0.005,
+        lambda_diversity_var: float = 0.0,  # DISABLED: destroys contrastive clusters
+        lambda_diversity_ortho: float = 0.0,  # DISABLED: conflicts with pair_loss
         use_sc_temperature: bool = False,
-        lambda_matryoshka: float = 0.1,
+        lambda_matryoshka: float = 0.1,  # multi-scale embedding loss (optional)
         # Temperature scheduling parameters (exposed for configurability)
         temp_schedule: str = "none",
         tau_max: float = 0.1,
@@ -1137,7 +1137,7 @@ class HDIMTrainer:
             + self.lambda_memory * loss_memory
             + self.lambda_sts * loss_sts
             + self.lambda_z * loss_z
-            + loss_diversity
+            + (self.lambda_diversity_var + self.lambda_diversity_ortho) * loss_diversity  # disabled when 0
             + self.lambda_matryoshka * loss_matryoshka
             + self.lambda_expert_ortho * loss_expert_ortho
         )

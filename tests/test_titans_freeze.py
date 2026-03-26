@@ -87,3 +87,83 @@ class TestRetrieveOnly:
             key = torch.randn(batch_size, 32)
             retrieved = memory_module.retrieve_only(key)
             assert retrieved.shape == (batch_size, 64)
+
+
+class TestFreezeMemory:
+    """Тесты freeze/unfreeze API."""
+
+    def test_freeze_memory_disables_grad(self, memory_module):
+        """freeze_memory отключает requires_grad для весов памяти."""
+        assert memory_module.memory.weight.requires_grad is True
+        assert memory_module.is_frozen() is False
+
+        memory_module.freeze_memory()
+
+        assert memory_module.memory.weight.requires_grad is False
+        assert memory_module.is_frozen() is True
+
+    def test_unfreeze_memory_enables_grad(self, memory_module):
+        """unfreeze_memory восстанавливает requires_grad."""
+        memory_module.freeze_memory()
+        assert memory_module.memory.weight.requires_grad is False
+
+        memory_module.unfreeze_memory()
+
+        assert memory_module.memory.weight.requires_grad is True
+        assert memory_module.is_frozen() is False
+
+    def test_freeze_prevents_memory_update(self, memory_module):
+        """В frozen режиме forward не обновляет память."""
+        memory_module.freeze_memory()
+        key = torch.randn(2, 32)
+        value = torch.randn(2, 64)
+        initial_weight = memory_module.memory.weight.clone().detach()
+
+        # forward с update_memory=True должен быть проигнорирован
+        _, _ = memory_module(key, value, update_memory=True)
+
+        assert torch.allclose(memory_module.memory.weight, initial_weight)
+
+    def test_freeze_memory_idempotent(self, memory_module):
+        """Повторный freeze не ломает состояние."""
+        memory_module.freeze_memory()
+        memory_module.freeze_memory()  # повторный вызов
+
+        assert memory_module.is_frozen() is True
+        assert memory_module.memory.weight.requires_grad is False
+
+
+class TestDeterminismAfterFreeze:
+    """Проверка детерминизма после freeze."""
+
+    def test_retrieve_only_deterministic(self, memory_module):
+        """retrieve_only даёт одинаковый результат при одинаковых входах."""
+        memory_module.freeze_memory()
+        key = torch.randn(4, 32)
+        torch.manual_seed(42)
+
+        result1 = memory_module.retrieve_only(key)
+        result2 = memory_module.retrieve_only(key)
+
+        assert torch.allclose(result1, result2)
+
+    def test_deterministic_across_multiple_calls(self, memory_module):
+        """Детерминизм сохраняется при множественных вызовах."""
+        memory_module.freeze_memory()
+        key = torch.randn(8, 32)
+
+        results = [memory_module.retrieve_only(key) for _ in range(5)]
+
+        for r in results[1:]:
+            assert torch.allclose(results[0], r)
+
+    def test_forward_frozen_deterministic(self, memory_module):
+        """forward в frozen режиме детерминирован."""
+        memory_module.freeze_memory()
+        key = torch.randn(4, 32)
+        value = torch.randn(4, 64)
+
+        _, loss1 = memory_module(key, value, update_memory=False)
+        _, loss2 = memory_module(key, value, update_memory=False)
+
+        assert torch.allclose(loss1, loss2)

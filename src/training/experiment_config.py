@@ -54,10 +54,10 @@ class ExperimentConfig:
     # ------------------------------------------------------------------ #
     # Phase-2 loss coefficients
     # ------------------------------------------------------------------ #
-    lambda_iso: float = 0.1
-    lambda_pair: float = 0.1
+    lambda_iso: float = 0.0  # DISABLED: conflicts with pair_loss, suppresses margin
+    lambda_pair: float = 0.4  # InfoNCE contrastive (optimal from Run 18)
     lambda_routing: float = 0.05
-    lambda_memory: float = 0.01
+    lambda_memory: float = 0.05  # memory regularization (EMA stability)
 
     # ------------------------------------------------------------------ #
     # Phase-2 training schedule extras
