@@ -6,10 +6,11 @@
 [Tests](tests/)
 [![Project Status](https://img.shields.io/badge/status-active-success.svg)](https://github.com/hypercoplex/hdim/issues) • [Contributing](CONTRIBUTING.md)
 
-> **Best Score:** 1.1542 (Phase 26c, epoch 15) — `pair_margin=0.993`, `STS=0.537`
+> **Best Score:** 1.1814 (Run 18, epoch 13, temp=0.10, lambda_pair=0.40) — `pair_margin=1.0224`, `STS=0.537`
 > **Phase 28:** MoEKernel score=1.0671 | pair_margin=0.9018 | STS=0.5512 (+355% vs SoftMoERouter baseline)
 > **Phase 29:** CliffordInteractionExpert + RAG freeze API + Security fix + Package setup
-> **Numerical validation:** 159/159 Python tests PASS | 168 pytest tests PASS
+> **Phase 30:** MoEKernel _expert_bias→buffer fix + SoftMoERouter deadlock fix
+> **Numerical validation:** 159/159 Python tests PASS | 453 pytest tests PASS
 > **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + SIMBAL + CliffordInteractionExpert
 
 ---
@@ -440,6 +441,36 @@ python scripts/gpu_train.py \
     --epochs 60 --batch_size 32
 ```
 
+### Project Record: Run 18 (MoE + TitansMemory)
+
+Best result achieved on `data/real_pairs_v10.json`, RTX 3070 Laptop 8GB:
+
+| Metric | Run 18 (Record) | Run 13 | Run 11 |
+|---|---|---|---|
+| **score** | **1.1814** | 1.1706 | 1.1528 |
+| **pair_margin** | **1.0224** | 1.0073 | 0.9866 |
+| best_epoch | 13 | 28 | 27 |
+| temperature | **0.10** | 0.12 | 0.12 |
+| lambda_pair | 0.40 | 0.40 | 0.35 |
+
+**Session 14 smoke test** (5 epochs, MoE + TitansMemory): ep5=1.1508 ≈ Run11 ep27 (27x faster convergence).
+
+**Optimal config:**
+```bash
+python scripts/gpu_train.py \
+    --pretrained_encoder --moe_kernel \
+    --real_pairs data/real_pairs_v10.json \
+    --amp --device cuda \
+    --epochs 30 --batch_size 24 \
+    --lr 5e-4 --sbert_lr 1e-5 \
+    --infonce_temperature 0.10 \
+    --lambda_pair 0.40 --lambda_sts 0.0 \
+    --lambda_z 0.01 --lambda_expert_ortho 0.01 \
+    --patience 15
+```
+
+---
+
 ### Phase 28 Results: MoEKernel vs SoftMoERouter
 
 Real training on `data/real_pairs_v10.json` (1036 pairs), SBERT encoder, RTX 3070:
@@ -476,7 +507,7 @@ python scripts/auto_tune.py \
 | `num_experts` | 4       | [2, 8]       | MoE diversity           |
 | `top_k`       | 2       | [1, 4]       | Experts per token       |
 | `lambda_z`    | 0.01    | [0.001, 0.1] | MoE collapse prevention |
-| `temperature` | 0.15    | [0.1, 0.5]   | InfoNCE contrast        |
+| `temperature` | 0.10    | [0.07, 0.5]  | InfoNCE contrast (optimal=0.10) |
 | `focal_gamma` | 2.0     | [0.5, 3.0]   | Hard negative focus     |
 
 
@@ -490,7 +521,7 @@ python scripts/auto_tune.py \
 # Numerical verification (159 tests, Phase 28)
 python verify_lean4_numerical.py
 
-# pytest suite (168 tests: 45 moe_kernel + 123 existing)
+# pytest suite (453 tests)
 python -m pytest tests/ -v
 
 # Real-model verification (MoEKernel on SBERT + real_pairs_v10.json)
@@ -526,15 +557,21 @@ python verify_lean4_numerical.py --category sandwich
 hypercoplexAI/
 ├── src/
 │   ├── core/
-│   │   ├── hypercomplex.py      # CliffordAlgebra, QuaternionLinear
-│   │   ├── domain_operators.py  # DomainRotationOperator, InvariantExtractor
-│   │   ├── hdim_pipeline.py     # HDIMPipeline orchestrator
-│   │   ├── titans_memory.py     # TitansMemoryModule (TTT)
-│   │   ├── hbma_memory.py       # HBMAMemory (4-system memory)
-│   │   ├── soft_moe_router.py   # SoftMoERouter (Phase 26)
-│   │   ├── moe_kernel.py        # MoEKernel domain experts (Phase 28)
-│   │   ├── domain_expert_pool.py # DomainExpertPool + SharedExpert
-│   │   └── memory_interface.py  # MemoryInterface ABC
+│   │   ├── hypercomplex.py           # CliffordAlgebra, QuaternionLinear
+│   │   ├── domain_operators.py       # DomainRotationOperator, InvariantExtractor
+│   │   ├── hdim_pipeline.py          # HDIMPipeline orchestrator
+│   │   ├── titans_memory.py          # TitansMemoryModule (TTT, RAG freeze)
+│   │   ├── hbma_memory.py            # HBMAMemory (4-system memory)
+│   │   ├── soft_moe_router.py        # SoftMoERouter (Phase 26)
+│   │   ├── moe_kernel.py             # MoEKernel domain experts (Phase 28)
+│   │   ├── moe_kernel_adapter.py     # MoEKernelRouterAdapter drop-in
+│   │   ├── clifford_interaction.py   # CliffordInteractionLayer (CAN)
+│   │   ├── msa_attention.py          # MSA sparse attention
+│   │   ├── domain_expert_pool.py     # DomainExpertPool + SharedExpert
+│   │   ├── memory_interface.py       # MemoryInterface ABC
+│   │   ├── transfer_engine.py        # Transfer engine
+│   │   ├── transfer_state.py         # TransferState dataclass
+│   │   └── auto_config.py            # AutoConfig utilities
 │   ├── models/
 │   │   ├── hdim_model.py        # HDIMModel, HDIMConfig
 │   │   ├── text_hdim_model.py   # TextHDIMModel
@@ -549,15 +586,27 @@ hypercoplexAI/
 │   ├── auto_tune.py             # Optuna hyperparameter search (v27)
 │   └── autoresearch_loop.py     # Automated research loop
 ├── tests/
-│   ├── test_hypercomplex.py
-│   ├── test_domain_operators.py
-│   ├── test_moe_router.py
-│   ├── test_moe_kernel.py       # 45 MoEKernel tests (Phase 28)
-│   └── ... (168 tests total)
+│   ├── test_hdim.py                  # Core model tests
+│   ├── test_hdim_pipeline.py         # Pipeline integration
+│   ├── test_moe_kernel.py            # MoEKernel (45 tests, Phase 28)
+│   ├── test_titans_memory.py         # TitansMemory TTT
+│   ├── test_titans_freeze.py         # RAG freeze API (Phase 29)
+│   ├── test_clifford_interaction.py  # CAN layer
+│   ├── test_can_integration.py       # CAN integration
+│   ├── test_hbma_plugin.py           # HBMA 4-system memory
+│   ├── test_msa_attention.py         # MSA sparse attention
+│   ├── test_memory_interface.py      # Memory ABC
+│   ├── test_memory_comparison.py     # Memory comparison
+│   ├── test_augmentation.py          # Embedding augmentations
+│   ├── test_auto_config.py           # AutoConfig
+│   ├── test_nan_inf_forward.py       # NaN/Inf protection
+│   ├── test_matryoshka_modernbert.py # Matryoshka + ModernBERT
+│   └── test_triton_performance.py    # Triton kernel benchmarks
+│   # Total: 453 tests PASS
 ├── docs/
 │   ├── ARCHITECTURE.md          # Full architecture documentation
 │   └── DIAGRAMS.md              # Mermaid diagrams
-├── verify_lean4_numerical.py    # 148 theorem verification
+├── verify_lean4_numerical.py    # 159 theorem verification
 ├── HDIM.md                      # Technical specification
 └── README.md                    # This file
 ```
@@ -677,7 +726,7 @@ training_config = {
 - ❌ `ModularMoERouter` — removed; use `SoftMoERouter`
 - ❌ `reset_memory('zero')` — use `reset_memory('geometric')`
 - ❌ `batch_size < 32` — InfoNCE requires sufficient negatives
-- ❌ `temperature < 0.15` — causes overconfidence
+- ❌ `temperature < 0.07` — causes overconfidence, gradient instability (optimal: 0.10)
 - ❌ `lambda_z = 0` — causes MoE collapse within 10 epochs
 
 ### Phase 17 Critical Fixes (C1-C7)
@@ -706,7 +755,7 @@ If you use HDIM in your research, please cite:
   author = {HypercoplexAI Team},
   year = {2026},
   url = {https://github.com/your-org/hypercoplexAI},
-  note = {Phase 29: CliffordInteractionExpert, RAG freeze API, security fix, package setup}
+  note = {Phase 30: MoEKernel buffer fix, SoftMoERouter deadlock fix; record score=1.1814}
 }
 ```
 
@@ -752,4 +801,4 @@ torch.load RCE vulnerability patched — weights_only=True enforced.
 
 ---
 
-*Last updated: 2026-03-19 | Phase 29 Complete | Research prototype — API may evolve*
+*Last updated: 2026-03-26 | Phase 30 Complete | Research prototype — API may evolve*

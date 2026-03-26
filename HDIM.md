@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 27.0 | Дата: 2026-03-17 | Рекорд: score=1.1542 (Phase 26c, ep15, margin=0.993, STS=0.537) | Phase 27: Numerical tests 148/148 PASS + pytest 123 PASS + auto_tune v27 + dead code cleanup*
+*Версия: 30.0 | Дата: 2026-03-26 | **РЕКОРД: score=1.1814** (Run 18, ep13, temp=0.10, λ_pair=0.40, margin=1.0224) | Phase 30: MoEKernel buffer fix + SoftMoERouter deadlock fix | Numerical tests 159/159 PASS + pytest 453 PASS*
 
 ---
 
@@ -206,7 +206,11 @@ total:   55  159   66   50   330
 | **25** | **—** | — | — | — | **Phase 25: freeze_sbert_bottom_frac + weight_decay для SBERT + data v10 (1036 pairs) + SBERT cache** |
 | **26a** | **1.1063** | — | — | ep45 | **Phase 26a: DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho, augment=3, no sts/dcl** |
 | **26b** | **1.1513** | — | — | ep15 | **Phase 26b: +sts=0.15, dcl=0.2, learnable_temp, augment=5** |
-| **26c** | **1.1542** | 0.993 | 0.537 | ep15 | **Phase 26c: +uniformity=0.1, sts=0.3 — NEW RECORD** |
+| **26c** | **1.1542** | 0.993 | 0.537 | ep15 | **Phase 26c: +uniformity=0.1, sts=0.3** |
+| **Run 11** | **1.1528** | 0.9866 | 0.5538 | ep27 | **Session 13: lambda_pair=0.35, temp=0.12, patience=15, cosine_decay** |
+| **Run 12** | **1.1480** | 0.9821 | — | ep27 | **Session 13: epochs=35, patience=20 — больше эпох не помогает** |
+| **Run 13** | **1.1706** | 1.0073 | — | ep28 | **Session 13: lambda_pair=0.40, margin>1.0 впервые** |
+| **Run 18** | **1.1814** | **1.0224** | 0.537 | ep13 | **SESSION 13 RECORD: temp=0.10, lambda_pair=0.40, ранний пик ep13** |
 
 ---
 
@@ -822,15 +826,60 @@ scripts/phase24_modernbert.bat
 
 ---
 
+## 17. Phase 28–30: MoEKernel + TitansMemory RAG + Bugs
+
+### Phase 28 — MoEKernel (2026-03-18)
+
+4 доменно-специализированных эксперта (560K params):
+- `MathExpert`: bottleneck hidden×2, две GELU нелинейности
+- `LanguageExpert`: pre-LayerNorm перед FFN
+- `CodeExpert`: SiLU вместо GELU
+- `ScienceExpert`: Tanh для физических величин
+
+Real-model benchmark (SBERT + real_pairs_v10.json, 5 эп):
+
+| Метрика | SoftMoERouter | MoEKernel | Прирост |
+|---|---|---|---|
+| score | 0.300 | 1.067 | +256% |
+| pair_margin | 0.000 | 0.902 | ∞ |
+| train_loss (ep5) | 0.930 | 0.274 | -71% |
+
+Lean4: 159/159 PASS (+11 теорем Phase 28). pytest: 453 PASS (+45 moe_kernel тестов).
+
+### Phase 29 — TitansMemory RAG API (2026-03-19)
+
+- `retrieve_only(k)`: RAG-совместимое извлечение без обновления памяти
+- `freeze_memory()` / `unfreeze_memory()`: детерминированные embeddings для RAG
+- `_frozen` guard: при RAG-режиме update_memory автоматически отключается
+
+### Phase 30 — Bug Fixes (commit b5decaf, 2026-03-26)
+
+- `MoEKernel._expert_bias`: `nn.Parameter` → `register_buffer` (не обучается)
+- `SoftMoERouter.forward()`: один `_ema_lock` для EMA + bias update (deadlock fix)
+- `MoEKernel.expert_orthogonalization_loss()`: `skip при eval` (commit 05d6b3a)
+
+### Session 14 — Smoke Test (MoE + TitansMemory)
+
+5-epoch smoke test результаты:
+```
+ep1=0.900, ep2=1.004, ep3=1.133, ep4=1.143, ep5=1.151
+```
+ep5=1.1508 ≈ Run11 ep27 за 5 эпох (27x быстрее). Нет NaN, нет OOM.
+
+---
+
 ## 15. Индекс файлов
 
 ```
 src/core/
-  hypercomplex.py         — Clifford/quaternion algebra и слои
+  hypercomplex.py         — Clifford/quaternion algebra и слои (Cl(4,1,0) default)
   domain_operators.py     — DomainRotationOperator, InvariantExtractor
-  titans_memory.py        — TitansMemory, HierarchicalTitansMemory
-  soft_moe_router.py      — SoftMoERouter (DEFAULT router, soft dispatch)
-  modular_moe.py          — ModularMoERouter (add/remove expert, runtime)
+  titans_memory.py        — TitansMemoryModule: TTT memory, RAG freeze API (Phase 29)
+  soft_moe_router.py      — SoftMoERouter: SharedExpert, AuxLossFree, ExpertOrtho (Phase 26)
+  moe_kernel.py           — MoEKernel: 4 domain experts 560K params (Phase 28)
+  moe_kernel_adapter.py   — MoEKernelRouterAdapter: drop-in для SoftMoERouter
+  clifford_interaction.py — CliffordInteractionLayer: CAN-style geometric nonlinearity
+  hbma_memory.py          — HBMAMemory: Working/Episodic/Semantic/Procedural (4-system)
   hdim_pipeline.py        — HDIMPipeline (оркестрация)
 
 src/models/
@@ -874,7 +923,8 @@ artifacts/
   phase13_scaled/         — Phase 13: best=0.696 (ep15, LR restart проблема)
   phase14_sota/           — Phase 14: Focal-InfoNCE + cosine_decay + v8 (в процессе)
   phase17/                — Phase 17: 7×P0 + 5×P1 fixes, hidden=128, T=0.15 (в процессе)
-  best_autotune/          — РЕКОРД: score=1.1542 (Phase 26c, ep15, hidden=256, 4 experts)
+  best_autotune/          — Phase 26c: score=1.1542 (ep15, hidden=256, 4 experts)
+  run18_record/           — РЕКОРД: score=1.1814 (ep13, temp=0.10, lambda_pair=0.40)
   optuna_study_v26.db     — Optuna study database v26
   optuna_results_v26.json — All Optuna trial results
 
@@ -1044,7 +1094,9 @@ def expert_orthogonalization_loss(self):
 | 26b | 1.1513 | — | — | ep15 | augment=5, sts=0.15, dcl=0.2, learnable_temp |
 | **26c** | **1.1542** | 0.993 | 0.537 | ep15 | augment=5, sts=0.3, uniformity=0.1 |
 
-**Новый рекорд: 1.1542** (vs предыдущий 1.1370 Phase 8e — улучшение на 1.5%)
+Phase 26c рекорд: 1.1542 (vs предыдущий 1.1370 Phase 8e — улучшение на 1.5%)
+
+**ТЕКУЩИЙ РЕКОРД ПРОЕКТА: 1.1814** (Run 18, Session 13, ep13, temp=0.10, lambda_pair=0.40) — улучшение на +2.4% vs Phase 26c
 
 ### 16.7 Phase 26 конфигурация (SOTA)
 

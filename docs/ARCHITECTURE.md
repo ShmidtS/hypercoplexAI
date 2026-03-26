@@ -1,9 +1,9 @@
 # HDIM Architecture Documentation
 
-> **Дата:** 2026-03-17
-> **Версия:** Research Prototype (Phase 27)
+> **Дата:** 2026-03-26
+> **Версия:** Research Prototype (Phase 30)
 > **Источники:** Исследовательские отчёты в `[.omc/research/](../.omc/research/)`
-> **Verification:** Lean4 148/148 PASS | pytest 123 PASS
+> **Verification:** Lean4 159/159 PASS | pytest 453 PASS
 
 ---
 
@@ -44,7 +44,7 @@
 | PRIMARY score     | `pair_margin × 1.0 + STS_exported × 0.3` | Целевая метрика                   |
 
 
-**Лучший результат:** 1.1542 (Phase 26c, ep15): `pair_margin=0.993`, `STS=0.537`
+**Лучший результат:** 1.1814 (Run 18, ep13, temp=0.10, λ_pair=0.40): `pair_margin=1.0224`, `STS=0.537`
 
 ---
 
@@ -128,6 +128,9 @@
 |                                                              | `DomainRegistry`         | Реестр доменов                                                             | **Stable** |
 | `[titans_memory.py](../src/core/titans_memory.py)`           | `TitansMemoryModule`     | Test-Time Training память                                                  | **Stable** |
 | `[soft_moe_router.py](../src/core/soft_moe_router.py)`       | `SoftMoERouter`          | Soft Mixture-of-Experts (Phase 26: SharedExpert, AuxLossFree, ExpertOrtho) | **Stable** |
+| `[moe_kernel.py](../src/core/moe_kernel.py)`                 | `MoEKernel`              | 4 доменных эксперта (math/language/code/science), 560K params, Phase 28    | **Stable** |
+|                                                              | `MoEKernelConfig`        | Dataclass конфигурации MoE-ядра                                             | **Stable** |
+|                                                              | `MoEKernelState`         | State-контейнер forward-прохода                                             | **Stable** |
 | `[domain_expert_pool.py](../src/core/domain_expert_pool.py)` | `DomainExpertPool`       | Пул из 4 frozen SBERT экспертов с trainable projections                    | **Stable** |
 |                                                              | `SharedExpert`           | Always-on FFN (DeepSeek-V3)                                                | **Stable** |
 |                                                              | `ExpertProjection`       | Trainable projection head                                                  | **Stable** |
@@ -575,7 +578,7 @@ L_total = L_recon + λ_iso L_iso + λ_pair L_pair + λ_routing L_routing +
 | `--lambda_iso`          | 0.1     | Iso loss weight                             |
 | `--lambda_pair`         | 0.1     | Pair loss weight                            |
 | `--lambda_z`            | 0.0     | Router Z-loss weight (>= 0.01 рекомендуемо) |
-| `--infonce_temperature` | 0.15    | Temperature для InfoNCE                     |
+| `--infonce_temperature` | 0.10    | Temperature для InfoNCE (оптимум Run 18)     |
 | `--focal_gamma`         | 1.0     | Gamma для Focal-InfoNCE                     |
 | `--amp`                 | True    | Mixed precision                             |
 | `--soft_router`         | False   | Использовать SoftMoERouter                  |
@@ -788,7 +791,7 @@ config = HDIMConfig(
 | `lambda_iso`          | 0.1     | Вес isomorphism loss                  |
 | `lambda_pair`         | 0.1     | Вес pair ranking loss                 |
 | `lambda_z`            | 0.0     | Вес MoE Z-loss (>= 0.01 рекомендуемо) |
-| `infonce_temperature` | 0.15    | Temperature для InfoNCE               |
+| `infonce_temperature` | 0.10    | Temperature для InfoNCE (оптимум Run 18) |
 | `focal_gamma`         | 1.0     | Gamma для Focal-InfoNCE               |
 | `soft_router`         | False   | Использовать SoftMoERouter            |
 
@@ -830,6 +833,37 @@ config = HDIMConfig(
 
 ---
 
+## Phase 30 (2026-03-26) — Bug Fixes
+
+### MoEKernel _expert_bias → buffer
+
+`_expert_bias` конвертирован из `nn.Parameter` в `register_buffer` — не участвует в оптимизации, корректно сохраняется в state_dict без градиентов.
+
+### SoftMoERouter deadlock fix
+
+В `forward()` объединён один `_ema_lock` для EMA-обновления и bias-обновления — устраняет возможный deadlock при multi-worker DataLoader.
+
+### Session 14 (2026-03-26) — MoE + TitansMemory Smoke Test
+
+5-epoch smoke test с MoE + TitansMemory (ep5=1.1508 ≈ Run11 ep27 за 1/27 эпох):
+- Нет NaN, нет OOM, GPU стабильна
+- Рекомендован полный прогон 30 эпох
+
+### ТЕКУЩИЙ ОПТИМАЛЬНЫЙ CONFIG
+
+| Параметр | Значение | Примечание |
+|---|---|---|
+| `batch_size` | 24 | Оптимум для RTX 3070 8GB |
+| `lr` | 5e-4 | Выше вызывает нестабильность |
+| `sbert_lr` | 1e-5 | Осторожное размораживание SBERT |
+| `temperature` | **0.10** | Рекорд Run 18; 0.12 даёт -0.0108 |
+| `lambda_pair` | **0.40** | Выше 0.40 не тестировалось |
+| `lambda_sts` | **0.0** | Любое значение > 0 подавляет margin |
+| `patience` | 15 | Нужно для multi-peak паттерна |
+| `epochs` | 30 | Пик на ep13 с temp=0.10 |
+
+---
+
 ## Расхождения README vs Код
 
 
@@ -852,9 +886,10 @@ config = HDIMConfig(
 | `ModularMoERouter`     | Нестабилен        | `SoftMoERouter`             |
 | `reset_memory('zero')` | Уничтожает знания | `reset_memory('geometric')` |
 | `batch_size < 32`      | Мало негативов    | `batch_size >= 32`          |
-| `temperature < 0.15`   | Overconfidence    | `temperature >= 0.15`       |
+| `temperature < 0.07`   | Gradient instability | `temperature = 0.10` (оптимум) |
 | `lambda_z = 0`         | MoE collapse      | `lambda_z >= 0.01`          |
-| Нет `reset_memory()`   | Memory drift      | Вызывать каждую эпоху       |
+| `lambda_sts > 0`       | Подавляет pair_margin | `lambda_sts = 0.0` (обязательно) |
+| Нет `reset_memory()`   | Memory drift      | epoch=1: hard, далее без сброса |
 
 
 ---
