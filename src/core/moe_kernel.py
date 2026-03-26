@@ -364,8 +364,8 @@ class MoEKernel(nn.Module):
 
         # --- Auxiliary-Loss-Free: per-expert bias ---
         if config.use_aux_loss_free:
-            self._expert_bias = nn.Parameter(
-                torch.zeros(config.num_experts), requires_grad=False  # type: ignore[arg-type]
+            self.register_buffer(
+                "_expert_bias", torch.zeros(config.num_experts)  # type: ignore[arg-type]
             )
             self._aux_lr = config.aux_lr
         else:
