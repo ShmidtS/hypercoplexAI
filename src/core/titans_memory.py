@@ -98,6 +98,21 @@ class TitansMemoryModule(nn.Module):
         """Check if memory is frozen."""
         return self._frozen
 
+    def retrieve_only(self, k: torch.Tensor) -> torch.Tensor:
+        """RAG-compatible retrieval without memory update.
+
+        Equivalent to forward with update_memory=False, but returns
+        only the retrieved tensor (no loss) for clean RAG inference.
+
+        Args:
+            k: key tensor (..., key_dim)
+
+        Returns:
+            Retrieved value tensor (..., val_dim)
+        """
+        with torch.no_grad():
+            return self.memory(k)
+
     # Backward compatibility properties (tests access these)
     @property
     def _MEMORY_MAX_NORM(self) -> float:
