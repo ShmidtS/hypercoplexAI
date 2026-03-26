@@ -560,11 +560,11 @@ class MoEKernel(nn.Module):
         # 6. Лоссы
         lb_loss = self._load_balance_loss(combine)
         z_loss_scaled = self.z_loss_weight * z_loss
-        ortho_loss = (
-            self.ortho_loss_weight * self.expert_orthogonalization_loss()
-            if self.use_expert_ortho
-            else torch.zeros((), device=x.device, dtype=x.dtype)
-        )
+        # Ortho loss только при обучении — inference не нуждается в регуляризации
+        if self.use_expert_ortho and self.training:
+            ortho_loss = self.ortho_loss_weight * self.expert_orthogonalization_loss()
+        else:
+            ortho_loss = torch.zeros((), device=x.device, dtype=x.dtype)
         router_loss = lb_loss
 
         # 7. Метрики нагрузки

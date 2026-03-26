@@ -103,6 +103,7 @@ class TitansMemoryModule(nn.Module):
 
         Equivalent to forward with update_memory=False, but returns
         only the retrieved tensor (no loss) for clean RAG inference.
+        No gradients flow through this method by design.
 
         Args:
             k: key tensor (..., key_dim)
