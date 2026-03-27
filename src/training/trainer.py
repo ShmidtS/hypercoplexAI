@@ -1256,12 +1256,12 @@ class HDIMTrainer:
         with torch.no_grad():
             for batch in dataloader:
                 losses = self._compute_batch_losses(batch)
-            for key in totals:
-                val = losses[key].item()
-                # Skip NaN/Inf values to prevent corruption of validation metrics
-                if math.isfinite(val):
-                    totals[key] += val
-            n_batches += 1
+                for key in totals:
+                    val = losses[key].item()
+                    # Skip NaN/Inf values to prevent corruption of validation metrics
+                    if math.isfinite(val):
+                        totals[key] += val
+                n_batches += 1
         if n_batches > 0:
             for key in totals:
                 totals[key] /= n_batches
