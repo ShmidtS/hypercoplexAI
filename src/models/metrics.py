@@ -85,7 +85,7 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
         return {"sts_exported": dummy, "sts_training": dummy, "pair_margin": dummy, "routing": dummy}
 
     if pair_enc is None or pair_domain_ids is None:
-        _, routing, _, state = model(
+        _, routing, _, _, state = model(
             enc,
             domain_id=domain_ids,
             return_state=True,
@@ -107,14 +107,14 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
             "routing": routing,
         }
 
-    _, routing, _, src_state = model.transfer_pairs(
+    _, routing, _, _, src_state = model.transfer_pairs(
         enc,
         domain_ids,
         pair_domain_ids,
         update_memory=False,
         memory_mode="retrieve",
     )
-    _, _, _, tgt_state = model(
+    _, _, _, _, tgt_state = model(
         pair_enc,
         domain_id=pair_domain_ids,
         return_state=True,
@@ -137,7 +137,7 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
     else:
         mismatched_pair_enc = pair_enc[negative_pair_indices]
         mismatched_pair_domain_ids = pair_domain_ids[negative_pair_indices]
-        _, _, _, mismatched_state = model(
+        _, _, _, _, mismatched_state = model(
             mismatched_pair_enc,
             domain_id=mismatched_pair_domain_ids,
             return_state=True,
@@ -212,10 +212,10 @@ def compute_all_metrics(
             # Собираем данные для глобального pair_margin
             enc_m, pair_enc_m, d_ids, pd_ids = _get_encodings(model, batch, device)
             if enc_m is not None and pair_enc_m is not None and pd_ids is not None:
-                _, _, _, src_state = model.transfer_pairs(
+                _, _, _, _, src_state = model.transfer_pairs(
                     enc_m, d_ids, pd_ids, update_memory=False, memory_mode="retrieve"
                 )
-                _, _, _, tgt_state = model(
+                _, _, _, _, tgt_state = model(
                     pair_enc_m, domain_id=pd_ids, return_state=True, update_memory=False, memory_mode="retrieve"
                 )
                 all_src_inv.append(src_state.exported_invariant.cpu())

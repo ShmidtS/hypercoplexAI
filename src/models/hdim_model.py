@@ -418,6 +418,7 @@ class HDIMModel(nn.Module):
         z_loss = torch.zeros((), device=device, dtype=dtype)
         routing_entropy = torch.zeros((), device=device, dtype=dtype)
 
+        all_slot_outputs: List[torch.Tensor] = []
         for mask in group_masks:
             group_route, group_router_state = pipeline.moe(u_mem[mask])
             u_route[mask] = group_route.to(dtype=u_route.dtype)
@@ -432,6 +433,10 @@ class HDIMModel(nn.Module):
             routing_entropy = routing_entropy + group_router_state["routing_entropy"].to(dtype=dtype)
             train_scores_snapshot.copy_(group_router_state["train_scores_snapshot"].to(dtype=dtype))
             expert_usage.copy_(group_router_state["expert_usage"].to(dtype=dtype))
+
+            # Collect slot_outputs from MoEKernel if present
+            if "slot_outputs" in group_router_state and group_router_state["slot_outputs"] is not None:
+                all_slot_outputs.append(group_router_state["slot_outputs"])
 
         # 5) Transfer
         step2 = pipeline.algebra.geometric_product(R_transfer, u_route)
@@ -452,11 +457,14 @@ class HDIMModel(nn.Module):
         router_loss = router_loss / total_samples
         z_loss = z_loss / total_samples
 
+        # Concatenate slot_outputs if available
+        slot_outputs_tensor = torch.cat(all_slot_outputs, dim=0) if all_slot_outputs else None
+
         return (
             output, routing_weights, raw_invariant, memory_augmented_invariant,
             exported_invariant, topk_idx, topk_gate_weights,
             train_scores_snapshot, expert_usage, routing_entropy,
-            memory_loss, router_loss, z_loss, memory_updated,
+            memory_loss, router_loss, z_loss, memory_updated, slot_outputs_tensor,
         )
 
     def forward(
@@ -489,7 +497,7 @@ class HDIMModel(nn.Module):
             output, routing_weights, raw_invariant, memory_augmented_invariant,
             exported_invariant, topk_idx, topk_gate_weights,
             train_scores_snapshot, expert_usage, _routing_entropy,
-            memory_loss, router_loss, z_loss, memory_updated,
+            memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
         ) = self._forward_core(
             x, R_inv_per_sample, R_per_sample, R_per_sample, R_inv_per_sample,
             group_masks, runtime,
@@ -514,8 +522,8 @@ class HDIMModel(nn.Module):
                 memory_updated=memory_updated,
                 runtime=runtime,
             )
-            return output, routing_weights, invariant, aux_state
-        return output, routing_weights, invariant
+            return output, routing_weights, invariant, _slot_outputs, aux_state
+        return output, routing_weights, invariant, _slot_outputs
 
     def transfer(
         self,
@@ -617,7 +625,7 @@ class HDIMModel(nn.Module):
             output, routing_weights, raw_invariant, memory_augmented_invariant,
             exported_invariant, topk_idx, topk_gate_weights,
             train_scores_snapshot, expert_usage, _routing_entropy,
-            memory_loss, router_loss, z_loss, memory_updated,
+            memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
         ) = self._forward_core(
             source_encoding,
             R_src_inv_per_sample, R_src_per_sample,
@@ -645,7 +653,7 @@ class HDIMModel(nn.Module):
             memory_updated=memory_updated,
             runtime=runtime,
         )
-        return output, routing_weights, invariant, aux_state
+        return output, routing_weights, invariant, _slot_outputs, aux_state
 
     # Phase 22 feature flags
 

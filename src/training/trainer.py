@@ -188,7 +188,7 @@ class HDIMTrainer:
     def _compute_pair_iso_targets(
         self, pair_encoding: torch.Tensor, pair_domain_id: torch.Tensor
     ) -> torch.Tensor:
-        _, _, _, aux_state = self._forward_batch(
+        _, _, _, _, aux_state = self._forward_batch(
             pair_encoding,
             pair_domain_id,
             TrainingRegime(
@@ -202,7 +202,7 @@ class HDIMTrainer:
     def _compute_pair_iso_targets_from_text(
         self, pair_texts: Sequence[str], pair_domain_id: torch.Tensor
     ) -> torch.Tensor:
-        _, _, _, aux_state = self._forward_text_batch(
+        _, _, _, _, aux_state = self._forward_text_batch(
             pair_texts,
             pair_domain_id,
             TrainingRegime(
@@ -311,7 +311,7 @@ class HDIMTrainer:
         if self._uses_text_model() and self._has_pair_texts(batch):
             pair_texts = self._extract_texts(batch, "pair_text")
             pair_domain_id = batch["pair_domain_id"].to(self.device)
-            _, _, _, aux_state = self._forward_text_batch(
+            _, _, _, _, aux_state = self._forward_text_batch(
                 pair_texts,
                 pair_domain_id,
                 TrainingRegime(
@@ -329,7 +329,7 @@ class HDIMTrainer:
         pair_domain_id = batch.get("pair_domain_id")
         if pair_encoding is None or pair_domain_id is None:
             return None
-        _, _, _, aux_state = self._forward_batch(
+        _, _, _, _, aux_state = self._forward_batch(
             pair_encoding.to(self.device),
             pair_domain_id.to(self.device),
             TrainingRegime(
@@ -1028,7 +1028,7 @@ class HDIMTrainer:
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
                 # Encode source once (was double-encoded by transfer_text_pairs + _encode_texts)
                 _src_enc, _src_scales = self._encode_texts(texts, collect_matryoshka=True)
-                output, routing_weights, invariant, aux_state = (
+                output, routing_weights, invariant, _slot_outputs, aux_state = (
                     self.model.core_model.transfer_pairs(
                         _src_enc,
                         domain_id,
@@ -1053,7 +1053,7 @@ class HDIMTrainer:
                 else:
                     recon_target = _tgt_enc
             else:
-                output, routing_weights, invariant, aux_state = self._forward_text_batch(
+                output, routing_weights, invariant, _slot_outputs, aux_state = self._forward_text_batch(
                     texts, domain_id, regime
                 )
                 recon_target = self._encode_texts(texts)
@@ -1065,7 +1065,7 @@ class HDIMTrainer:
                 if self._augmenter is not None:
                     pair_encoding = self._augmenter(pair_encoding, pairs_only=False)
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
-                output, routing_weights, invariant, aux_state = self.model.transfer_pairs(
+                output, routing_weights, invariant, slot_outputs, aux_state = self.model.transfer_pairs(
                     encoding,
                     domain_id,
                     pair_domain_id,
@@ -1081,7 +1081,7 @@ class HDIMTrainer:
                 else:
                     recon_target = pair_encoding
             else:
-                output, routing_weights, invariant, aux_state = self._forward_batch(
+                output, routing_weights, invariant, _slot_outputs, aux_state = self._forward_batch(
                     encoding, domain_id, regime
                 )
                 recon_target = encoding

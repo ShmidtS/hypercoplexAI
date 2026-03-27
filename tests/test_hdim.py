@@ -45,7 +45,7 @@ def test_model_forward(model, cfg):
     bsz = 4
     x = torch.randn(bsz, cfg.hidden_dim)
     domain_id = torch.zeros(bsz, dtype=torch.long)
-    out, routing, inv = model(x, domain_id)
+    out, routing, inv, slot_outputs = model(x, domain_id)
     assert out.shape == (bsz, cfg.hidden_dim)
     assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
@@ -56,7 +56,7 @@ def test_model_forward_return_state(model, cfg):
     bsz = 4
     x = torch.randn(bsz, cfg.hidden_dim)
     domain_id = torch.zeros(bsz, dtype=torch.long)
-    out, routing, inv, state = model(
+    out, routing, inv, slot_outputs, state = model(
         x,
         domain_id,
         return_state=True,
@@ -93,7 +93,7 @@ def test_transfer_pairs(model, cfg):
     x = torch.randn(bsz, cfg.hidden_dim)
     source_domain_id = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     target_domain_id = torch.tensor([1, 2, 0, 3], dtype=torch.long)
-    out, routing, inv, state = model.transfer_pairs(
+    out, routing, inv, slot_outputs, state = model.transfer_pairs(
         x,
         source_domain_id,
         target_domain_id,
@@ -332,7 +332,7 @@ def test_evaluate_batch_with_pairs(trainer):
 def test_model_return_state_exposes_memory_lifecycle(model, cfg):
     x = torch.randn(4, cfg.hidden_dim)
     domain_id = torch.zeros(4, dtype=torch.long)
-    _, _, _, state = model(
+    _, _, _, _, state = model(
         x,
         domain_id,
         return_state=True,
@@ -362,7 +362,7 @@ def test_model_forward_rejects_invalid_domain_id(model, cfg):
 def test_model_memory_mode_none_skips_memory_augmentation(model, cfg):
     x = torch.randn(3, cfg.hidden_dim)
     domain_id = torch.zeros(3, dtype=torch.long)
-    _, _, _, state = model(
+    _, _, _, _, state = model(
         x,
         domain_id,
         return_state=True,
@@ -395,14 +395,14 @@ def test_forward_and_transfer_pairs_expose_same_lifecycle_contract(model, cfg):
     source_domain_id = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     target_domain_id = torch.tensor([1, 2, 0, 3], dtype=torch.long)
 
-    _, _, _, forward_state = model(
+    _, _, _, _, forward_state = model(
         x,
         source_domain_id,
         return_state=True,
         update_memory=False,
         memory_mode="retrieve",
     )
-    _, _, _, pair_state = model.transfer_pairs(
+    _, _, _, _, pair_state = model.transfer_pairs(
         x,
         source_domain_id,
         target_domain_id,
@@ -452,14 +452,14 @@ def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
 
     model.eval()
     with torch.no_grad():
-        _, routing_a, inv_a, state_a = model(
+        _, routing_a, inv_a, _, state_a = model(
             x,
             domain_id,
             return_state=True,
             update_memory=False,
             memory_mode="retrieve",
         )
-        _, routing_b, inv_b, state_b = model(
+        _, routing_b, inv_b, _, state_b = model(
             x,
             domain_id,
             return_state=True,
@@ -834,7 +834,7 @@ def test_round_trip_transfer_same_domain(model, cfg):
     x = torch.randn(4, cfg.hidden_dim)
     domain_id = torch.zeros(4, dtype=torch.long)
     with torch.no_grad():
-        out, _, _ = model(x, domain_id, update_memory=False, memory_mode="retrieve")
+        out, _, _, _ = model(x, domain_id, update_memory=False, memory_mode="retrieve")
     assert out.shape == x.shape
 
 
@@ -843,7 +843,7 @@ def test_raw_invariant_differs_from_exported(model, cfg):
     x = torch.randn(4, cfg.hidden_dim)
     domain_id = torch.zeros(4, dtype=torch.long)
     with torch.no_grad():
-        _, _, _, state = model(
+        _, _, _, _, state = model(
             x, domain_id,
             return_state=True,
             update_memory=False,

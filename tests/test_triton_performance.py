@@ -213,7 +213,7 @@ class TestTritonEdgeCases:
         layer = CliffordInteractionLayer(use_triton=True).cuda()
         x = torch.randn(4, 32, 16, device='cuda')
         
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             output = layer(x)
         
         assert output.shape == (4, 32, 16)

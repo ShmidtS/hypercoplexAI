@@ -392,14 +392,14 @@ class TextHDIMModel(nn.Module):
         source_domain_id: torch.Tensor,
         target_domain_id: torch.Tensor,
     ) -> TextPairScoreResult:
-        _, _, _, src_state = self.transfer_text_pairs(
+        _, _, _, _, src_state = self.transfer_text_pairs(
             source_texts,
             source_domain_id,
             target_domain_id,
             update_memory=False,
             memory_mode="retrieve",
         )
-        _, _, _, tgt_state = self.forward_texts(
+        _, _, _, _, tgt_state = self.forward_texts(
             target_texts,
             target_domain_id,
             return_state=True,

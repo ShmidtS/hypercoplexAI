@@ -12,6 +12,7 @@ build_sbert_hdim_model(cfg, ...) -> TextHDIMModel (with frozen SBERT encoder)
 build_modernbert_hdim_model(cfg, ...) -> TextHDIMModel (with ModernBERT encoder)
 model_from_experiment_config(exp) -> TextHDIMModel | HDIMModel
 """
+
 from __future__ import annotations
 
 from typing import Union
@@ -24,6 +25,7 @@ from src.training.experiment_config import ExperimentConfig
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _patch_soft_router(core_model: HDIMModel, z_loss_weight: float = 0.0) -> None:
     """Replace pipeline.moe with SoftMoERouter in-place.
@@ -188,10 +190,13 @@ def _patch_moe_kernel(
 
         def forward(self, x):
             import torch
+
             output, state = self.kernel(x)
             top_k = min(2, state.expert_weights.shape[-1])
             topk_weights, topk_idx = state.expert_weights.topk(top_k, dim=-1)
-            topk_weights_norm = topk_weights / topk_weights.sum(-1, keepdim=True).clamp_min(1e-8)
+            topk_weights_norm = topk_weights / topk_weights.sum(
+                -1, keepdim=True
+            ).clamp_min(1e-8)
             router_state = {
                 "loss": state.total_loss(),
                 "router_loss": state.total_loss(),
@@ -205,6 +210,7 @@ def _patch_moe_kernel(
                 "topk_idx": topk_idx,
                 "topk_gate_weights": topk_weights_norm,
                 "moe_kernel_state": state,
+                "slot_outputs": state.slot_outputs,
             }
             return output, router_state
 
@@ -214,6 +220,7 @@ def _patch_moe_kernel(
 # ---------------------------------------------------------------------------
 # Public factory functions
 # ---------------------------------------------------------------------------
+
 
 def build_hdim_model(cfg: HDIMConfig) -> HDIMModel:
     """Build a plain HDIMModel from an HDIMConfig."""
@@ -328,18 +335,20 @@ def model_from_experiment_config(
         or getattr(exp, "modernbert_encoder", False)
     )
 
-    z_loss_weight = getattr(exp, 'z_loss_weight', 0.0)
+    z_loss_weight = getattr(exp, "z_loss_weight", 0.0)
 
     if needs_text:
         if getattr(exp, "modernbert_encoder", False):
             return build_modernbert_hdim_model(
                 cfg,
                 soft_router=exp.soft_router,
-                modernbert_model_name=getattr(exp, 'modernbert_model_name', 'answerdotai/ModernBERT-base'),
-                freeze_modernbert=getattr(exp, 'freeze_modernbert', True),
-                use_cls_pooling=getattr(exp, 'modernbert_use_cls_pooling', True),
-                max_length=getattr(exp, 'modernbert_max_length', 512),
-                matryoshka_dims=getattr(exp, 'matryoshka_dims', None),
+                modernbert_model_name=getattr(
+                    exp, "modernbert_model_name", "answerdotai/ModernBERT-base"
+                ),
+                freeze_modernbert=getattr(exp, "freeze_modernbert", True),
+                use_cls_pooling=getattr(exp, "modernbert_use_cls_pooling", True),
+                max_length=getattr(exp, "modernbert_max_length", 512),
+                matryoshka_dims=getattr(exp, "matryoshka_dims", None),
                 z_loss_weight=z_loss_weight,
             )
         if getattr(exp, "pretrained_encoder", False):

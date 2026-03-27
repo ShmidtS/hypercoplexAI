@@ -86,6 +86,7 @@ class MoEKernelState:
     combine_weights: torch.Tensor  # (B, num_slots)
     expert_names: List[str]
     top_expert_idx: torch.Tensor  # (B,) — индекс наиболее используемого эксперта
+    slot_outputs: Optional[torch.Tensor] = None # (num_slots, D) — реальные выходы экспертов
 
     def total_loss(self) -> torch.Tensor:
         return self.router_loss + self.z_loss + self.ortho_loss
@@ -594,6 +595,7 @@ class MoEKernel(nn.Module):
             combine_weights=combine.reshape(*orig_shape[:-1], self.num_slots),
             expert_names=self.expert_names,
             top_expert_idx=top_expert_idx.reshape(orig_shape[:-1]),
+ slot_outputs=slot_outputs,
         )
         return output.reshape(orig_shape), state
 

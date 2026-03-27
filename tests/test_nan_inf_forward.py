@@ -254,7 +254,7 @@ def test_full_hdim_forward():
 
     # Test without AMP
     with torch.no_grad():
-        output, routing_weights, invariant, aux = model(
+        output, routing_weights, invariant, _, aux = model(
             x, domain_id=domain_id, return_state=True, update_memory=True, memory_mode="update"
         )
 
@@ -278,7 +278,7 @@ def test_full_hdim_forward():
     # Test with AMP
     model.zero_grad()
     with torch.autocast('cuda', dtype=torch.float16):
-        output_amp, routing_weights_amp, invariant_amp, aux_amp = model(
+        output_amp, routing_weights_amp, invariant_amp, _, aux_amp = model(
             x, domain_id=domain_id, return_state=True, update_memory=True, memory_mode="update"
         )
 
@@ -333,7 +333,7 @@ def test_extreme_values():
 
     with torch.no_grad():
         with torch.autocast('cuda', dtype=torch.float16):
-            output, routing_weights, invariant, aux = model(x_large, domain_id=domain_id, return_state=True)
+            output, routing_weights, invariant, _, aux = model(x_large, domain_id=domain_id, return_state=True)
 
         diag = check_tensor(output, "output_large_inputs")
         print_diagnostics(diag)
@@ -348,7 +348,7 @@ def test_extreme_values():
 
     with torch.no_grad():
         with torch.autocast('cuda', dtype=torch.float16):
-            output, routing_weights, invariant, aux = model(x_small, domain_id=domain_id, return_state=True)
+            output, routing_weights, invariant, _, aux = model(x_small, domain_id=domain_id, return_state=True)
 
         diag = check_tensor(output, "output_small_inputs")
         print_diagnostics(diag)
@@ -365,7 +365,7 @@ def test_extreme_values():
 
     with torch.no_grad():
         with torch.autocast('cuda', dtype=torch.float16):
-            output, routing_weights, invariant, aux = model(x_mixed, domain_id=domain_id, return_state=True)
+            output, routing_weights, invariant, _, aux = model(x_mixed, domain_id=domain_id, return_state=True)
 
         diag = check_tensor(output, "output_mixed_scale")
         print_diagnostics(diag)
