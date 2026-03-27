@@ -56,6 +56,13 @@ class MoEKernelConfig:
     use_can_experts: bool = False  # Использовать CliffordInteractionLayer вместо FFN
 
     def __post_init__(self):
+        # Защита от вырожденного temperature (z_loss теряет эффект при temp < 0.1)
+        if self.temperature < 0.1:
+            raise ValueError(
+                f"MoEKernelConfig.temperature={self.temperature} < 0.1: "
+                "z_loss regulation is suppressed by clamp at such small values. "
+                "Use temperature >= 0.1."
+            )
         # Если expert_names задан, num_experts вычисляется из него
         if self.expert_names is not None:
             computed_num = len(self.expert_names)

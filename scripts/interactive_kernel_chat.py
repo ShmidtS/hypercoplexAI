@@ -189,8 +189,11 @@ class HDIMKernelChat:
 			if slot_outputs is not None and isinstance(slot_outputs, torch.Tensor):
 				slot_out = slot_outputs
 
+			sbert_emb = text_emb[0].cpu().numpy()  # SBERT space = same as KB
+
 			return {
 				"embedding": embedding,
+				"sbert_embedding": sbert_emb,
 				"norm": float(np.linalg.norm(embedding)),
 				"routing": routing_info,
 				"slot_outputs": slot_out,
@@ -198,38 +201,42 @@ class HDIMKernelChat:
 
 	def generate_response(self, result: Dict[str, Any], user_input: str = "") -> str:
 		"""Ответ через HDIM-retrieval: ищем ближайшие аналогии в базе знаний."""
-		embedding = result["embedding"]  # np.ndarray (D,)
+		# Use SBERT embedding for retrieval (same space as KB embeddings)
+		embedding = result.get("sbert_embedding", result["embedding"])  # SBERT space
 		expert_idx = result["routing"]["dominant_expert"]
 		expert_name = self.expert_names[expert_idx]
 		weights = result["routing"]["weights"]
 
-		# --- Retrieval via cosine similarity ---
+		# --- Retrieval via cosine similarity (diversified) ---
 		if self.kb_embeddings is not None and len(self.kb_source_texts) > 0:
 			emb_t = torch.from_numpy(embedding).float().to(self.device)  # (D,)
 			emb_t = torch.nn.functional.normalize(emb_t.unsqueeze(0), dim=-1)  # (1, D)
 			kb_norm = torch.nn.functional.normalize(self.kb_embeddings, dim=-1)  # (N, D)
 			sims = (kb_norm @ emb_t.T).squeeze(-1)  # (N,)
-			top3 = sims.topk(min(3, len(sims))).indices.tolist()
 
-			best_idx = top3[0]
-			best_sim = sims[best_idx].item()
-			src = self.kb_source_texts[best_idx]
-			tgt = self.kb_target_texts[best_idx]
-			family = self.kb_families[best_idx]
+			# Pick top-N unique families for diversity
+			sorted_idx = sims.argsort(descending=True).tolist()
+			selected = []
+			seen_families = set()
+			for idx in sorted_idx:
+				fam = self.kb_families[idx]
+				base_fam = fam.replace('_aug_permute', '').replace('_aug_expand', '').replace('_aug_noise', '').replace('_aug_', '_')
+				if base_fam not in seen_families:
+					seen_families.add(base_fam)
+					selected.append(idx)
+				if len(selected) >= 3:
+					break
 
-			# Format the analogy response
-			lines = [
-				f"Домен: {expert_name} (уверенность: {max(weights):.1%})",
-				f"Аналогия [{family.replace('_', ' ')}] (схожесть: {best_sim:.3f}):",
-				f"  А: {src[:120]}",
-				f"  Б: {tgt[:120]}",
-			]
-			if len(top3) > 1:
-				i2 = top3[1]
-				sim2 = sims[i2].item()
-				fam2 = self.kb_families[i2].replace('_', ' ')
-				lines.append(f"Также близко [{fam2}] (схожесть: {sim2:.3f}):")
-				lines.append(f"  А: {self.kb_source_texts[i2][:100]}")
+			lines = [f"Эксперт: {expert_name} (уверенность: {max(weights):.1%})"]
+			for rank, idx in enumerate(selected):
+				sim = sims[idx].item()
+				fam = self.kb_families[idx].replace('_aug_permute', '').replace('_aug_expand', '').replace('_', ' ')
+				src = self.kb_source_texts[idx]
+				tgt = self.kb_target_texts[idx]
+				prefix = "Лучшая аналогия" if rank == 0 else f"Также ({rank+1})"
+				lines.append(f"{prefix} [{fam}] (sim={sim:.3f}):")
+				lines.append(f"  А: {src[:120]}")
+				lines.append(f"  Б: {tgt[:120]}")
 			return "\n".join(lines)
 		else:
 			return f"[{expert_name}] Embedding norm: {result['norm']:.4f}. База знаний не загружена."
