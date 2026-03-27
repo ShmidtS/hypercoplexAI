@@ -118,7 +118,7 @@ class HDIMIntegratedDecoder(nn.Module):
     def __init__(
         self,
         hdim_dim: int = 256,
-        gpt_model: str = "microsoft/DialoGPT-medium",  # Multilingual conversational model
+        gpt_model: str = "ai-forever/rugpt3small_based_on_gpt2",  # Russian GPT-3 small
         device: str = "cuda",
         use_cross_attention: bool = True,
     ):
@@ -258,13 +258,13 @@ class HDIMIntegratedDecoder(nn.Module):
 
         # 2. Build prompt for GPT-2
         expert_prompts = {
-            "Math": "Question about mathematics:",
-            "Language": "Conversation in Russian:",
-            "Code": "Programming question:",
-            "Science": "Science question:",
+            "Math": "Вопрос по математике:",
+            "Language": "Вопрос:",
+            "Code": "Вопрос по программированию:",
+            "Science": "Научный вопрос:",
         }
-        prompt_prefix = expert_prompts.get(expert_name, "Question:")
-        prompt = f"{prompt_prefix} {user_input}\nAnswer:"
+        prompt_prefix = expert_prompts.get(expert_name, "Вопрос:")
+        prompt = f"{prompt_prefix} {user_input}\nОтвет:"
 
         # 3. Tokenize
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
@@ -286,9 +286,9 @@ class HDIMIntegratedDecoder(nn.Module):
         # 5. Decode and clean
         full_response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # Extract response after "Answer:"
-        if "Answer:" in full_response:
-            response = full_response.split("Answer:")[-1].strip()
+        # Extract response after "Ответ:"
+        if "Ответ:" in full_response:
+            response = full_response.split("Ответ:")[-1].strip()
         else:
             response = full_response[len(prompt) :].strip()
 

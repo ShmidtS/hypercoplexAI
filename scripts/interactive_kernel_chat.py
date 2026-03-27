@@ -22,10 +22,11 @@ from typing import Optional, Dict, Any, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import json
+
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.model_factory import build_sbert_hdim_model, _patch_moe_kernel
 from src.core.titans_memory import TitansMemoryModule
-from scripts.hdim_decoder import HDIMIntegratedDecoder
 
 
 class HDIMKernelChat:
@@ -70,47 +71,49 @@ class HDIMKernelChat:
 		).to(self.device)
 
 		self.expert_names = ["Math", "Language", "Code", "Science"]
-		self._init_decoder()
+		self._init_knowledge_base()
 
 		print("HDIM Kernel initialized!")
 		print(f" Experts: {self.config.num_experts} ({', '.join(self.expert_names)})")
-		print(f" Decoder: HDIMIntegratedDecoder (cross-attention + routing weights)")
+		print(f" Knowledge base loaded")
 		print()
 
-	def _init_decoder(self):
-		"""Initialize HDIM-integrated decoder with cross-attention conditioning."""
-		# Use text_encoder to get correct input dimension for core_model
+	def _init_knowledge_base(self):
+		"""Load knowledge base from real_pairs and encode with SBERT for retrieval."""
+		kb_path = Path(__file__).resolve().parents[1] / "data" / "real_pairs_v10.json"
+		try:
+			raw = kb_path.read_bytes()
+			pairs = json.loads(raw.decode("utf-8"))
+		except Exception as e:
+			print(f"Warning: could not load knowledge base: {e}")
+			self.kb_texts = []
+			self.kb_embeddings = None
+			return
+
+		# Keep only positive cross-domain pairs with readable text
+		import re
+		def _readable(t):
+			return bool(re.search(r'[a-zA-Zа-яА-ЯёЁ]{4}', t))
+
+		pos = [
+			p for p in pairs
+			if p.get("relation") == "positive"
+			and _readable(p["source_text"])
+			and _readable(p["target_text"])
+		]
+
+		# Store pairs for retrieval: encode source side with SBERT
+		self.kb_pairs = pos
+		self.kb_source_texts = [p["source_text"] for p in pos]
+		self.kb_target_texts = [p["target_text"] for p in pos]
+		self.kb_families = [p.get("family", "?") for p in pos]
+
+		print(f"Encoding {len(pos)} knowledge pairs with SBERT...")
 		with torch.no_grad():
-			# Encode dummy text through text_encoder first
-			text_emb = self.model.text_encoder(["test"], device=self.device)
-			domain_id = torch.zeros(1, dtype=torch.long, device=self.device)
-			result = self.model.core_model(text_emb, domain_id=domain_id)
-
-			if isinstance(result, tuple):
-				output = result[0]
-			else:
-				output = result
-
-			if isinstance(output, tuple):
-				emb = output[0]
-			else:
-				emb = output
-
-			# Get the embedding dimension from actual output
-			if isinstance(emb, torch.Tensor):
-				emb_dim = emb.shape[-1]
-			else:
-				emb_dim = self.config.hidden_dim
-
-			print(f"Detected embedding dimension: {emb_dim}")
-
-			# Use HDIM-integrated decoder with cross-attention disabled for demo
-			# (cross-attention needs training to work properly)
-			self.decoder = HDIMIntegratedDecoder(
-				hdim_dim=emb_dim,
-				use_cross_attention=not self.demo_mode,  # Only use cross-attn with trained checkpoint
-				device=str(self.device)
-			)
+			self.kb_embeddings = self.model.text_encoder(
+				self.kb_source_texts, device=self.device
+			)  # (N, D)
+		print(f"Knowledge base ready: {len(pos)} pairs")
 
 	def _load_checkpoint(self, path: str) -> HDIMModel:
 		"""Загружает чекпоинт с автоопределением hidden_dim."""
@@ -194,48 +197,42 @@ class HDIMKernelChat:
 			}
 
 	def generate_response(self, result: Dict[str, Any], user_input: str = "") -> str:
-		"""Генерирует осмысленный ответ через HDIM-integrated decoder."""
-		embedding = result["embedding"]
-		norm = result.get("norm", 1.0)
-
-		# Normalize embedding for better generation
-		if norm > 0:
-			embedding = embedding / norm
-
-		# Get dominant expert for context
+		"""Ответ через HDIM-retrieval: ищем ближайшие аналогии в базе знаний."""
+		embedding = result["embedding"]  # np.ndarray (D,)
 		expert_idx = result["routing"]["dominant_expert"]
 		expert_name = self.expert_names[expert_idx]
+		weights = result["routing"]["weights"]
 
-		# Get routing weights for weighted generation
-		routing_weights = result["routing"]["weights"]
+		# --- Retrieval via cosine similarity ---
+		if self.kb_embeddings is not None and len(self.kb_source_texts) > 0:
+			emb_t = torch.from_numpy(embedding).float().to(self.device)  # (D,)
+			emb_t = torch.nn.functional.normalize(emb_t.unsqueeze(0), dim=-1)  # (1, D)
+			kb_norm = torch.nn.functional.normalize(self.kb_embeddings, dim=-1)  # (N, D)
+			sims = (kb_norm @ emb_t.T).squeeze(-1)  # (N,)
+			top3 = sims.topk(min(3, len(sims))).indices.tolist()
 
-		# Get memory context if available (from TitansMemory)
-		memory_context = None
-		if hasattr(self, 'memory') and self.memory is not None:
-			# Try to retrieve relevant context from memory
-			try:
-				with torch.no_grad():
-					emb_tensor = torch.from_numpy(embedding).float().unsqueeze(0).to(self.device)
-					mem_result = self.memory.retrieve_only(emb_tensor)
-					if mem_result is not None and isinstance(mem_result, dict) and "values" in mem_result:
-						# Use memory values as context hint
-						memory_context = "Релевантный контекст найден"
-			except Exception:
-				pass  # Memory retrieval is optional
+			best_idx = top3[0]
+			best_sim = sims[best_idx].item()
+			src = self.kb_source_texts[best_idx]
+			tgt = self.kb_target_texts[best_idx]
+			family = self.kb_families[best_idx]
 
-		# Generate through HDIM-integrated decoder
-		# Note: cross-attention is untrained, so templates dominate
-		generated = self.decoder.generate_response(
-			embedding,
-			user_input=user_input,
-			routing_weights=routing_weights,
-			expert_name=expert_name,
-			memory_context=memory_context,
-			max_new_tokens=30,
-			temperature=0.5, # Lower temperature for more focused responses
-		)
-
-		return generated
+			# Format the analogy response
+			lines = [
+				f"Домен: {expert_name} (уверенность: {max(weights):.1%})",
+				f"Аналогия [{family.replace('_', ' ')}] (схожесть: {best_sim:.3f}):",
+				f"  А: {src[:120]}",
+				f"  Б: {tgt[:120]}",
+			]
+			if len(top3) > 1:
+				i2 = top3[1]
+				sim2 = sims[i2].item()
+				fam2 = self.kb_families[i2].replace('_', ' ')
+				lines.append(f"Также близко [{fam2}] (схожесть: {sim2:.3f}):")
+				lines.append(f"  А: {self.kb_source_texts[i2][:100]}")
+			return "\n".join(lines)
+		else:
+			return f"[{expert_name}] Embedding norm: {result['norm']:.4f}. База знаний не загружена."
 
 	def chat_loop(self):
 		"""Основной цикл чата."""
@@ -256,11 +253,7 @@ class HDIMKernelChat:
 
 				result = self.encode(text)
 				response = self.generate_response(result, text)
-
-				print(f"\n{response}")
-				print(f"[Expert: {self.expert_names[result['routing']['dominant_expert']]}]")
-				print(f"[Confidence: {result['routing']['weights'][result['routing']['dominant_expert']]:.3f}]")
-				print()
+				print(f"\n{response}\n")
 
 			except KeyboardInterrupt:
 				print("\nВыход...")
