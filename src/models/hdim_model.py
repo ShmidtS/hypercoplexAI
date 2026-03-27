@@ -192,32 +192,6 @@ class HDIMModel(nn.Module):
             memory_mode=memory_mode,
         )
 
-    def _moe_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Run MoE forward with optional gradient checkpointing."""
-        if self.pipeline._use_gradient_checkpointing and self.training:
-            moe = self.pipeline.moe
-
-            def _moe_output_only(inp: torch.Tensor) -> torch.Tensor:
-                orig_shape = inp.shape
-                x_flat = inp.reshape(-1, inp.shape[-1])
-
-                dispatch, combine = moe._compute_dispatch_combine(x_flat)
-                slot_inputs = dispatch.T @ x_flat
-                slot_outputs = moe._evaluate_experts(slot_inputs)
-                output = combine @ slot_outputs
-                return output.reshape(orig_shape)
-
-            output = checkpoint(_moe_output_only, x, use_reentrant=False)
-            was_training = moe.training
-            moe.eval()
-            with torch.no_grad():
-                _, router_state = moe(x)
-            moe.train(was_training)
-            _, router_state = moe(x)
-            return output, router_state
-        else:
-            return self.pipeline.moe(x)
-
     def _build_aux_state(
         self,
         *,
