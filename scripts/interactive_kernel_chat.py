@@ -200,46 +200,74 @@ class HDIMKernelChat:
 			}
 
 	def generate_response(self, result: Dict[str, Any], user_input: str = "") -> str:
-		"""Ответ через HDIM-retrieval: ищем ближайшие аналогии в базе знаний."""
-		# Use SBERT embedding for retrieval (same space as KB embeddings)
+		"""Ответ через HDIM-retrieval с объяснением структурной аналогии."""
 		embedding = result.get("sbert_embedding", result["embedding"])  # SBERT space
 		expert_idx = result["routing"]["dominant_expert"]
 		expert_name = self.expert_names[expert_idx]
 		weights = result["routing"]["weights"]
 
-		# --- Retrieval via cosine similarity (diversified) ---
-		if self.kb_embeddings is not None and len(self.kb_source_texts) > 0:
-			emb_t = torch.from_numpy(embedding).float().to(self.device)  # (D,)
-			emb_t = torch.nn.functional.normalize(emb_t.unsqueeze(0), dim=-1)  # (1, D)
-			kb_norm = torch.nn.functional.normalize(self.kb_embeddings, dim=-1)  # (N, D)
-			sims = (kb_norm @ emb_t.T).squeeze(-1)  # (N,)
+		# Все эксперты с их весами для контекста
+		expert_weights = [
+			f"{self.expert_names[i]}={w:.1%}"
+			for i, w in enumerate(weights)
+		]
 
-			# Pick top-N unique families for diversity
-			sorted_idx = sims.argsort(descending=True).tolist()
-			selected = []
-			seen_families = set()
-			for idx in sorted_idx:
-				fam = self.kb_families[idx]
-				base_fam = fam.replace('_aug_permute', '').replace('_aug_expand', '').replace('_aug_noise', '').replace('_aug_', '_')
-				if base_fam not in seen_families:
-					seen_families.add(base_fam)
-					selected.append(idx)
-				if len(selected) >= 3:
-					break
+		if self.kb_embeddings is None or len(self.kb_source_texts) == 0:
+			return f"[{expert_name}] База знаний не загружена."
 
-			lines = [f"Эксперт: {expert_name} (уверенность: {max(weights):.1%})"]
-			for rank, idx in enumerate(selected):
+		emb_t = torch.from_numpy(embedding).float().to(self.device)
+		emb_t = torch.nn.functional.normalize(emb_t.unsqueeze(0), dim=-1)  # (1, D)
+		kb_norm = torch.nn.functional.normalize(self.kb_embeddings, dim=-1)  # (N, D)
+		sims = (kb_norm @ emb_t.T).squeeze(-1)  # (N,)
+
+		# Выбираем топ-3 из разных семейств (диверсификация)
+		sorted_idx = sims.argsort(descending=True).tolist()
+		selected = []
+		seen_families: set = set()
+		for idx in sorted_idx:
+			base_fam = self.kb_families[idx]
+			for suf in ('_aug_permute', '_aug_expand', '_aug_noise'):
+				base_fam = base_fam.replace(suf, '')
+			if base_fam not in seen_families:
+				seen_families.add(base_fam)
+				selected.append(idx)
+			if len(selected) >= 3:
+				break
+
+		lines = []
+
+		# Заголовок с маршрутизацией
+		lines.append(f"Домен: {expert_name} | Маршрутизация: {', '.join(expert_weights)}")
+		lines.append("")
+
+		# Лучшая аналогия с объяснением
+		if selected:
+			best_idx = selected[0]
+			best_sim = sims[best_idx].item()
+			best_src = self.kb_source_texts[best_idx]
+			best_tgt = self.kb_target_texts[best_idx]
+			best_fam = self.kb_families[best_idx].replace('_aug_permute', '').replace('_aug_expand', '').replace('_aug_noise', '').replace('_', ' ').strip()
+
+			lines.append(f"Структурная аналогия [{best_fam}] (cos={best_sim:.3f}):")
+			lines.append(f"  Область A: {best_src[:160]}")
+			lines.append(f"  Область B: {best_tgt[:160]}")
+			lines.append(f"  Общий принцип: оба явления описываются одной структурой — '{best_fam.split()[0]}' паттерн")
+															  # сохраняем первое слово семейства как ключевой принцип
+
+		# Дополнительные аналогии
+		if len(selected) > 1:
+			lines.append("")
+			lines.append("Смежные аналогии:")
+			for rank, idx in enumerate(selected[1:], 2):
 				sim = sims[idx].item()
-				fam = self.kb_families[idx].replace('_aug_permute', '').replace('_aug_expand', '').replace('_', ' ')
+				fam = self.kb_families[idx].replace('_aug_permute', '').replace('_aug_expand', '').replace('_aug_noise', '').replace('_', ' ').strip()
 				src = self.kb_source_texts[idx]
 				tgt = self.kb_target_texts[idx]
-				prefix = "Лучшая аналогия" if rank == 0 else f"Также ({rank+1})"
-				lines.append(f"{prefix} [{fam}] (sim={sim:.3f}):")
-				lines.append(f"  А: {src[:120]}")
-				lines.append(f"  Б: {tgt[:120]}")
-			return "\n".join(lines)
-		else:
-			return f"[{expert_name}] Embedding norm: {result['norm']:.4f}. База знаний не загружена."
+				lines.append(f"  {rank}. [{fam}] (cos={sim:.3f})")
+				lines.append(f"     {src[:100]}")
+				lines.append(f"     ≈ {tgt[:100]}")
+
+		return "\n".join(lines)
 
 	def chat_loop(self):
 		"""Основной цикл чата."""
