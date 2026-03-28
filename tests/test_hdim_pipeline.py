@@ -141,16 +141,42 @@ class TestPipelineTransfer:
 
         # Проверка размерностей в state
         assert state["output"].shape == (4, 64)
+        assert state["g_source"].shape == (4, pipeline.clifford_dim)
         assert state["u_inv"].shape == (4, pipeline.clifford_dim)
+        assert state["u_mem"].shape == (4, pipeline.clifford_dim)
+        assert state["u_route"].shape == (4, pipeline.clifford_dim)
+        assert state["g_target"].shape == (4, pipeline.clifford_dim)
+
+        # Контракт alias-полей TransferState
+        assert torch.allclose(state["raw_invariant"], state["u_inv"])
+        assert torch.allclose(state["memory_augmented_invariant"], state["u_mem"])
+        assert torch.allclose(state["exported_invariant"], state["u_route"])
+        assert torch.allclose(state["invariant"], state["u_route"])
 
     def test_pipeline_transfer_input_is_invariant(self, pipeline):
         """Трансфер когда вход уже является инвариантом."""
-        # ПРИМЕЧАНИЕ: Этот тест отключён т.к. обнаружен баг в pipeline:
-        # При input_is_invariant=True, u_route передаётся напрямую в r_target,
-        # но u_route уже прошёл через MoE и имеет размерность expert_dim,
-        # а не clifford_dim. Это вызывает ошибку в geometric_product.
-        # TODO: Исправить баг в hdim_pipeline.py (Фаза 2)
-        pytest.skip("Баг в pipeline: размерность u_route не совпадает с clifford_dim при input_is_invariant=True")
+        invariant_input = torch.randn(4, pipeline.clifford_dim)
+
+        pipeline.eval()
+        output, state = pipeline.transfer(
+            invariant_input,
+            source_domain="source",
+            target_domain="target",
+            update_memory=False,
+            memory_mode="retrieve",
+            input_is_invariant=True,
+        )
+
+        assert output.shape == (4, 64)
+        assert state["input_is_invariant"] is True
+        assert state["g_source"] is None
+        assert state["u_inv"].shape == invariant_input.shape
+        assert state["u_mem"].shape == invariant_input.shape
+        assert state["u_route"].shape == invariant_input.shape
+        assert state["g_target"].shape == invariant_input.shape
+        assert torch.allclose(state["u_inv"], invariant_input)
+        assert not torch.isnan(state["g_target"]).any()
+        assert not torch.isnan(output).any()
 
 
 class TestPipelineMemoryModes:

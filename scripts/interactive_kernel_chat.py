@@ -71,12 +71,41 @@ class HDIMKernelChat:
 		).to(self.device)
 
 		self.expert_names = ["Math", "Language", "Code", "Science"]
+		self.domain_keywords = {
+			0: ("math", "алгеб", "геометр", "интеграл", "дифф", "формул", "теор", "матриц", "вектор", "уравнен", "числ", "fourier", "фурье"),
+			1: ("language", "язык", "текст", "слово", "граммат", "перевод", "семан", "синтакс", "литерат", "метафор", "sentence", "translation"),
+			2: ("code", "код", "программ", "python", "java", "javascript", "bug", "debug", "алгоритм", "функц", "класс", "api", "script", "git", "repo"),
+			3: ("science", "физ", "хим", "био", "dna", "ген", "клет", "тепл", "терм", "энерг", "квант", "молек", "эксперимент", "наук", "кавитац"),
+		}
 		self._init_knowledge_base()
 
 		print("HDIM Kernel initialized!")
 		print(f" Experts: {self.config.num_experts} ({', '.join(self.expert_names)})")
 		print(f" Knowledge base loaded")
 		print()
+
+	def _normalize_family(self, family: str) -> str:
+		base_family = family or "?"
+		for suffix in ("_aug_permute", "_aug_expand", "_aug_noise"):
+			base_family = base_family.replace(suffix, "")
+		return base_family.replace("_", " ").strip()
+
+	def _infer_domain_id(self, text: str) -> int:
+		text_lower = text.lower()
+		scores = {
+			domain_id: sum(text_lower.count(keyword) for keyword in keywords)
+			for domain_id, keywords in self.domain_keywords.items()
+		}
+		best_domain, best_score = max(scores.items(), key=lambda item: item[1])
+		sorted_scores = sorted(scores.values(), reverse=True)
+		if best_score <= 0:
+			return 0
+		if len(sorted_scores) > 1 and best_score == sorted_scores[1]:
+			return 0
+		return best_domain
+
+	def _infer_kb_domain(self, source_text: str, target_text: str, family: str) -> int:
+		return self._infer_domain_id(f"{family} {source_text} {target_text}")
 
 	def _init_knowledge_base(self):
 		"""Load knowledge base from real_pairs and encode with SBERT for retrieval."""
@@ -88,6 +117,7 @@ class HDIMKernelChat:
 			print(f"Warning: could not load knowledge base: {e}")
 			self.kb_texts = []
 			self.kb_embeddings = None
+			self.kb_domains = []
 			return
 
 		# Keep only positive cross-domain pairs with readable text
@@ -107,6 +137,10 @@ class HDIMKernelChat:
 		self.kb_source_texts = [p["source_text"] for p in pos]
 		self.kb_target_texts = [p["target_text"] for p in pos]
 		self.kb_families = [p.get("family", "?") for p in pos]
+		self.kb_domains = [
+			self._infer_kb_domain(p["source_text"], p["target_text"], p.get("family", "?"))
+			for p in pos
+		]
 
 		print(f"Encoding {len(pos)} knowledge pairs with SBERT...")
 		with torch.no_grad():
@@ -153,7 +187,8 @@ class HDIMKernelChat:
 		"""Кодирует текст через HDIM pipeline."""
 		with torch.no_grad():
 			text_emb = self.model.text_encoder([text], device=self.device)
-			domain_id = torch.zeros(1, dtype=torch.long, device=self.device)
+			pred_domain = self._infer_domain_id(text)
+			domain_id = torch.tensor([pred_domain], dtype=torch.long, device=self.device)
 
 			result = self.model.core_model(text_emb, domain_id=domain_id, return_state=True)
 
@@ -173,16 +208,32 @@ class HDIMKernelChat:
 			else:
 				embedding = np.array(embeddings[0])
 
-			if aux_state is not None and hasattr(aux_state, "expert_usage"):
-				weights_arr = aux_state.expert_usage.cpu().numpy()
+			dominant_expert = pred_domain
+			if aux_state is not None and hasattr(aux_state, "expert_weights"):
+				expert_weights = aux_state.expert_weights
+				if isinstance(expert_weights, torch.Tensor):
+					expert_weights = expert_weights.reshape(-1, expert_weights.shape[-1])
+					weights_arr = expert_weights[0].detach().cpu().numpy()
+				else:
+					weights_arr = np.array(expert_weights)
 			elif routing_weights is not None:
-				weights_arr = routing_weights[0].cpu().numpy() if routing_weights.dim() > 1 else routing_weights.cpu().numpy()
+				weights_arr = routing_weights[0].detach().cpu().numpy() if routing_weights.dim() > 1 else routing_weights.detach().cpu().numpy()
+			elif aux_state is not None and hasattr(aux_state, "expert_usage"):
+				weights_arr = aux_state.expert_usage.detach().cpu().numpy()
 			else:
-				weights_arr = np.zeros(self.config.num_experts)
+				weights_arr = np.zeros(self.config.num_experts, dtype=np.float32)
+
+			if aux_state is not None and hasattr(aux_state, "top_expert_idx"):
+				top_expert_idx = aux_state.top_expert_idx
+				if isinstance(top_expert_idx, torch.Tensor):
+					dominant_expert = int(top_expert_idx.reshape(-1)[0].item())
+			elif isinstance(weights_arr, np.ndarray) and weights_arr.size > 0:
+				dominant_expert = int(np.argmax(weights_arr))
 
 			routing_info = {
 				"weights": weights_arr.tolist() if isinstance(weights_arr, np.ndarray) else weights_arr,
-				"dominant_expert": int(np.argmax(weights_arr)) if isinstance(weights_arr, np.ndarray) else 0,
+				"dominant_expert": dominant_expert,
+				"predicted_domain": pred_domain,
 			}
 
 			slot_out = None
@@ -203,10 +254,11 @@ class HDIMKernelChat:
 		"""Ответ через HDIM-retrieval с объяснением структурной аналогии."""
 		embedding = result.get("sbert_embedding", result["embedding"])  # SBERT space
 		expert_idx = result["routing"]["dominant_expert"]
+		pred_domain = result["routing"].get("predicted_domain", expert_idx)
+		predicted_name = self.expert_names[pred_domain]
 		expert_name = self.expert_names[expert_idx]
 		weights = result["routing"]["weights"]
 
-		# Все эксперты с их весами для контекста
 		expert_weights = [
 			f"{self.expert_names[i]}={w:.1%}"
 			for i, w in enumerate(weights)
@@ -216,18 +268,27 @@ class HDIMKernelChat:
 			return f"[{expert_name}] База знаний не загружена."
 
 		emb_t = torch.from_numpy(embedding).float().to(self.device)
-		emb_t = torch.nn.functional.normalize(emb_t.unsqueeze(0), dim=-1)  # (1, D)
-		kb_norm = torch.nn.functional.normalize(self.kb_embeddings, dim=-1)  # (N, D)
+		emb_t = F.normalize(emb_t.unsqueeze(0), dim=-1)  # (1, D)
+		kb_norm = F.normalize(self.kb_embeddings, dim=-1)  # (N, D)
 		sims = (kb_norm @ emb_t.T).squeeze(-1)  # (N,)
 
-		# Выбираем топ-3 из разных семейств (диверсификация)
-		sorted_idx = sims.argsort(descending=True).tolist()
+		preferred_domains = {pred_domain, expert_idx}
+		domain_bonus = 0.05
+		scores = sims.clone()
+		if self.kb_domains:
+			for idx, kb_domain in enumerate(self.kb_domains):
+				if kb_domain in preferred_domains:
+					scores[idx] += domain_bonus
+
+		reranked_idx = scores.argsort(descending=True).tolist()
+		domain_matched = [idx for idx in reranked_idx if self.kb_domains[idx] in preferred_domains]
+		fallback_idx = [idx for idx in reranked_idx if self.kb_domains[idx] not in preferred_domains]
+		ranked_idx = domain_matched + fallback_idx
+
 		selected = []
 		seen_families: set = set()
-		for idx in sorted_idx:
-			base_fam = self.kb_families[idx]
-			for suf in ('_aug_permute', '_aug_expand', '_aug_noise'):
-				base_fam = base_fam.replace(suf, '')
+		for idx in ranked_idx:
+			base_fam = self._normalize_family(self.kb_families[idx])
 			if base_fam not in seen_families:
 				seen_families.add(base_fam)
 				selected.append(idx)
@@ -235,35 +296,38 @@ class HDIMKernelChat:
 				break
 
 		lines = []
-
-		# Заголовок с маршрутизацией
-		lines.append(f"Домен: {expert_name} | Маршрутизация: {', '.join(expert_weights)}")
+		lines.append(
+			f"Предсказанный домен: {predicted_name} | Routed expert: {expert_name} | "
+			f"Маршрутизация: {', '.join(expert_weights)}"
+		)
 		lines.append("")
 
-		# Лучшая аналогия с объяснением
 		if selected:
 			best_idx = selected[0]
 			best_sim = sims[best_idx].item()
+			best_score = scores[best_idx].item()
 			best_src = self.kb_source_texts[best_idx]
 			best_tgt = self.kb_target_texts[best_idx]
-			best_fam = self.kb_families[best_idx].replace('_aug_permute', '').replace('_aug_expand', '').replace('_aug_noise', '').replace('_', ' ').strip()
+			best_fam = self._normalize_family(self.kb_families[best_idx])
+			principle = best_fam.split()[0] if best_fam else "общий"
+			match_note = "domain-match" if self.kb_domains[best_idx] in preferred_domains else "fallback"
 
-			lines.append(f"Структурная аналогия [{best_fam}] (cos={best_sim:.3f}):")
+			lines.append(f"Структурная аналогия [{best_fam}] (cos={best_sim:.3f}, score={best_score:.3f}, {match_note}):")
 			lines.append(f"  Область A: {best_src[:160]}")
 			lines.append(f"  Область B: {best_tgt[:160]}")
-			lines.append(f"  Общий принцип: оба явления описываются одной структурой — '{best_fam.split()[0]}' паттерн")
-															  # сохраняем первое слово семейства как ключевой принцип
+			lines.append(f"  Общий принцип: оба явления описываются одной структурой — '{principle}' паттерн")
 
-		# Дополнительные аналогии
 		if len(selected) > 1:
 			lines.append("")
 			lines.append("Смежные аналогии:")
 			for rank, idx in enumerate(selected[1:], 2):
 				sim = sims[idx].item()
-				fam = self.kb_families[idx].replace('_aug_permute', '').replace('_aug_expand', '').replace('_aug_noise', '').replace('_', ' ').strip()
+				score = scores[idx].item()
+				fam = self._normalize_family(self.kb_families[idx])
 				src = self.kb_source_texts[idx]
 				tgt = self.kb_target_texts[idx]
-				lines.append(f"  {rank}. [{fam}] (cos={sim:.3f})")
+				match_note = "domain-match" if self.kb_domains[idx] in preferred_domains else "fallback"
+				lines.append(f"  {rank}. [{fam}] (cos={sim:.3f}, score={score:.3f}, {match_note})")
 				lines.append(f"     {src[:100]}")
 				lines.append(f"     ≈ {tgt[:100]}")
 

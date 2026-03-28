@@ -115,21 +115,20 @@ class TransferEngine(nn.Module):
             u_route, router_state = self.moe(u_mem)
 
         # Sandwich transfer through domain rotors
-        if input_is_invariant:
-            # Direct application of target rotor
-            g_target = target_rotor(u_route)
-        else:
-            # Full sandwich transfer
-            _, g_target = sandwich_transfer(
-                self.algebra,
-                g_source,
-                source_rotor,
-                target_rotor,
-                invariant_override=u_route,
-            )
+        _, g_target = sandwich_transfer(
+            self.algebra,
+            u_route,
+            source_rotor,
+            target_rotor,
+            invariant_override=u_route,
+        )
 
         # Decode to output
         output = self.decoder(g_target)
+
+        router_state = dict(router_state)
+        router_state["u_route"] = u_route
+        router_state["g_target"] = g_target
 
         return output, router_state
 

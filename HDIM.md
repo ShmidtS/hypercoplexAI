@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 30.0 | Дата: 2026-03-26 | **РЕКОРД: score=1.1814** (Run 18, ep13, temp=0.10, λ_pair=0.40, margin=1.0224) | Phase 30: MoEKernel buffer fix + SoftMoERouter deadlock fix | Numerical tests 159/159 PASS + pytest 453 PASS*
+*Версия: 30.0 | Дата: 2026-03-26 | **РЕКОРД: score=1.1814** (Run 18, ep13, temp=0.10, λ_pair=0.40, margin=1.0224) | Phase 30: MoEKernel buffer fix + SoftMoERouter deadlock fix | Numerical Python verification/tests 159/159 PASS + pytest 453 PASS*
 
 ---
 
@@ -844,7 +844,7 @@ Real-model benchmark (SBERT + real_pairs_v10.json, 5 эп):
 | pair_margin | 0.000 | 0.902 | ∞ |
 | train_loss (ep5) | 0.930 | 0.274 | -71% |
 
-Lean4: 159/159 PASS (+11 теорем Phase 28). pytest: 453 PASS (+45 moe_kernel тестов).
+Numerical Python verification/tests: 159/159 PASS in `verify_lean4_numerical.py`. pytest: 453 PASS (+45 moe_kernel тестов).
 
 ### Phase 29 — TitansMemory RAG API (2026-03-19)
 

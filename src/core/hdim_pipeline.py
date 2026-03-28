@@ -223,7 +223,7 @@ class HDIMPipeline(nn.Module):
                 u_inv=u_inv,
                 u_mem=u_mem,
                 u_route=router_state.get("u_route", u_mem),
-                g_target=output if input_is_invariant else None,
+                g_target=router_state["g_target"],
                 output=output,
                 memory_loss=memory_state.loss,
                 memory_retrieved=memory_state.retrieved,

@@ -3,7 +3,7 @@
 > **Дата:** 2026-03-26
 > **Версия:** Research Prototype (Phase 30)
 > **Источники:** Исследовательские отчёты в `[.omc/research/](../.omc/research/)`
-> **Verification:** Lean4 159/159 PASS | pytest 453 PASS
+> **Verification:** Numerical Python verification/tests 159/159 PASS (`verify_lean4_numerical.py`) | pytest 453 PASS
 
 ---
 
