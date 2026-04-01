@@ -11,18 +11,14 @@ from typing import List, Optional
 
 from .hypercomplex import CliffordAlgebra
 
-# Triton acceleration (optional)
-try:
-    from .cuda import has_triton_support, apply_triton_clifford_interaction
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-    
-    def has_triton_support() -> bool:
-        return False
-    
-    def apply_triton_clifford_interaction(*args, **kwargs):
-        raise RuntimeError("Triton not available")
+# Triton acceleration not available
+TRITON_AVAILABLE = False
+
+def has_triton_support() -> bool:
+    return False
+
+def apply_triton_clifford_interaction(*args, **kwargs):
+    raise RuntimeError("Triton not available")
 
 
 class CliffordInteractionExpert(nn.Module):

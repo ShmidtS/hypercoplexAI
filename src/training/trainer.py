@@ -1177,11 +1177,23 @@ class HDIMTrainer:
             return self._compute_batch_losses(batch)
 
     def train_step(self, batch: Dict[str, Any], scaler=None) -> torch.Tensor:
-        """Execute one training step with optional AMP scaler support."""
+        """Execute one training step with optional AMP scaler support.
+
+        Phase 31: Includes OnlineLearner replay_step for experience replay.
+        """
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         losses = self._compute_batch_losses(batch)
         loss_total = losses["loss_total"]
+
+        # Phase 31: Experience replay from OnlineLearner buffer
+        online_replay_loss = torch.tensor(0.0, device=loss_total.device)
+        if hasattr(self.model, 'online_learner') and self.model.online_learner is not None:
+            replay_loss = self.model.online_learner.replay_step(self.model)
+            if replay_loss is not None:
+                online_replay_loss = replay_loss
+                loss_total = loss_total + replay_loss
+
         if scaler is not None:
             # NaN/Inf loss: skip step entirely and force scale reduction.
             # Without this, backward() produces NaN grads → scaler.step()
@@ -1228,6 +1240,7 @@ class HDIMTrainer:
             if not isinstance(v, torch.Tensor) or v.dim() == 0
         }
         self._last_loss_components["grad_norm"] = self._last_grad_norm
+        self._last_loss_components["online_replay_loss"] = online_replay_loss.item()
         return loss_total.detach()
 
     def compute_iso_loss(
@@ -1280,6 +1293,10 @@ class HDIMTrainer:
             "temp_schedule_T_0": self._temp_schedule_T_0,
             "focal_gamma": self._focal_gamma,
         }
+        # Phase 31: Save OnlineLearner state for persistence between sessions
+        if hasattr(self.model, 'online_learner') and self.model.online_learner is not None:
+            checkpoint["online_learner_state"] = self.model.online_learner.save_state()
+
         if scaler is not None:
             checkpoint["scaler_state_dict"] = scaler.state_dict()
         torch.save(checkpoint, path)
@@ -1313,5 +1330,10 @@ class HDIMTrainer:
         self._tau_min = checkpoint.get("tau_min", 0.01)
         self._temp_schedule_T_0 = checkpoint.get("temp_schedule_T_0", 20)
         self._focal_gamma = checkpoint.get("focal_gamma", 1.0)
+        # Phase 31: Restore OnlineLearner state from checkpoint
+        if hasattr(self.model, 'online_learner') and self.model.online_learner is not None:
+            if "online_learner_state" in checkpoint:
+                self.model.online_learner.load_state(checkpoint["online_learner_state"])
+
         if scaler is not None and "scaler_state_dict" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])

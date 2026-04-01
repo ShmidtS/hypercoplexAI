@@ -115,6 +115,11 @@ class HDIMConfig:
     use_msa: bool = False  # Phase 29: MSA sparse index for SemanticMemory
     use_overflow: bool = False  # Phase 29: MSA overflow buffer for EpisodicMemory
     text: HDIMTextConfig = field(default_factory=HDIMTextConfig)
+    # Phase 31: Self-Evolution (Online Learning)
+    online_learning: bool = False  # Enable online TTT learning
+    online_replay_size: int = 10000  # Experience replay buffer size
+    online_surprise_threshold: float = 0.3  # Surprise threshold for updates
+    online_ttt_lr: float = 1e-5  # TTT learning rate
 
     def __post_init__(self):
         # Compute num_experts from expert_names if provided
@@ -145,6 +150,8 @@ class HDIMModel(nn.Module):
 
     Forward returns (output, routing_weights, invariant) where invariant is
     the hidden-dim projection of the canonical training invariant.
+
+    Phase 31: Supports self-evolution via OnlineLearner when config.online_learning=True.
     """
 
     def __init__(self, config: HDIMConfig) -> None:
@@ -168,6 +175,20 @@ class HDIMModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         clifford_dim = self.pipeline.clifford_dim
         self.training_inv_head = nn.Linear(clifford_dim, config.hidden_dim)
+
+        # Phase 31: Online Learner for self-evolution (uses moe output dimension)
+        self.online_learner = None
+        if config.online_learning:
+            from src.core.online_learner import OnlineLearner
+            self.online_learner = OnlineLearner(
+                hidden_dim=clifford_dim,
+                num_experts=config.num_experts or 4,
+                replay_buffer_size=config.online_replay_size,
+                surprise_threshold=config.online_surprise_threshold,
+                ttt_lr=config.online_ttt_lr,
+            )
+
+        # Rotor stacks rebuild each forward (requires_grad rotors need fresh graph)
 
     def _domain_idx_to_name(self, domain_idx: int) -> str:
         """Convert an integer domain index to its registered name."""
@@ -317,7 +338,11 @@ class HDIMModel(nn.Module):
         )
 
     def _build_rotor_stacks(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build stacked normalized and inverse rotor tensors for all domains."""
+        """Build stacked normalized and inverse rotor tensors for all domains.
+
+        Rebuilt each forward pass to ensure correct autograd flow into
+        domain rotor parameters.
+        """
         pipeline = self.pipeline
         rotors_n = torch.stack(
             [pipeline.domain_rotors[self._domain_names[i]]._normalized_R()
@@ -386,6 +411,32 @@ class HDIMModel(nn.Module):
             memory_mode=runtime.memory_mode,
         )
 
+        # Phase 31: Online Learning (Self-Evolution)
+        # Entirely detached from main training graph to avoid backward conflicts.
+        online_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        online_updated = False
+        if self.online_learner is not None and self.training:
+            with torch.no_grad():
+                moe = pipeline.moe
+                if hasattr(moe, 'dispatch_proj'):
+                    gate_logits = moe.dispatch_proj(u_mem[0:1].detach())
+                    slot_idx = int(gate_logits.argmax(dim=-1).item())
+                    dominant_expert = slot_idx // getattr(moe, 'slots_per_expert', 1)
+                elif hasattr(moe, 'router_proj'):
+                    gate_logits = moe.router_proj(u_mem[0:1].detach())
+                    dominant_expert = int(gate_logits.argmax(dim=-1).item() % (self.config.num_experts or 4))
+                elif hasattr(moe, 'kernel') and hasattr(moe.kernel, 'router_proj'):
+                    # MoEKernelAdapter wraps MoEKernel as self.kernel
+                    gate_logits = moe.kernel.router_proj(u_mem[0:1].detach())
+                    dominant_expert = int(gate_logits.argmax(dim=-1).item() % (self.config.num_experts or 4))
+                else:
+                    dominant_expert = 0
+
+                _loss, online_updated, _ = self.online_learner.online_update(
+                    x=u_mem.detach(),
+                    expert_idx=dominant_expert,
+                )
+
         # 4) MoE routing per group
         u_route = torch.empty_like(u_mem)
         router_loss = torch.zeros((), device=device, dtype=dtype)
@@ -450,8 +501,8 @@ class HDIMModel(nn.Module):
         update_memory: bool = True,
         memory_mode: str = "update",
     ) -> (
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+        | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], HDIMAuxState]
     ):
         """Run the HDIM forward pass for same-domain reconstruction batches."""
         x = self.dropout(x)
