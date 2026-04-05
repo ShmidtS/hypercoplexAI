@@ -195,6 +195,15 @@ class HDIMModel(nn.Module):
                 ttt_lr=config.online_ttt_lr,
             )
 
+        # Phase 32: Hallucination Detector (optional)
+        self.hallucination_detector = None
+        if config.hallucination_detection:
+            from src.core.hallucination_detector import HallucinationDetector
+            self.hallucination_detector = HallucinationDetector(
+                num_experts=config.num_experts or 4,
+                risk_threshold=config.hallucination_risk_threshold,
+            )
+
         # Rotor stacks rebuild each forward (requires_grad rotors need fresh graph)
 
     def _domain_idx_to_name(self, domain_idx: int) -> str:
@@ -237,6 +246,8 @@ class HDIMModel(nn.Module):
         z_loss: torch.Tensor,
         memory_updated: bool,
         runtime: HDIMRuntimeConfig,
+        hallucination_risk: float = 0.0,
+        memory_surprise: float | None = None,
     ) -> HDIMAuxState:
         return HDIMAuxState(
             memory_loss=memory_loss,
@@ -255,6 +266,8 @@ class HDIMModel(nn.Module):
             memory_updated=memory_updated,
             memory_mode=runtime.memory_mode,
             update_memory=runtime.update_memory,
+            hallucination_risk=hallucination_risk,
+            memory_surprise=memory_surprise,
         )
 
     def _build_aux_state_from_transfer_state(
@@ -489,14 +502,31 @@ class HDIMModel(nn.Module):
         router_loss = router_loss / total_samples
         z_loss = z_loss / total_samples
 
+        # Phase 32: Hallucination detection
+        hallucination_risk = 0.0
+        memory_surprise_val = None
+        if self.hallucination_detector is not None:
+            memory_surprise_val = memory_state.surprise.mean().item() if hasattr(memory_state, 'surprise') and memory_state.surprise is not None else None
+            result = self.hallucination_detector.from_router_state(
+            router_state={
+            "routing_entropy": routing_entropy,
+            "gate_weights": routing_weights,
+            "topk_gate_weights": topk_gate_weights,
+            },
+            memory_mismatch=torch.tensor(memory_surprise_val) if memory_surprise_val is not None else None,
+            memory_loss=memory_loss,
+            )
+            hallucination_risk = result.hallucination_risk
+
         # Concatenate slot_outputs if available
         slot_outputs_tensor = torch.cat(all_slot_outputs, dim=0) if all_slot_outputs else None
 
         return (
-            output, routing_weights, raw_invariant, memory_augmented_invariant,
-            exported_invariant, topk_idx, topk_gate_weights,
-            train_scores_snapshot, expert_usage, routing_entropy,
-            memory_loss, router_loss, z_loss, memory_updated, slot_outputs_tensor,
+        output, routing_weights, raw_invariant, memory_augmented_invariant,
+        exported_invariant, topk_idx, topk_gate_weights,
+        train_scores_snapshot, expert_usage, routing_entropy,
+        memory_loss, router_loss, z_loss, memory_updated, slot_outputs_tensor,
+        hallucination_risk, memory_surprise_val,
         )
 
     def forward(
@@ -529,7 +559,8 @@ class HDIMModel(nn.Module):
             output, routing_weights, raw_invariant, memory_augmented_invariant,
             exported_invariant, topk_idx, topk_gate_weights,
             train_scores_snapshot, expert_usage, _routing_entropy,
-            memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
+        memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
+        _hallucination_risk, _memory_surprise,
         ) = self._forward_core(
             x, R_inv_per_sample, R_per_sample, R_per_sample, R_inv_per_sample,
             group_masks, runtime,
@@ -553,6 +584,8 @@ class HDIMModel(nn.Module):
                 z_loss=z_loss,
                 memory_updated=memory_updated,
                 runtime=runtime,
+            hallucination_risk=_hallucination_risk,
+            memory_surprise=_memory_surprise,
             )
             return output, routing_weights, invariant, _slot_outputs, aux_state
         return output, routing_weights, invariant, _slot_outputs
@@ -657,7 +690,8 @@ class HDIMModel(nn.Module):
             output, routing_weights, raw_invariant, memory_augmented_invariant,
             exported_invariant, topk_idx, topk_gate_weights,
             train_scores_snapshot, expert_usage, _routing_entropy,
-            memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
+        memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
+        _hallucination_risk, _memory_surprise,
         ) = self._forward_core(
             source_encoding,
             R_src_inv_per_sample, R_src_per_sample,
@@ -684,6 +718,8 @@ class HDIMModel(nn.Module):
             z_loss=z_loss,
             memory_updated=memory_updated,
             runtime=runtime,
+            hallucination_risk=_hallucination_risk,
+            memory_surprise=_memory_surprise,
         )
         return output, routing_weights, invariant, _slot_outputs, aux_state
 
