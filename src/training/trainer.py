@@ -993,14 +993,22 @@ class HDIMTrainer:
         texts: Sequence[str],
         domain_id: torch.Tensor,
         regime: TrainingRegime,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
-        return self.model.forward_texts(
+        *,
+        return_encoding: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState, torch.Tensor]:
+        result = self.model.forward_texts(
             texts,
             domain_id,
             return_state=True,
             update_memory=regime.update_memory,
             memory_mode=regime.memory_mode,
+            return_encoding=return_encoding,
         )
+        if return_encoding:
+            output, routing_weights, invariant, slot_outputs, aux_state, encodings = result
+            return (output, routing_weights, invariant, slot_outputs, aux_state, encodings)
+        output, routing_weights, invariant, slot_outputs, aux_state = result
+        return (output, routing_weights, invariant, slot_outputs, aux_state)
 
     def _forward_batch(
         self,
@@ -1053,10 +1061,9 @@ class HDIMTrainer:
                 else:
                     recon_target = _tgt_enc
             else:
-                output, routing_weights, invariant, _slot_outputs, aux_state = self._forward_text_batch(
-                    texts, domain_id, regime
+                output, routing_weights, invariant, _slot_outputs, aux_state, recon_target = self._forward_text_batch(
+                    texts, domain_id, regime, return_encoding=True
                 )
-                recon_target = self._encode_texts(texts)
         else:
             encoding = batch["encoding"].to(self.device)
             if regime.mode == "paired":

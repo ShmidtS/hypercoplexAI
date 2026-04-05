@@ -321,9 +321,10 @@ class TextHDIMModel(nn.Module):
         return_state: bool = False,
         update_memory: bool = True,
         memory_mode: str = "update",
+        return_encoding: bool = False,
     ):
         encodings = self.encode_texts(texts, device=domain_id.device)
-        return HDIMModel.forward(
+        result = HDIMModel.forward(
             self.core_model,
             encodings,
             domain_id,
@@ -331,6 +332,10 @@ class TextHDIMModel(nn.Module):
             update_memory=update_memory,
             memory_mode=memory_mode,
         )
+        if return_encoding:
+            output, routing_weights, invariant, slot_outputs, aux_state = result
+            return (output, routing_weights, invariant, slot_outputs, aux_state, encodings)
+        return result
 
     def transfer_texts(
         self,

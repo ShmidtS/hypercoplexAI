@@ -45,8 +45,10 @@ class HDIMAuxState:
     memory_updated: bool
     memory_mode: str
     update_memory: bool
+    hallucination_risk: float = 0.0
+    memory_surprise: float | None = None
 
-    def to_dict(self) -> Dict[str, Union[torch.Tensor, bool, str]]:
+    def to_dict(self) -> Dict[str, Union[torch.Tensor, bool, str, float, None]]:
         return {
             "memory_loss": self.memory_loss,
             "router_loss": self.router_loss,
@@ -64,6 +66,8 @@ class HDIMAuxState:
             "memory_updated": self.memory_updated,
             "memory_mode": self.memory_mode,
             "update_memory": self.update_memory,
+            "hallucination_risk": self.hallucination_risk,
+            "memory_surprise": self.memory_surprise,
         }
 
 
@@ -120,6 +124,9 @@ class HDIMConfig:
     online_replay_size: int = 10000  # Experience replay buffer size
     online_surprise_threshold: float = 0.3  # Surprise threshold for updates
     online_ttt_lr: float = 1e-5  # TTT learning rate
+    # Phase 32: Hallucination Detection
+    hallucination_detection: bool = False  # Enable hallucination detection
+    hallucination_risk_threshold: float = 0.5  # Risk threshold for hallucination flag
 
     def __post_init__(self):
         # Compute num_experts from expert_names if provided
