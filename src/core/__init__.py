@@ -29,6 +29,16 @@ from .moe_kernel import (
 from .moe_interface import MoERouter
 from .moe_kernel_adapter import MoEKernelAdapter
 from .soft_moe_router import SoftMoERouter
+from .maxscore_router import MaxScoreRouter, RouterCheckpoint, RouterResult
+from .hallucination_detector import HallucinationDetector, HallucinationDetectionResult, SemanticEntropyProbe
+from .online_lora import (
+    OnlineLoRA,
+    OnlineLoRALinear,
+    OnlineLoRAConv,
+    OnlineLoRAConfig,
+    OnlineLoRAManager,
+    wrap_with_online_lora,
+)
 
 # SRP components (refactored from HDIMPipeline)
 from .domain_encoder import DomainEncoder
@@ -50,7 +60,12 @@ __all__ = [
     'MoEKernel', 'MoEKernelConfig', 'MoEKernelState',
     'DomainExpert', 'MathExpert', 'LanguageExpert', 'CodeExpert', 'ScienceExpert',
     'create_expert', 'EXPERT_REGISTRY',
-    'MoERouter', 'MoEKernelAdapter', 'SoftMoERouter',
+    'MoERouter', 'MoEKernelAdapter', 'SoftMoERouter', 'MaxScoreRouter', 'RouterCheckpoint', 'RouterResult',
+    # Hallucination detection
+    'HallucinationDetector', 'HallucinationDetectionResult', 'SemanticEntropyProbe',
+    # Online-LoRA
+    'OnlineLoRA', 'OnlineLoRALinear', 'OnlineLoRAConv', 'OnlineLoRAConfig', 'OnlineLoRAManager',
+    'wrap_with_online_lora',
     # SRP Components
     'DomainEncoder', 'InvariantProcessor', 'InvariantMemoryState', 'TransferEngine',
 ]

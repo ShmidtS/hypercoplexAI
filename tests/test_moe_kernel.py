@@ -920,3 +920,201 @@ class TestRegisterExpert:
                 math_expert = MathExpert(input_dim=64, hidden_dim=128)
                 # These specialized experts use FFN by default
                 assert hasattr(math_expert, 'net')
+
+
+# ============================================================
+# Batched Expert Execution
+# ============================================================
+
+class TestBatchedExpertExecution:
+    """Tests for batched expert execution via torch.bmm."""
+
+    def test_config_has_use_batched_experts(self):
+        """MoEKernelConfig has use_batched_experts parameter."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            use_batched_experts=True,
+        )
+        assert cfg.use_batched_experts is True
+
+    def test_batched_with_homogeneous_experts(self):
+        """Batched execution works with homogeneous DomainExpert instances."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["custom_0", "custom_1", "custom_2", "custom_3"],
+            use_batched_experts=True,
+        )
+        kernel = MoEKernel(cfg)
+        kernel.eval()
+
+        # All experts should be plain DomainExpert
+        for expert in kernel.experts:
+            assert type(expert).__name__ == "DomainExpert"
+
+        # Forward pass
+        x = torch.randn(16, 64)
+        out, state = kernel(x)
+        assert out.shape == (16, 64)
+        assert not torch.isnan(out).any()
+
+    def test_batched_gradient_flow(self):
+        """Gradients flow correctly through batched execution."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+            use_batched_experts=True,
+        )
+        kernel = MoEKernel(cfg)
+        kernel.train()
+
+        x = torch.randn(8, 64, requires_grad=True)
+        out, state = kernel(x)
+        loss = out.mean() + state.total_loss()
+        loss.backward()
+
+        assert x.grad is not None
+        assert not torch.isnan(x.grad).any()
+        # All experts should have gradients
+        for expert in kernel.experts:
+            for p in expert.parameters():
+                assert p.grad is not None
+
+    def test_can_use_batched_returns_false_for_specialized(self):
+        """_can_use_batched returns False for specialized experts."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["math", "language", "code", "science"],
+            use_batched_experts=True,
+        )
+        kernel = MoEKernel(cfg)
+
+        # Should detect heterogeneous experts
+        assert kernel._can_use_batched() is False
+
+    def test_can_use_batched_returns_true_for_homogeneous(self):
+        """_can_use_batched returns True for homogeneous DomainExpert."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+            use_batched_experts=True,
+        )
+        kernel = MoEKernel(cfg)
+
+        # Should detect homogeneous experts
+        assert kernel._can_use_batched() is True
+
+    def test_can_use_batched_false_for_can_experts(self):
+        """_can_use_batched returns False for CAN experts."""
+        cfg = MoEKernelConfig(
+            input_dim=16,
+            expert_hidden_dim=32,
+            num_experts=2,
+            expert_names=["a", "b"],
+            use_can_experts=True,
+            use_batched_experts=True,
+        )
+        kernel = MoEKernel(cfg)
+
+        # CAN experts should disable batched execution
+        assert kernel._can_use_batched() is False
+
+    def test_batched_fallback_to_sequential_for_specialized(self):
+        """Batched config falls back to sequential for specialized experts."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["math", "language", "code", "science"],
+            use_batched_experts=True,
+        )
+        kernel = MoEKernel(cfg)
+        kernel.eval()
+
+        # Should use sequential path even with use_batched_experts=True
+        x = torch.randn(8, 64)
+        out, state = kernel(x)
+        assert out.shape == (8, 64)
+        assert not torch.isnan(out).any()
+
+    def test_batched_output_matches_sequential(self):
+        """Batched and sequential execution produce similar outputs."""
+        torch.manual_seed(42)
+
+        # Create two kernels with same architecture
+        cfg_batched = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+            use_batched_experts=True,
+        )
+
+        cfg_seq = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+            use_batched_experts=False,
+        )
+
+        kernel_batched = MoEKernel(cfg_batched)
+        kernel_seq = MoEKernel(cfg_seq)
+
+        # Copy weights from batched to sequential
+        kernel_seq.load_state_dict(kernel_batched.state_dict())
+
+        kernel_batched.eval()
+        kernel_seq.eval()
+
+        x = torch.randn(8, 64)
+
+        with torch.no_grad():
+            out_batched, _ = kernel_batched(x)
+            out_seq, _ = kernel_seq(x)
+
+        # Outputs should be very close (within numerical precision)
+        assert torch.allclose(out_batched, out_seq, atol=1e-5)
+
+    def test_run_experts_batched_direct_call(self):
+        """Direct call to _run_experts_batched works correctly."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+        )
+        kernel = MoEKernel(cfg)
+        kernel.eval()
+
+        slot_inputs = torch.randn(4, 64)  # 4 slots (num_experts * slots_per_expert)
+
+        with torch.no_grad():
+            out = kernel._run_experts_batched(slot_inputs)
+
+        assert out.shape == (4, 64)
+        assert not torch.isnan(out).any()
+
+    def test_run_experts_batched_raises_for_specialized(self):
+        """_run_experts_batched raises RuntimeError for specialized experts."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["math", "language", "code", "science"],
+        )
+        kernel = MoEKernel(cfg)
+
+        slot_inputs = torch.randn(4, 64)
+
+        with pytest.raises(RuntimeError, match="homogeneous DomainExpert"):
+            kernel._run_experts_batched(slot_inputs)

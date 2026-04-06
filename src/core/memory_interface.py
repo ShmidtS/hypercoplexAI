@@ -29,6 +29,7 @@ class MemoryResult:
     alpha: Optional[torch.Tensor] = None  # memory blend gate (Titans)
     eta: Optional[torch.Tensor] = None    # momentum learning rate (Titans)
     theta: Optional[torch.Tensor] = None  # gradient step size (Titans)
+    surprise: Optional[torch.Tensor] = None  # surprise signal (Titans)
 
 
 class MemoryInterface(nn.Module, ABC):
@@ -100,6 +101,11 @@ class TitansAdapter(MemoryInterface):
         self._last_loss = mem_state.loss.detach()
         gate_val = torch.sigmoid(self.gate(x))
         gated_output = x + gate_val * mem_state.retrieved
+        # Export surprise signal if available
+        surprise = None
+        if hasattr(self.titans, '_last_surprise'):
+            surprise = torch.tensor(self.titans._last_surprise, device=x.device)
+
         return MemoryResult(
             output=gated_output,
             loss=mem_state.loss,
@@ -107,6 +113,7 @@ class TitansAdapter(MemoryInterface):
             alpha=mem_state.alpha,
             eta=mem_state.eta,
             theta=mem_state.theta,
+            surprise=surprise,
         )
 
     def reset(self, strategy: str = 'geometric') -> None:
