@@ -21,13 +21,17 @@ HDIM — MoE Kernel: полноценное ядро Mixture-of-Experts роут
 
 from __future__ import annotations
 
+import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -54,7 +58,11 @@ class MoEKernelConfig:
     dropout: float = 0.1
     expert_names: Optional[List[str]] = None
     use_can_experts: bool = False  # Использовать CliffordInteractionLayer вместо FFN
-    use_batched_experts: bool = False  # Batched execution via torch.bmm (requires homogeneous DomainExpert)
+    use_batched_experts: bool = True
+    batched_fallback: bool = True
+    expert_homogeneity_check: bool = True  # Batched execution via torch.bmm (requires homogeneous DomainExpert)
+    use_bias_balancing: bool = True # Alias for use_aux_loss_free (DeepSeek-V3 style)
+    bias_update_frequency: int = 100 # Steps between bias updates (0 = update every forward)
 
     def __post_init__(self):
         # Защита от вырожденного temperature (z_loss теряет эффект при temp < 0.1)
@@ -396,6 +404,24 @@ class MoEKernel(nn.Module):
         self.ortho_loss_weight = config.ortho_loss_weight
         self.use_expert_ortho = config.use_expert_ortho
 
+        # --- Heterogeneous expert warning ---
+        if config.expert_homogeneity_check and config.use_batched_experts:
+            if not self._can_use_batched():
+                logger.warning(
+                    "MoEKernel: use_batched_experts=True but experts are heterogeneous. "
+                    "Batched execution requires homogeneous DomainExpert instances. "
+                    "Falling back to sequential execution."
+                )
+
+        # --- Profiling state ---
+        self._profiling_enabled = False
+        self._batched_time_ns = 0
+        self._sequential_time_ns = 0
+        self._batched_call_count = 0
+        self._sequential_call_count = 0
+        # --- Bias update step counter ---
+        self._bias_step = 0
+
     # ----------------------------------------------------------
     # Dispatch / Combine
     # ----------------------------------------------------------
@@ -560,6 +586,72 @@ class MoEKernel(nn.Module):
         return True
 
     # ----------------------------------------------------------
+    # Profiling
+    # ----------------------------------------------------------
+
+    def enable_profiling(self, enabled: bool = True) -> None:
+        """Enable or disable expert execution profiling."""
+        self._profiling_enabled = enabled
+
+    def get_profiling_stats(self) -> dict:
+        """Return profiling statistics for batched vs sequential execution.
+
+        Returns:
+            dict with keys: batched_time_ms, sequential_time_ms,
+                           batched_calls, sequential_calls,
+                           avg_batched_ms, avg_sequential_ms
+        """
+        batched_ms = self._batched_time_ns / 1_000_000
+        sequential_ms = self._sequential_time_ns / 1_000_000
+        avg_batched = batched_ms / self._batched_call_count if self._batched_call_count > 0 else 0
+        avg_sequential = sequential_ms / self._sequential_call_count if self._sequential_call_count > 0 else 0
+        return {
+            "batched_time_ms": batched_ms,
+            "sequential_time_ms": sequential_ms,
+            "batched_calls": self._batched_call_count,
+            "sequential_calls": self._sequential_call_count,
+            "avg_batched_ms": avg_batched,
+            "avg_sequential_ms": avg_sequential,
+        }
+
+    def reset_profiling(self) -> None:
+        """Reset profiling counters."""
+        self._batched_time_ns = 0
+        self._sequential_time_ns = 0
+        self._batched_call_count = 0
+        self._sequential_call_count = 0
+        # --- Bias update step counter ---
+        self._bias_step = 0
+
+    def _profile_expert_execution(
+        self, slot_inputs: torch.Tensor, use_batched: bool
+    ) -> torch.Tensor:
+        """Execute experts with timing for profiling.
+
+        Args:
+            slot_inputs: (num_slots, D) tensor
+            use_batched: If True, use batched execution
+
+        Returns:
+            slot_outputs: (num_slots, D) tensor
+        """
+        if use_batched:
+            start = time.perf_counter_ns()
+            outputs = self._run_experts_batched(slot_inputs)
+            end = time.perf_counter_ns()
+            if self._profiling_enabled:
+                self._batched_time_ns += end - start
+                self._batched_call_count += 1
+        else:
+            start = time.perf_counter_ns()
+            outputs = self._run_experts(slot_inputs)
+            end = time.perf_counter_ns()
+            if self._profiling_enabled:
+                self._sequential_time_ns += end - start
+                self._sequential_call_count += 1
+        return outputs
+
+    # ----------------------------------------------------------
     # Load balance loss (Switch Transformer стиль)
     # ----------------------------------------------------------
 
@@ -652,10 +744,8 @@ class MoEKernel(nn.Module):
         slot_inputs = dispatch.T @ x_flat  # (S, D)
 
         # 3. Запуск экспертов (batched для homogeneous DomainExpert)
-        if self.config.use_batched_experts and self._can_use_batched():
-            slot_outputs = self._run_experts_batched(slot_inputs)  # 2-3x faster
-        else:
-            slot_outputs = self._run_experts(slot_inputs)  # Fallback for heterogeneous
+        use_batched = self.config.use_batched_experts and self._can_use_batched()
+        slot_outputs = self._profile_expert_execution(slot_inputs, use_batched)
 
         # 4. Combine: Y = combine @ slot_outputs
         output = combine @ slot_outputs  # (T, D)
@@ -689,9 +779,7 @@ class MoEKernel(nn.Module):
         if self.training:
             with torch.no_grad():
                 self.train_scores.mul_(0.9).add_(0.1 * expert_usage)
-                if self._expert_bias is not None:
-                    delta = torch.sign(expert_usage - self._target_load)
-                    self._expert_bias.data -= self._aux_lr * delta
+                self._update_biases(expert_usage)
 
         state = MoEKernelState(
             output=output.reshape(orig_shape),
@@ -713,6 +801,35 @@ class MoEKernel(nn.Module):
         """Сбрасывает per-expert bias к нулю."""
         if self._expert_bias is not None:
             self._expert_bias.data.zero_()
+            self._bias_step = 0
+
+    def _update_biases(self, expert_load: torch.Tensor) -> None:
+        """
+        Auxiliary-Loss-Free bias update (DeepSeek-V3, arXiv:2412.19437).
+
+        Updates per-expert bias based on load imbalance:
+        - Overloaded experts: decrease bias (reduce routing probability)
+        - Underloaded experts: increase bias (increase routing probability)
+
+        Uses sign-based update for stability:
+            bias -= aux_lr * sign(load - target_load)
+
+        Args:
+            expert_load: (num_experts,) tensor with current expert usage
+        """
+        if self._expert_bias is None:
+            return
+
+        self._bias_step += 1
+
+        # Check update frequency (0 = update every forward)
+        freq = self.config.bias_update_frequency
+        if freq > 0 and self._bias_step % freq != 0:
+            return
+
+        # Sign-based update: overloaded -> negative delta (decrease bias)
+        delta = torch.sign(expert_load - self._target_load)
+        self._expert_bias.data.sub_(delta, alpha=self._aux_lr)
 
     def expert_load_stats(self) -> Dict[str, float]:
         """Возвращает текущие EMA нагрузки по именам экспертов."""

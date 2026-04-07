@@ -47,6 +47,7 @@ class HDIMAuxState:
     update_memory: bool
     hallucination_risk: float = 0.0
     memory_surprise: float | None = None
+    feedback_action: str | None = None  # Phase 33: Hallucination feedback action
 
     def to_dict(self) -> Dict[str, Union[torch.Tensor, bool, str, float, None]]:
         return {
@@ -124,9 +125,14 @@ class HDIMConfig:
     online_replay_size: int = 10000  # Experience replay buffer size
     online_surprise_threshold: float = 0.3  # Surprise threshold for updates
     online_ttt_lr: float = 1e-5  # TTT learning rate
+    online_gradient_mode: str = "detached" # Gradient mode: detached | selective | full
+    online_gradient_scale: float = 0.1 # Gradient scaling factor for selective/full modes
     # Phase 32: Hallucination Detection
     hallucination_detection: bool = False  # Enable hallucination detection
     hallucination_risk_threshold: float = 0.5  # Risk threshold for hallucination flag
+    # Phase 33: Hallucination Feedback Loop (Self-Correction)
+    hallucination_feedback: bool = False # Enable hallucination feedback loop
+    hallucination_feedback_config: Optional[dict] = None # Override default feedback config
 
     def __post_init__(self):
         # Compute num_experts from expert_names if provided
@@ -186,13 +192,17 @@ class HDIMModel(nn.Module):
         # Phase 31: Online Learner for self-evolution (uses moe output dimension)
         self.online_learner = None
         if config.online_learning:
-            from src.core.online_learner import OnlineLearner
+            from src.core.online_learner import OnlineLearner, GradientMode
+            # Parse gradient mode from string
+            gradient_mode = GradientMode(config.online_gradient_mode)
             self.online_learner = OnlineLearner(
                 hidden_dim=clifford_dim,
                 num_experts=config.num_experts or 4,
                 replay_buffer_size=config.online_replay_size,
                 surprise_threshold=config.online_surprise_threshold,
                 ttt_lr=config.online_ttt_lr,
+                gradient_mode=gradient_mode,
+                gradient_scale=config.online_gradient_scale,
             )
 
         # Phase 32: Hallucination Detector (optional)
@@ -204,6 +214,17 @@ class HDIMModel(nn.Module):
                 risk_threshold=config.hallucination_risk_threshold,
             )
 
+
+        # Phase 33: Hallucination Feedback Loop (optional)
+        self.hallucination_feedback_loop = None
+        if config.hallucination_feedback:
+            from src.core.hallucination_feedback import HallucinationFeedbackLoop
+            # Get expert names from pipeline MoE
+            expert_names = config.expert_names or [f"expert_{i}" for i in range(config.num_experts or 4)]
+            self.hallucination_feedback_loop = HallucinationFeedbackLoop(
+                expert_names=expert_names,
+                enabled=True,
+            )
         # Rotor stacks rebuild each forward (requires_grad rotors need fresh graph)
 
     def _domain_idx_to_name(self, domain_idx: int) -> str:
@@ -248,6 +269,7 @@ class HDIMModel(nn.Module):
         runtime: HDIMRuntimeConfig,
         hallucination_risk: float = 0.0,
         memory_surprise: float | None = None,
+        feedback_action: str | None = None,
     ) -> HDIMAuxState:
         return HDIMAuxState(
             memory_loss=memory_loss,
@@ -268,6 +290,7 @@ class HDIMModel(nn.Module):
             update_memory=runtime.update_memory,
             hallucination_risk=hallucination_risk,
             memory_surprise=memory_surprise,
+            feedback_action=feedback_action,
         )
 
     def _build_aux_state_from_transfer_state(
@@ -388,6 +411,7 @@ class HDIMModel(nn.Module):
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor, bool,
+        Optional[str],
     ]:
         """Shared core for forward and transfer_pairs.
 
@@ -432,7 +456,7 @@ class HDIMModel(nn.Module):
         )
 
         # Phase 31: Online Learning (Self-Evolution)
-        # Entirely detached from main training graph to avoid backward conflicts.
+        # Uses gradient mode from config: DETACHED (safe), SELECTIVE (replay only), FULL (experimental)
         online_loss = torch.tensor(0.0, device=device, dtype=dtype)
         online_updated = False
         if self.online_learner is not None and self.training:
@@ -452,10 +476,13 @@ class HDIMModel(nn.Module):
                 else:
                     dominant_expert = 0
 
-                _loss, online_updated, _ = self.online_learner.online_update(
-                    x=u_mem.detach(),
-                    expert_idx=dominant_expert,
-                )
+            # Use gradient-mode-aware update method
+            _loss, online_updated, _ = self.online_learner.online_update_with_mode(
+                x=u_mem,
+                expert_idx=dominant_expert,
+                model=self,
+            )
+            online_loss = _loss
 
         # 4) MoE routing per group
         u_route = torch.empty_like(u_mem)
@@ -518,6 +545,30 @@ class HDIMModel(nn.Module):
             )
             hallucination_risk = result.hallucination_risk
 
+        # Phase 33: Hallucination Feedback Loop (Self-Correction)
+        feedback_action = None
+        if self.hallucination_feedback_loop is not None:
+            # Get current dominant expert from topk_idx
+            current_expert_idx = topk_idx[0, 0].item() if topk_idx.numel() > 0 else 0
+            expert_names = self.pipeline.moe.expert_names if hasattr(self.pipeline.moe, 'expert_names') else [f'expert_{i}' for i in range(self.config.num_experts or 4)]
+            current_expert = expert_names[current_expert_idx] if current_expert_idx < len(expert_names) else expert_names[0]
+            
+            feedback_result = self.hallucination_feedback_loop.check_and_respond(
+                risk_score=hallucination_risk,
+                routing_info={
+                    'current_expert': current_expert,
+                    'expert_weights': routing_weights.mean(dim=0) if routing_weights.numel() > 0 else None,
+                },
+                base_confidence=1.0,
+            )
+            feedback_action = feedback_result.action.value
+            
+            # Update expert hallucination history
+            self.hallucination_feedback_loop.update_expert_hallucination_history(
+                current_expert, 
+                hallucination_risk > 0.5
+            )
+
         # Concatenate slot_outputs if available
         slot_outputs_tensor = torch.cat(all_slot_outputs, dim=0) if all_slot_outputs else None
 
@@ -526,7 +577,7 @@ class HDIMModel(nn.Module):
         exported_invariant, topk_idx, topk_gate_weights,
         train_scores_snapshot, expert_usage, routing_entropy,
         memory_loss, router_loss, z_loss, memory_updated, slot_outputs_tensor,
-        hallucination_risk, memory_surprise_val,
+        hallucination_risk, memory_surprise_val, feedback_action,
         )
 
     def forward(
@@ -560,7 +611,7 @@ class HDIMModel(nn.Module):
             exported_invariant, topk_idx, topk_gate_weights,
             train_scores_snapshot, expert_usage, _routing_entropy,
         memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
-        _hallucination_risk, _memory_surprise,
+        _hallucination_risk, _memory_surprise, _feedback_action,
         ) = self._forward_core(
             x, R_inv_per_sample, R_per_sample, R_per_sample, R_inv_per_sample,
             group_masks, runtime,
@@ -691,7 +742,7 @@ class HDIMModel(nn.Module):
             exported_invariant, topk_idx, topk_gate_weights,
             train_scores_snapshot, expert_usage, _routing_entropy,
         memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
-        _hallucination_risk, _memory_surprise,
+        _hallucination_risk, _memory_surprise, _feedback_action,
         ) = self._forward_core(
             source_encoding,
             R_src_inv_per_sample, R_src_per_sample,
@@ -720,6 +771,7 @@ class HDIMModel(nn.Module):
             runtime=runtime,
             hallucination_risk=_hallucination_risk,
             memory_surprise=_memory_surprise,
+            feedback_action=_feedback_action,
         )
         return output, routing_weights, invariant, _slot_outputs, aux_state
 

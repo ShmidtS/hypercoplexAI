@@ -12,12 +12,41 @@ Reference:
 - MoCo: Momentum Contrast (He et al., CVPR 2020)
 """
 
+from enum import Enum
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass
 import random
+
+
+class GradientMode(Enum):
+    """Gradient flow modes for online learning.
+
+    DETACHED: No gradient flow (current behavior, safest)
+    SELECTIVE: Gradients only for replay buffer updates
+    FULL: Full gradient flow (experimental, may destabilize training)
+    """
+    DETACHED = "detached"
+    SELECTIVE = "selective"
+    FULL = "full"
+
+
+@dataclass
+class OnlineLearnerConfig:
+    """Configuration for OnlineLearner with gradient mode support."""
+    hidden_dim: int = 256
+    num_experts: int = 4
+    replay_buffer_size: int = 10000
+    replay_batch_size: int = 32
+    ema_decay: float = 0.999
+    ttt_lr: float = 1e-5
+    surprise_threshold: float = 0.3
+    consolidation_interval: int = 1000
+    grad_clip: float = 1.0
+    gradient_mode: GradientMode = GradientMode.DETACHED
+    gradient_scale: float = 0.1
 
 
 @dataclass
@@ -134,6 +163,7 @@ class OnlineLearner(nn.Module):
     - Experience replay buffer for stability
     - Gradient-based surprise detection
     - EMA model for stable targets
+    - Selective gradient flow modes for knowledge consolidation
 
     Integration point: HDIMModel._forward_core() after _apply_memory()
     """
@@ -150,6 +180,8 @@ class OnlineLearner(nn.Module):
         consolidation_interval: int = 1000,
         grad_clip: float = 1.0,
         device: Optional[torch.device] = None,
+        gradient_mode: GradientMode = GradientMode.DETACHED,
+        gradient_scale: float = 0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -159,6 +191,8 @@ class OnlineLearner(nn.Module):
         self.grad_clip = grad_clip
         self.replay_batch_size = replay_batch_size
         self.consolidation_interval = consolidation_interval
+        self.gradient_mode = gradient_mode
+        self.gradient_scale = gradient_scale
 
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -298,6 +332,167 @@ class OnlineLearner(nn.Module):
 
         return loss, True, surprise_mean
 
+    def _update_detached(
+        self,
+        x: torch.Tensor,
+        expert_idx: int,
+        surprise: torch.Tensor,
+        surprise_mean: float,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Detached update: no gradient flow (original behavior).
+
+        Returns:
+            (loss, updated): loss tensor (always 0.0 for detached), whether update happened
+        """
+        # Store for replay buffer
+        x_detached = x.detach()
+        for i in range(x.size(0)):
+            self.replay_buffer.add(
+                encoding=x_detached[i],
+                domain_id=expert_idx,
+                surprise=float(surprise[i].item()),
+            )
+
+        # Update tracking
+        self.expert_update_count[expert_idx] += 1
+        self.expert_surprise_accum[expert_idx] += surprise_mean
+
+        # Update EMA
+        self._update_ema(x.mean(dim=0))
+
+        return torch.tensor(0.0, device=x.device), True
+
+    def _update_selective(
+        self,
+        x: torch.Tensor,
+        expert_idx: int,
+        surprise: torch.Tensor,
+        surprise_mean: float,
+        model: Optional[nn.Module] = None,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Selective update: gradients only for replay buffer consolidation.
+
+        This enables gradient flow for replay buffer samples while keeping
+        the main forward pass detached.
+
+        Returns:
+            (loss, updated): scaled loss for replay gradient, whether update happened
+        """
+        # Store with gradient tracking for replay
+        x_scaled = x * self.gradient_scale
+        for i in range(x.size(0)):
+            self.replay_buffer.add(
+                encoding=x_scaled[i].detach(),
+                domain_id=expert_idx,
+                surprise=float(surprise[i].item()),
+            )
+
+        # Update tracking
+        self.expert_update_count[expert_idx] += 1
+        self.expert_surprise_accum[expert_idx] += surprise_mean
+
+        # Compute scaled loss for replay buffer gradient
+        if self._ema_initialized:
+            target = self.ema_weights.unsqueeze(0).expand(x.size(0), -1)
+            loss = F.mse_loss(x_scaled, target) * self.gradient_scale
+        else:
+            loss = torch.tensor(0.0, device=x.device)
+
+        # Update EMA
+        self._update_ema(x.mean(dim=0))
+
+        return loss, True
+
+    def _update_full(
+        self,
+        x: torch.Tensor,
+        expert_idx: int,
+        surprise: torch.Tensor,
+        surprise_mean: float,
+        model: Optional[nn.Module] = None,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Full gradient update: experimental mode with gradient clipping.
+
+        WARNING: This can destabilize training. Use with caution.
+
+        Returns:
+            (loss, updated): full gradient loss, whether update happened
+        """
+        # Compute target
+        if not self._ema_initialized:
+            self._init_ema(x.mean(dim=0))
+
+        target = self.ema_weights.unsqueeze(0).expand(x.size(0), -1)
+
+        # Scaled MSE loss with gradient flow
+        loss = F.mse_loss(x * self.gradient_scale, target)
+
+        # Store for replay buffer
+        x_detached = x.detach()
+        for i in range(x.size(0)):
+            self.replay_buffer.add(
+                encoding=x_detached[i],
+                domain_id=expert_idx,
+                surprise=float(surprise[i].item()),
+            )
+
+        # Update tracking
+        self.expert_update_count[expert_idx] += 1
+        self.expert_surprise_accum[expert_idx] += surprise_mean
+
+        # Update EMA
+        self._update_ema(x.mean(dim=0))
+
+        return loss, True
+
+    def online_update_with_mode(
+        self,
+        x: torch.Tensor,
+        expert_idx: int,
+        model: Optional[nn.Module] = None,
+        force_update: bool = False,
+    ) -> Tuple[torch.Tensor, bool, float]:
+        """Perform online update with configured gradient mode.
+
+        This is the main entry point that dispatches to the appropriate
+        update method based on gradient_mode.
+
+        Args:
+            x: Input encoding [batch, hidden_dim]
+            expert_idx: Which expert this belongs to
+            model: HDIM model (required for SELECTIVE/FULL modes)
+            force_update: Force update regardless of surprise
+
+        Returns:
+            (loss, updated, surprise_mean): loss value, whether update happened, mean surprise
+        """
+        self.step_count += 1
+
+        # Compute surprise
+        surprise = self.compute_surprise(x)
+        surprise_mean = float(surprise.mean().item())
+
+        # Check if should update
+        should_update = force_update or (surprise_mean > self.surprise_threshold and self.training)
+
+        if not should_update:
+            return torch.tensor(0.0, device=x.device), False, surprise_mean
+
+        # Initialize EMA if needed
+        self._init_ema(x.mean(dim=0))
+
+        # Dispatch to appropriate update method
+        if self.gradient_mode == GradientMode.DETACHED:
+            loss, updated = self._update_detached(x, expert_idx, surprise, surprise_mean)
+        elif self.gradient_mode == GradientMode.SELECTIVE:
+            loss, updated = self._update_selective(x, expert_idx, surprise, surprise_mean, model)
+        elif self.gradient_mode == GradientMode.FULL:
+            loss, updated = self._update_full(x, expert_idx, surprise, surprise_mean, model)
+        else:
+            raise ValueError(f"Unknown gradient mode: {self.gradient_mode}")
+
+        return loss, updated, surprise_mean
+
     def replay_step(self, model: nn.Module) -> Optional[torch.Tensor]:
         """Sample from replay buffer and perform update.
 
@@ -346,6 +541,8 @@ class OnlineLearner(nn.Module):
             'expert_update_count': self.expert_update_count.tolist(),
             'expert_surprise_avg': (self.expert_surprise_accum / (self.expert_update_count + 1)).tolist(),
             'ema_initialized': self._ema_initialized,
+            'gradient_mode': self.gradient_mode.value,
+            'gradient_scale': self.gradient_scale,
         }
 
     def save_state(self) -> Dict[str, Any]:
@@ -361,6 +558,8 @@ class OnlineLearner(nn.Module):
             'expert_update_count': self.expert_update_count.cpu().clone(),
             'expert_surprise_accum': self.expert_surprise_accum.cpu().clone(),
             'step_count': self.step_count.cpu().clone(),
+            'gradient_mode': self.gradient_mode.value,
+            'gradient_scale': self.gradient_scale,
         }
 
         # Save replay buffer samples
@@ -393,6 +592,12 @@ class OnlineLearner(nn.Module):
             self.expert_surprise_accum.copy_(state['expert_surprise_accum'])
         if 'step_count' in state:
             self.step_count.copy_(state['step_count'])
+
+        # Restore gradient mode (backward compatible)
+        if 'gradient_mode' in state:
+            self.gradient_mode = GradientMode(state['gradient_mode'])
+        if 'gradient_scale' in state:
+            self.gradient_scale = state['gradient_scale']
 
         # Restore replay buffer
         if 'replay_buffer' in state and self.replay_buffer.prioritized:

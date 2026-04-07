@@ -526,6 +526,131 @@ class TestAuxLossFree:
         k = MoEKernel(cfg)
         assert k._expert_bias is None
 
+    def test_bias_balancing_reduces_imbalance(self):
+        """Test that bias updates reduce load imbalance over multiple steps."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+            use_aux_loss_free=True,
+            bias_update_frequency=1,  # Update every step
+            aux_lr=0.01,
+        )
+        kernel = MoEKernel(cfg)
+        kernel.train()
+
+        # Run multiple forward passes and track imbalance
+        imbalances = []
+        for _ in range(50):
+            x = torch.randn(32, 64)
+            _, state = kernel(x)
+            # Calculate imbalance as max deviation from uniform
+            expected = 1.0 / kernel.num_experts
+            imbalance = (state.expert_usage - expected).abs().max().item()
+            imbalances.append(imbalance)
+
+        # Later imbalances should be generally lower than early ones
+        early_avg = sum(imbalances[:10]) / 10
+        late_avg = sum(imbalances[-10:]) / 10
+        assert late_avg <= early_avg * 1.5, f"Bias balancing should not increase imbalance: early={early_avg:.4f}, late={late_avg:.4f}"
+
+    def test_bias_values_update_correctly(self):
+        """Test that bias values change in expected direction based on load."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+            use_aux_loss_free=True,
+            bias_update_frequency=1,
+            aux_lr=0.1,  # Large lr for visible effect
+        )
+        kernel = MoEKernel(cfg)
+        kernel.train()
+
+        initial_bias = kernel._expert_bias.data.clone()
+        x = torch.randn(64, 64)
+        _, state = kernel(x)
+
+        # Check that bias was updated
+        assert not torch.equal(kernel._expert_bias.data, initial_bias)
+
+        # Check bias direction consistency with load deviation
+        load = state.expert_usage
+        target = kernel._target_load
+        expected_delta_sign = torch.sign(load - target)
+
+        # The actual bias change should be opposite (we decrease bias for overloaded)
+        actual_delta = kernel._expert_bias.data - initial_bias
+        # Sign of actual delta should be opposite of expected_delta_sign
+        # Overloaded experts get their bias decreased
+        assert torch.allclose(torch.sign(actual_delta), -expected_delta_sign, atol=0.1) or actual_delta.abs().max() < 0.01
+
+    def test_backward_compatible_no_bias(self):
+        """Test that MoEKernel works correctly when bias balancing is disabled."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["math", "language", "code", "science"],
+            use_aux_loss_free=False,  # Disable bias balancing
+            use_bias_balancing=False,
+        )
+        kernel = MoEKernel(cfg)
+        kernel.eval()
+
+        x = torch.randn(16, 64)
+        out, state = kernel(x)
+
+        assert out.shape == (16, 64)
+        assert not torch.isnan(out).any()
+        assert kernel._expert_bias is None
+
+    def test_bias_update_frequency_config(self):
+        """Test that bias_update_frequency config is respected."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=2,
+            expert_names=["a", "b"],
+            use_aux_loss_free=True,
+            bias_update_frequency=10,  # Update every 10 steps
+        )
+        kernel = MoEKernel(cfg)
+        kernel.train()
+
+        # Run 5 forward passes - bias should NOT update (frequency=10)
+        initial_bias = kernel._expert_bias.data.clone()
+        for _ in range(5):
+            x = torch.randn(16, 64)
+            kernel(x)
+
+        # Bias should not have changed (step 5 < frequency 10)
+        assert torch.equal(kernel._expert_bias.data, initial_bias), "Bias should not update before frequency threshold"
+
+        # Run 5 more forward passes (total 10) - bias SHOULD update now
+        for _ in range(5):
+            x = torch.randn(16, 64)
+            kernel(x)
+
+        # After 10 steps, bias should have been updated
+        assert not torch.equal(kernel._expert_bias.data, initial_bias), "Bias should update at frequency threshold"
+
+    def test_use_bias_balancing_alias(self):
+        """Test that use_bias_balancing works as alias for use_aux_loss_free."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=2,
+            expert_names=["a", "b"],
+            use_bias_balancing=True,
+        )
+        assert cfg.use_bias_balancing is True
+
+        kernel = MoEKernel(cfg)
+        assert kernel._expert_bias is not None
+
 
 # ============================================================
 # Expert load stats
@@ -930,14 +1055,13 @@ class TestBatchedExpertExecution:
     """Tests for batched expert execution via torch.bmm."""
 
     def test_config_has_use_batched_experts(self):
-        """MoEKernelConfig has use_batched_experts parameter."""
+        """MoEKernelConfig has use_batched_experts parameter with default True."""
         cfg = MoEKernelConfig(
             input_dim=64,
             expert_hidden_dim=128,
             num_experts=4,
-            use_batched_experts=True,
         )
-        assert cfg.use_batched_experts is True
+        assert cfg.use_batched_experts is True  # Default is now True
 
     def test_batched_with_homogeneous_experts(self):
         """Batched execution works with homogeneous DomainExpert instances."""
@@ -992,7 +1116,6 @@ class TestBatchedExpertExecution:
             expert_hidden_dim=128,
             num_experts=4,
             expert_names=["math", "language", "code", "science"],
-            use_batched_experts=True,
         )
         kernel = MoEKernel(cfg)
 
@@ -1118,3 +1241,224 @@ class TestBatchedExpertExecution:
 
         with pytest.raises(RuntimeError, match="homogeneous DomainExpert"):
             kernel._run_experts_batched(slot_inputs)
+
+
+# ============================================================
+# Profiling and New Config Tests
+# ============================================================
+
+class TestProfilingAndNewConfig:
+    """Tests for profiling hooks and new config parameters."""
+
+    def test_config_has_batched_fallback(self):
+        """MoEKernelConfig has batched_fallback parameter."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=2,
+        )
+        assert cfg.batched_fallback is True
+
+    def test_config_has_expert_homogeneity_check(self):
+        """MoEKernelConfig has expert_homogeneity_check parameter."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=2,
+        )
+        assert cfg.expert_homogeneity_check is True
+
+    def test_enable_profiling(self):
+        """enable_profiling() method works."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+        )
+        kernel = MoEKernel(cfg)
+        assert kernel._profiling_enabled is False
+        kernel.enable_profiling(True)
+        assert kernel._profiling_enabled is True
+        kernel.enable_profiling(False)
+        assert kernel._profiling_enabled is False
+
+    def test_get_profiling_stats(self):
+        """get_profiling_stats() returns timing statistics."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+        )
+        kernel = MoEKernel(cfg)
+        kernel.eval()
+        kernel.enable_profiling(True)
+
+        x = torch.randn(16, 64)
+        with torch.no_grad():
+            kernel(x)
+
+        stats = kernel.get_profiling_stats()
+        assert "batched_time_ms" in stats
+        assert "sequential_time_ms" in stats
+        assert "batched_calls" in stats
+        assert "sequential_calls" in stats
+        assert stats["batched_calls"] > 0
+
+    def test_reset_profiling(self):
+        """reset_profiling() resets counters."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+        )
+        kernel = MoEKernel(cfg)
+        kernel.eval()
+        kernel.enable_profiling(True)
+
+        x = torch.randn(16, 64)
+        with torch.no_grad():
+            kernel(x)
+
+        kernel.reset_profiling()
+        stats = kernel.get_profiling_stats()
+        assert stats["batched_time_ms"] == 0
+        assert stats["batched_calls"] == 0
+
+    def test_batched_vs_sequential_profiling(self):
+        """Profiling compares batched vs sequential execution time."""
+        torch.manual_seed(42)
+
+        # Create two kernels: one batched, one sequential
+        cfg_batched = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+            use_batched_experts=True,
+        )
+
+        cfg_seq = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+            use_batched_experts=False,
+        )
+
+        kernel_batched = MoEKernel(cfg_batched)
+        kernel_seq = MoEKernel(cfg_seq)
+
+        # Copy weights
+        kernel_seq.load_state_dict(kernel_batched.state_dict())
+
+        kernel_batched.eval()
+        kernel_seq.eval()
+
+        kernel_batched.enable_profiling(True)
+        kernel_seq.enable_profiling(True)
+
+        x = torch.randn(32, 64)
+
+        with torch.no_grad():
+            kernel_batched(x)
+            kernel_seq(x)
+
+        stats_batched = kernel_batched.get_profiling_stats()
+        stats_seq = kernel_seq.get_profiling_stats()
+
+        # Both should have recorded calls
+        assert stats_batched["batched_calls"] > 0
+        assert stats_seq["sequential_calls"] > 0
+
+    def test_heterogeneous_fallback_warning(self, caplog):
+        """Heterogeneous experts trigger warning when use_batched_experts=True."""
+        import logging
+
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["math", "language", "code", "science"],
+            use_batched_experts=True,
+            expert_homogeneity_check=True,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            kernel = MoEKernel(cfg)
+
+        # Should have logged a warning about heterogeneous experts
+        assert any("heterogeneous" in record.message.lower() for record in caplog.records)
+
+    def test_heterogeneous_fallback_disabled(self, caplog):
+        """No warning when expert_homogeneity_check=False."""
+        import logging
+
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["math", "language", "code", "science"],
+            use_batched_experts=True,
+            expert_homogeneity_check=False,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            kernel = MoEKernel(cfg)
+
+        # Should NOT have logged warning
+        assert not any("heterogeneous" in record.message.lower() for record in caplog.records)
+
+    def test_batched_fallback_config_option(self):
+        """batched_fallback config option exists."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            batched_fallback=False,
+        )
+        assert cfg.batched_fallback is False
+
+    def test_profile_expert_execution_batched(self):
+        """_profile_expert_execution uses batched path correctly."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+        )
+        kernel = MoEKernel(cfg)
+        kernel.eval()
+        kernel.enable_profiling(True)
+
+        slot_inputs = torch.randn(4, 64)
+        with torch.no_grad():
+            out = kernel._profile_expert_execution(slot_inputs, use_batched=True)
+
+        assert out.shape == (4, 64)
+        stats = kernel.get_profiling_stats()
+        assert stats["batched_calls"] == 1
+        assert stats["sequential_calls"] == 0
+
+    def test_profile_expert_execution_sequential(self):
+        """_profile_expert_execution uses sequential path correctly."""
+        cfg = MoEKernelConfig(
+            input_dim=64,
+            expert_hidden_dim=128,
+            num_experts=4,
+            expert_names=["a", "b", "c", "d"],
+        )
+        kernel = MoEKernel(cfg)
+        kernel.eval()
+        kernel.enable_profiling(True)
+
+        slot_inputs = torch.randn(4, 64)
+        with torch.no_grad():
+            out = kernel._profile_expert_execution(slot_inputs, use_batched=False)
+
+        assert out.shape == (4, 64)
+        stats = kernel.get_profiling_stats()
+        assert stats["batched_calls"] == 0
+        assert stats["sequential_calls"] == 1

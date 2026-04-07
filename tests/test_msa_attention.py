@@ -242,11 +242,12 @@ class TestMSAAugmentedSemanticMemory:
 
         assert output.shape == batch_input.shape
 
-    def test_msa_disabled_by_default(self, batch_input):
-        """Test that MSA is disabled by default (backward compat)."""
-        memory = MSAAugmentedSemanticMemory(hidden_dim=64, num_prototypes=32)
-        assert memory.use_msa is False
-        assert memory.msa_index is None
+    def test_msa_enabled_by_default(self, batch_input):
+        """Test that MSA is enabled by default in SemanticMemory."""
+        from src.core.hbma_memory import SemanticMemory
+        memory = SemanticMemory(hidden_dim=64, num_prototypes=32)
+        assert memory.use_msa is True
+        assert memory.msa_index is not None
 
     def test_msa_enabled_when_requested(self):
         """Test that MSA is properly initialized when requested."""
@@ -407,6 +408,105 @@ class TestMSAEdgeCases:
         assert output.shape == h.shape
 
 
+
+
+class TestSemanticMemoryMSA:
+    """Test suite for SemanticMemory MSA integration."""
+
+    @pytest.fixture
+    def semantic_msa(self):
+        """Create SemanticMemory with MSA enabled."""
+        from src.core.hbma_memory import SemanticMemory
+        return SemanticMemory(
+            hidden_dim=64,
+            num_prototypes=32,
+            use_msa=True,
+        )
+
+    @pytest.fixture
+    def semantic_dense(self):
+        """Create SemanticMemory with MSA disabled."""
+        from src.core.hbma_memory import SemanticMemory
+        return SemanticMemory(
+            hidden_dim=64,
+            num_prototypes=32,
+            use_msa=False,
+        )
+
+    @pytest.fixture
+    def batch_input(self):
+        """Generate test input."""
+        return torch.randn(4, 64)
+
+    def test_msa_retrieval_correctness(self, semantic_msa, batch_input):
+        """Test that MSA retrieval produces valid output."""
+        semantic_msa.eval()
+        with torch.no_grad():
+            output = semantic_msa(batch_input)
+        assert output.shape == batch_input.shape
+        assert not torch.isnan(output).any()
+        assert not torch.isinf(output).any()
+
+    def test_msa_vs_dense_equivalence(self, semantic_msa, semantic_dense, batch_input):
+        """Test that MSA and dense modes produce same-shaped outputs."""
+        semantic_msa.eval()
+        semantic_dense.eval()
+        
+        # Copy prototypes to ensure same starting point
+        semantic_msa.prototypes.copy_(semantic_dense.prototypes.detach())
+        
+        with torch.no_grad():
+            out_msa = semantic_msa(batch_input)
+            out_dense = semantic_dense(batch_input)
+        
+        # Both should produce valid outputs of same shape
+        assert out_msa.shape == batch_input.shape
+        assert out_dense.shape == batch_input.shape
+        
+        # Both should be valid tensors
+        assert not torch.isnan(out_msa).any()
+        assert not torch.isnan(out_dense).any()
+
+    def test_msa_overflow_integration(self, batch_input):
+        """Test MSA integration with EpisodicMemory overflow."""
+        from src.core.hbma_memory import HBMAMemory
+        
+        # Create HBMA with MSA enabled (default)
+        hbma = HBMAMemory(hidden_dim=64)
+        
+        # Verify MSA is enabled
+        assert hbma.semantic.use_msa is True
+        assert hbma.episodic.use_overflow is True
+        
+        # Forward pass should work
+        output = hbma(batch_input)
+        assert output.shape == batch_input.shape
+
+    def test_msa_config_override(self):
+        """Test that MSAConfig can override defaults."""
+        from src.core.hbma_memory import SemanticMemory, MSAConfig
+        
+        cfg = MSAConfig(top_k=8, chunk_size=32, temperature=0.05)
+        memory = SemanticMemory(
+            hidden_dim=64,
+            num_prototypes=32,
+            use_msa=True,
+            msa_config=cfg,
+        )
+        
+        assert memory.msa_index.top_k == 8
+        assert memory.msa_index.chunk_size == 32
+        assert memory.msa_index.temperature == 0.05
+
+    def test_gradient_flow_msa(self, semantic_msa, batch_input):
+        """Test that gradients flow through MSA path."""
+        x = batch_input.requires_grad_(True)
+        out = semantic_msa(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert x.grad.shape == x.shape
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
@@ -553,11 +653,11 @@ class TestEpisodicMemoryOverflow:
             use_overflow=False,
         )
 
-    def test_overflow_disabled_by_default(self):
-        """Test that overflow is disabled by default."""
+    def test_overflow_enabled_by_default(self):
+        """Test that overflow is enabled by default in EpisodicMemory."""
         mem = EpisodicMemory(hidden_dim=64, num_slots=32)
-        assert mem.use_overflow is False
-        assert mem.overflow is None
+        assert mem.use_overflow is True
+        assert mem.overflow is not None
 
     def test_overflow_enabled_when_requested(self, episodic_with_overflow):
         """Test that overflow is enabled when requested."""

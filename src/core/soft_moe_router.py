@@ -212,9 +212,7 @@ class SoftMoERouter(MoERouter):
                 # PyTorch tensor ops are atomic on GPU — no lock needed
                 self.train_scores.mul_(0.9).add_(expert_load, alpha=0.1)
                 # Phase 26: Auxiliary-Loss-Free bias update (DeepSeek-V3)
-                if self.use_aux_loss_free:
-                    delta = torch.sign(expert_load - self._target_load)
-                    self._expert_bias.data.add_(delta, alpha=-self._aux_lr)
+                self._update_biases(expert_load)
 
         # Router loss: load balance
         router_loss = self._entropy_load_balance_loss(combine)
@@ -311,10 +309,44 @@ class SoftMoERouter(MoERouter):
         """Enable DeepSeek-V3 always-on shared expert."""
         self.use_shared_expert = True
 
-    def enable_aux_loss_free(self, aux_lr: float = 0.001) -> None:
-        """Enable Auxiliary-Loss-Free balancing (DeepSeek-V3)."""
+    def _update_biases(self, expert_load: torch.Tensor) -> None:
+        """
+        Auxiliary-Loss-Free bias update (DeepSeek-V3, arXiv:2412.19437).
+
+        Updates per-expert bias based on load imbalance:
+        - Overloaded experts: decrease bias (reduce routing probability)
+        - Underloaded experts: increase bias (increase routing probability)
+
+        Uses sign-based update for stability:
+            bias -= aux_lr * sign(load - target_load)
+
+        Args:
+            expert_load: (num_experts,) tensor with current expert usage
+        """
+        if not self.use_aux_loss_free:
+            return
+
+        self._bias_step += 1
+
+        # Check update frequency (0 = update every forward)
+        if self._bias_update_frequency > 0 and self._bias_step % self._bias_update_frequency != 0:
+            return
+
+        # Sign-based update: overloaded -> negative delta (decrease bias)
+        delta = torch.sign(expert_load - self._target_load)
+        self._expert_bias.data.add_(delta, alpha=-self._aux_lr)
+
+    def enable_aux_loss_free(self, aux_lr: float = 0.001, bias_update_frequency: int = 100) -> None:
+        """Enable Auxiliary-Loss-Free balancing (DeepSeek-V3).
+
+        Args:
+            aux_lr: Learning rate for bias updates
+            bias_update_frequency: Steps between bias updates (0 = every forward)
+        """
         self.use_aux_loss_free = True
+        self.use_bias_balancing = True
         self._aux_lr = aux_lr
+        self._bias_update_frequency = bias_update_frequency
 
     def enable_expert_ortho(self) -> None:
         """Enable expert orthogonalization loss."""

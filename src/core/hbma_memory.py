@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 # Phase 2 MSA: Sparse retrieval for SemanticMemory
 # Phase 3 MSA: Overflow buffer for EpisodicMemory
-from src.core.msa_attention import MSASparseIndex, MSAOverflowBuffer
+from src.core.msa_attention import MSASparseIndex, MSAOverflowBuffer, MSAConfig
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +81,26 @@ class ConsolidationContext:
     procedural: Optional[ProceduralMemory]
     is_training: bool
     step: int
+
+# ---------------------------------------------------------------------------
+# MSA Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MSAConfig:
+    """Configuration for MSA sparse retrieval in SemanticMemory."""
+
+    top_k: int = 16
+    """Number of top prototypes to retrieve."""
+
+    chunk_size: int = 64
+    """Compression window size (P from paper)."""
+
+    temperature: float = 0.1
+    """Temperature for softmax in top-k selection."""
+
+    compression_threshold: int = 128
+    """Minimum prototypes before chunk compression activates."""
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +273,7 @@ class EpisodicMemory(nn.Module):
         surprise_threshold: float = 0.4,
         dropout: float = 0.1,
  # Phase 3 MSA: Overflow feature flag
- use_overflow: bool = False,
+ use_overflow: bool = True,
  overflow_num_prototypes: int = 1024,
  overflow_max_hops: int = 3,
     ) -> None:
@@ -425,6 +445,9 @@ class SemanticMemory(nn.Module):
         temperature: float = 0.07,
         contradiction_thresh: float = -0.3,  # negative cosine = contradiction
         dropout: float = 0.1,
+        # Phase 2 MSA: Sparse retrieval (ENABLED BY DEFAULT)
+        use_msa: bool = True,
+        msa_config: Optional[MSAConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_dim           = hidden_dim
@@ -451,6 +474,20 @@ class SemanticMemory(nn.Module):
         self.register_buffer("proto_evidence",torch.ones(num_prototypes))            # evidence count
         self.register_buffer("proto_age",     torch.zeros(num_prototypes))           # steps since update
         self._salience = SalienceScorer()
+        # Phase 2 MSA: Sparse index (enabled by default)
+        self.use_msa = use_msa
+        if use_msa:
+            cfg = msa_config or MSAConfig()
+            self.msa_index = MSASparseIndex(
+                dim=hidden_dim,
+                num_prototypes=num_prototypes,
+                top_k=cfg.top_k,
+                chunk_size=cfg.chunk_size,
+                temperature=cfg.temperature,
+                compression_threshold=cfg.compression_threshold,
+            )
+        else:
+            self.msa_index = None
 
     @torch.no_grad()
     def _update_prototypes(self, h: torch.Tensor) -> None:
@@ -497,6 +534,17 @@ class SemanticMemory(nn.Module):
 
                 updated = self.ema_momentum * self.prototypes[p] + (1 - self.ema_momentum) * centroid
                 self.prototypes[p] = F.normalize(updated, dim=-1)
+
+    def _dense_retrieval(self, h_norm, p_snap, p_norm, conf_snap, age_snap, ev_snap, type_weights, x):
+        """Dense retrieval via cosine similarity (fallback for MSA)."""
+        raw_sim = h_norm @ p_norm.T # [B, P]
+        type_idx = torch.arange(self.num_prototypes, device=x.device)
+        type_assign = type_idx // self.protos_per_type
+        type_mask = type_weights[:, type_assign]
+        weighted_sim = raw_sim * type_mask * conf_snap.unsqueeze(0)
+        sal = self._salience.score(weighted_sim, age_snap, ev_snap, conf_snap, type_weight=0.9)
+        attn = F.softmax(sal / self.temperature, dim=-1)
+        return attn @ p_snap
 
     def diversity_loss(self) -> torch.Tensor:
         """Prototype diversity loss — prevents semantic collapse."""
