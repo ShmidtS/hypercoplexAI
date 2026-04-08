@@ -86,6 +86,14 @@ class MoEKernelAdapter(MoERouter):
             "dominant_expert_names": state.dominant_expert_names(),
         }
 
+        # Alias keys expected by _forward_core
+        info.update({
+            "gate_weights": state.expert_weights,
+            "topk_idx": state.top_expert_idx,
+            "topk_gate_weights": state.dispatch_weights,
+            "train_scores_snapshot": state.expert_usage,
+        })
+
         return output, info
 
     def get_expert_load(self) -> Tensor:

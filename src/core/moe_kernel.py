@@ -830,6 +830,8 @@ class MoEKernel(nn.Module):
         # Sign-based update: overloaded -> negative delta (decrease bias)
         delta = torch.sign(expert_load - self._target_load)
         self._expert_bias.data.sub_(delta, alpha=self._aux_lr)
+        # Clamp bias to prevent runaway (observed in run_018: science bias 5.22)
+        self._expert_bias.data.clamp_(-1.0, 1.0)
 
     def expert_load_stats(self) -> Dict[str, float]:
         """Возвращает текущие EMA нагрузки по именам экспертов."""

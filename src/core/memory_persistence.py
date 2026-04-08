@@ -317,7 +317,22 @@ class MemoryPersistence:
             for k, v in state_clean.items()
         }
 
-        memory.load_state_dict(state_on_device, strict=strict)
+        # Handle shape mismatches for overflow buffers (dynamic-size tensors)
+        model_state = memory.state_dict()
+        mismatch_keys = []
+        for k in list(state_on_device.keys()):
+            if k in model_state:
+                saved = state_on_device[k]
+                expected = model_state[k]
+                if isinstance(saved, torch.Tensor) and isinstance(expected, torch.Tensor):
+                    if saved.shape != expected.shape:
+                        # Skip overflow buffers with incompatible shapes
+                        if "overflow" in k:
+                            mismatch_keys.append(k)
+        for k in mismatch_keys:
+            del state_on_device[k]
+
+        memory.load_state_dict(state_on_device, strict=strict and not mismatch_keys)
 
     def _get_hidden_dim(self, memory: nn.Module) -> int:
         """Get hidden dimension for metadata."""

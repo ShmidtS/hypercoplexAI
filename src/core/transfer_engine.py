@@ -42,6 +42,7 @@ class TransferEngine(nn.Module):
         algebra: CliffordAlgebra,
         num_experts: int = 4,
         top_k: int = 2,
+        router_cls: Optional[type] = None,
     ):
         """Инициализация TransferEngine.
 
@@ -51,6 +52,7 @@ class TransferEngine(nn.Module):
             algebra: алгебра Клиффорда для операций
             num_experts: количество экспертов MoE
             top_k: топ-k маршрутизации
+            router_cls: класс роутера MoE (None = SoftMoERouter)
         """
         super().__init__()
 
@@ -62,8 +64,11 @@ class TransferEngine(nn.Module):
         from .soft_moe_router import SoftMoERouter
         from .hdim_pipeline import HDIMDecoder
 
+        if router_cls is None:
+            router_cls = SoftMoERouter
+
         # MoE router: soft routing к доменным экспертам
-        self.moe = SoftMoERouter(
+        self.moe = router_cls(
             input_dim=clifford_dim,
             num_experts=num_experts,
             expert_dim=clifford_dim * 2,
@@ -107,10 +112,11 @@ class TransferEngine(nn.Module):
         """
         # MoE routing with optional gradient checkpointing
         if self._use_gradient_checkpointing and self.training:
-            u_route, router_state = checkpoint(
+            result = checkpoint(
                 self.moe, u_mem,
                 use_reentrant=False,
             )
+            u_route, router_state = result  # type: ignore[misc]
         else:
             u_route, router_state = self.moe(u_mem)
 

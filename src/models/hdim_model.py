@@ -117,8 +117,6 @@ class HDIMConfig:
     memory_type: str = "titans"  # titans | hippocampus | neocortex | cls | hbma
     domain_names: Optional[List[str]] = None
     expert_names: Optional[List[str]] = None  # New field for dynamic expert names
-    use_msa: bool = False  # Phase 29: MSA sparse index for SemanticMemory
-    use_overflow: bool = False  # Phase 29: MSA overflow buffer for EpisodicMemory
     text: HDIMTextConfig = field(default_factory=HDIMTextConfig)
     # Phase 31: Self-Evolution (Online Learning)
     online_learning: bool = False  # Enable online TTT learning
@@ -410,8 +408,10 @@ class HDIMModel(nn.Module):
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor, torch.Tensor, bool,
-        Optional[str],
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        bool, Optional[torch.Tensor], float,
+        Optional[float], Optional[str],
     ]:
         """Shared core for forward and transfer_pairs.
 
@@ -461,17 +461,18 @@ class HDIMModel(nn.Module):
         online_updated = False
         if self.online_learner is not None and self.training:
             with torch.no_grad():
+                u_mean = u_mem.mean(dim=0, keepdim=True).detach()
                 moe = pipeline.moe
                 if hasattr(moe, 'dispatch_proj'):
-                    gate_logits = moe.dispatch_proj(u_mem[0:1].detach())
+                    gate_logits = moe.dispatch_proj(u_mean)
                     slot_idx = int(gate_logits.argmax(dim=-1).item())
                     dominant_expert = slot_idx // getattr(moe, 'slots_per_expert', 1)
                 elif hasattr(moe, 'router_proj'):
-                    gate_logits = moe.router_proj(u_mem[0:1].detach())
+                    gate_logits = moe.router_proj(u_mean)
                     dominant_expert = int(gate_logits.argmax(dim=-1).item() % (self.config.num_experts or 4))
                 elif hasattr(moe, 'kernel') and hasattr(moe.kernel, 'router_proj'):
                     # MoEKernelAdapter wraps MoEKernel as self.kernel
-                    gate_logits = moe.kernel.router_proj(u_mem[0:1].detach())
+                    gate_logits = moe.kernel.router_proj(u_mean)
                     dominant_expert = int(gate_logits.argmax(dim=-1).item() % (self.config.num_experts or 4))
                 else:
                     dominant_expert = 0
@@ -548,8 +549,8 @@ class HDIMModel(nn.Module):
         # Phase 33: Hallucination Feedback Loop (Self-Correction)
         feedback_action = None
         if self.hallucination_feedback_loop is not None:
-            # Get current dominant expert from topk_idx
-            current_expert_idx = topk_idx[0, 0].item() if topk_idx.numel() > 0 else 0
+            # Get current dominant expert from topk_idx (batch mode)
+            current_expert_idx = topk_idx[:, 0].mode().values.item() if topk_idx.numel() > 0 else 0
             expert_names = self.pipeline.moe.expert_names if hasattr(self.pipeline.moe, 'expert_names') else [f'expert_{i}' for i in range(self.config.num_experts or 4)]
             current_expert = expert_names[current_expert_idx] if current_expert_idx < len(expert_names) else expert_names[0]
             
@@ -637,6 +638,7 @@ class HDIMModel(nn.Module):
                 runtime=runtime,
             hallucination_risk=_hallucination_risk,
             memory_surprise=_memory_surprise,
+            feedback_action=_feedback_action,
             )
             return output, routing_weights, invariant, _slot_outputs, aux_state
         return output, routing_weights, invariant, _slot_outputs
@@ -812,3 +814,7 @@ class HDIMModel(nn.Module):
     def enable_gradient_checkpointing(self) -> None:
         """Enable gradient checkpointing on pipeline."""
         self.pipeline.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable gradient checkpointing on pipeline."""
+        self.pipeline.disable_gradient_checkpointing()

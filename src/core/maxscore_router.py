@@ -166,6 +166,12 @@ class MaxScoreRouter(MoERouter):
                 - router_loss: load balancing loss
                 - expert_usage: (E,) usage statistics
         """
+        import warnings
+        warnings.warn(
+            "MaxScoreRouter.forward() returns pass-through input; "
+            "use SoftMoERouter or MoEKernel for end-to-end routing.",
+            UserWarning, stacklevel=2,
+        )
         orig_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])  # (T, D)
         T = x_flat.shape[0]
@@ -188,10 +194,10 @@ class MaxScoreRouter(MoERouter):
         # Compute routing entropy for monitoring
         entropy = self._compute_entropy(scores)
 
-        # Compute expert output (placeholder — actual expert eval is in MoE layer)
-        # For router-only mode, output is weighted combination of input
-        # This allows testing router in isolation
-        output = x_flat  # Pass-through, actual expert eval happens in MoE wrapper
+        # NOTE: MaxScoreRouter is a pure router -- it computes optimal dispatch
+        # weights but does NOT apply experts. Use with an external expert executor.
+        # For the standard pipeline, use SoftMoERouter or MoEKernel instead.
+        output = x_flat
 
         # Load balancing loss
         router_loss = self._compute_load_balance_loss(scores)

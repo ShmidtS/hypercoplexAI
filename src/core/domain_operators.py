@@ -47,7 +47,7 @@ class DomainRotationOperator(nn.Module):
         """Нормализация R → R/||R|| (epsilon только для защиты от ||R||=0).
         Результат: ||_normalized_R()|| ≈ 1."""
         norm = self.algebra.norm(self.R)
-        return self.R / (norm + 1e-8)
+        return self.R / (norm + 1e-4)
 
     def get_inverse(self) -> torch.Tensor:
         """Обратный ротор: R⁻¹ = ~R / ||R||².
@@ -56,7 +56,7 @@ class DomainRotationOperator(nn.Module):
         R_n = self._normalized_R()
         R_rev = self.algebra.reverse(R_n)
         norm_sq = self.algebra.norm(R_n) ** 2
-        return R_rev / (norm_sq + 1e-8)
+        return R_rev / (norm_sq + 1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # unit=False: epsilon для численной стабильности под AMP (fp16 optimizer

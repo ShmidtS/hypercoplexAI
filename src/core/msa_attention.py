@@ -320,12 +320,14 @@ class MSAOverflowBuffer(nn.Module):
         chunk_size: int = 64,
         num_heads: int = 4,
         temperature: float = 0.1,
+        capacity: int = 10000,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.key_dim = key_dim if key_dim is not None else dim
         self.max_hops = max_hops
         self.top_k = top_k
+        self.max_capacity = capacity
 
         # MSA sparse index for overflow storage
         self.msa_index = MSASparseIndex(
@@ -398,6 +400,15 @@ class MSAOverflowBuffer(nn.Module):
         self.overflow_keys = torch.cat([self.overflow_keys, key.detach()], dim=0)
         self.overflow_vals = torch.cat([self.overflow_vals, value.detach()], dim=0)
         self.overflow_evidence = torch.cat([self.overflow_evidence, evidence.detach()], dim=0)
+
+        # Eviction: keep only topk entries by evidence if over capacity
+        if self.overflow_keys.shape[0] > self.max_capacity:
+            _, topk_idx = self.overflow_evidence.topk(self.max_capacity)
+            topk_idx, _ = topk_idx.sort()  # preserve insertion order
+            self.overflow_keys = self.overflow_keys[topk_idx]
+            self.overflow_vals = self.overflow_vals[topk_idx]
+            self.overflow_evidence = self.overflow_evidence[topk_idx]
+
         self.overflow_count[0] = self.overflow_keys.shape[0]
 
     def retrieve(

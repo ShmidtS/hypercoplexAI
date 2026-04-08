@@ -47,18 +47,19 @@
  ------------------------------
 """
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
 import torch
 import torch.nn.functional as F
 
 # Fix Windows console encoding for Cyrillic input via pipe
-import io
-
-if hasattr(sys.stdin, "reconfigure"):
-    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+stdin_reconfigure = getattr(sys.stdin, "reconfigure", None)
+if callable(stdin_reconfigure):
+    stdin_reconfigure(encoding="utf-8", errors="replace")
+stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if callable(stdout_reconfigure):
+    stdout_reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -69,42 +70,127 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DOMAIN_NAMES = ["math", "language", "code", "science"]
 DOMAIN_IDX = {n: i for i, n in enumerate(DOMAIN_NAMES)}
 
+LLM_BACKEND = os.environ.get("HDIM_LLM_BACKEND", "none")
+LLM_MODEL = os.environ.get("HDIM_LLM_MODEL", "")
 
-CHECKPOINT_PATH = (
+
+def query_llm(user_text: str, expert_info: str, model: str = "") -> str | None:
+    """Query an LLM backend (openai or anthropic) for a grounded response.
+
+    Returns the assistant reply text, or None if no backend is configured.
+    """
+    if LLM_BACKEND == "none":
+        return None
+    model = model or LLM_MODEL
+    system_prompt = (
+        "You are an HDIM AI assistant. The MoE router identified the following "
+        f"expert routing for the user's input:\n{expert_info}\n"
+        "Use this routing context to ground your response."
+    )
+    try:
+        if LLM_BACKEND == "openai":
+            from openai import OpenAI
+            client = OpenAI()
+            resp = client.chat.completions.create(
+                model=model or "gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                max_tokens=512,
+            )
+            return resp.choices[0].message.content
+        if LLM_BACKEND == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic()
+            resp = client.messages.create(
+                model=model or "claude-sonnet-4-20250514",
+                max_tokens=512,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_text}],
+            )
+            block = resp.content[0]
+            if isinstance(block, anthropic.types.TextBlock):
+                return block.text
+            return str(block)
+    except Exception as exc:
+        print(f"[llm error] {exc}")
+    return None
+
+
+CHECKPOINT_CANDIDATES = [
     Path(__file__).resolve().parents[1]
     / "artifacts"
     / "gpu_training"
     / "checkpoints"
-    / "best.pt"
-)
+    / "best.pt",
+    Path(__file__).resolve().parents[1]
+    / "artifacts"
+    / "run_018"
+    / "checkpoints"
+    / "best.pt",
+]
 
 
 def build_model():
     print(f"[init] Building SBERT + MoEKernel on {DEVICE}...")
-    cfg = HDIMConfig(hidden_dim=64, num_experts=4, num_domains=4, top_k=2)
-    model = build_sbert_hdim_model(cfg, soft_router=False, freeze_sbert=True)
-    _patch_moe_kernel(
-        model.core_model,
-        expert_names=["math", "language", "code", "science"],
-        z_loss_weight=0.01,
-        ortho_loss_weight=0.01,
-    )
-    # Load trained checkpoint if available
-    if CHECKPOINT_PATH.exists():
-        ckpt = torch.load(str(CHECKPOINT_PATH), map_location=DEVICE, weights_only=True)
+    checkpoint_path = next((path for path in CHECKPOINT_CANDIDATES if path.exists()), None)
+
+    if checkpoint_path is not None:
+        ckpt = torch.load(str(checkpoint_path), map_location=DEVICE, weights_only=True)
         sd = ckpt.get("model_state_dict", ckpt)
+        proj_bias = sd.get("text_encoder.projection.4.bias")
+        hidden_dim = proj_bias.shape[0] if proj_bias is not None else 256
+        cfg = HDIMConfig(
+            hidden_dim=hidden_dim,
+            num_experts=4,
+            num_domains=4,
+            memory_type="titans",
+            top_k=2,
+        )
+        model = build_sbert_hdim_model(cfg, soft_router=True, freeze_sbert=True)
+        _patch_moe_kernel(
+            model.core_model,
+            expert_names=["math", "language", "code", "science"],
+            z_loss_weight=0.01,
+            ortho_loss_weight=0.01,
+        )
         result = model.load_state_dict(sd, strict=False)
         score = ckpt.get("score", None)
         epoch = ckpt.get("current_epoch", ckpt.get("epoch", "?"))
         score_str = f", score={score:.4f}" if score is not None else ""
         print(
-            f"[init] Checkpoint loaded: epoch={epoch}{score_str} ({len(result.missing_keys)} missing keys)"
+            f"[init] Checkpoint loaded from {checkpoint_path}: epoch={epoch}{score_str} ({len(result.missing_keys)} missing keys)"
         )
     else:
-        print(
-            f"[init] WARNING: checkpoint not found at {CHECKPOINT_PATH} — using random weights"
+        cfg = HDIMConfig(hidden_dim=64, num_experts=4, num_domains=4, top_k=2)
+        model = build_sbert_hdim_model(cfg, soft_router=False, freeze_sbert=True)
+        _patch_moe_kernel(
+            model.core_model,
+            expert_names=["math", "language", "code", "science"],
+            z_loss_weight=0.01,
+            ortho_loss_weight=0.01,
         )
+        print(
+            "[init] WARNING: no checkpoint found in known artifacts paths — using random weights"
+        )
+
     model.to(DEVICE)
+    # Fix runaway expert bias from run_018 (science bias was 5.22)
+    _moe = model.core_model.pipeline.moe
+    # _expert_bias may be on MoEKernel directly or under .kernel (adapter pattern)
+    for _attr in ("_expert_bias",):
+        _target = None
+        if hasattr(_moe, _attr) and getattr(_moe, _attr) is not None:
+            _target = _moe
+        elif hasattr(_moe, "kernel") and hasattr(_moe.kernel, _attr) and getattr(_moe.kernel, _attr) is not None:
+            _target = _moe.kernel
+        if _target is not None:
+            bias_vals = getattr(_target, _attr).data
+            max_bias = bias_vals.abs().max().item()
+            if max_bias > 1.0:
+                print(f"[init] Clamping expert bias (max={max_bias:.2f} -> clamp 1.0)")
+                bias_vals.clamp_(-1.0, 1.0)
     model.eval()
     print("[init] Model ready.")
     print(f"[init] Experts: {DOMAIN_NAMES}")
@@ -115,23 +201,20 @@ def build_model():
 
 def encode_text(model, text: str):
     """Encode text and run through HDIMModel. Returns (exported_invariant, expert_weights, dominant_expert, out, aux_state)."""
-    text = str(text)  # ensure str, not bytes
+    text = str(text)
     with torch.no_grad():
-        enc = model.encode_texts([text], device=DEVICE)  # (1, 64)
+        enc = model.encode_texts([text], device=DEVICE)
         dom = torch.zeros(1, dtype=torch.long, device=DEVICE)
-        out, routing_weights, invariant, aux_state = model(
-            enc, dom, return_state=True, memory_mode="none"
-        )
-        expert_weights = aux_state.expert_usage.cpu()  # (4,)
+        out, _, _, _, aux_state = model(enc, dom, return_state=True, memory_mode="retrieve")
+        expert_weights = aux_state.expert_usage.cpu()
         top_idx = expert_weights.argmax().item()
-        # Return exported_invariant (clifford space) for domain transfer operations
         exported_inv = aux_state.exported_invariant
         return exported_inv, expert_weights, DOMAIN_NAMES[top_idx], out, aux_state
 
 
 def format_bar(weights, width=20):
     bars = []
-    for i, (name, w) in enumerate(zip(DOMAIN_NAMES, weights.tolist())):
+    for name, w in zip(DOMAIN_NAMES, weights.tolist()):
         filled = int(w * width)
         bar = "#" * filled + "-" * (width - filled)
         bars.append(f" {name:8s} [{bar}] {w:.3f}")
@@ -148,7 +231,7 @@ def main():
     print("=" * 55)
     print(" MoEKernel Interactive Chat")
     print(" Experts: math | language | code | science")
-    print(" Commands: :transfer <domain> | :compare <text> | :experts | :quit")
+    print(" Commands: :transfer <domain> | :compare <text> | :experts | :memory | :quit")
     print("=" * 55)
     print()
 
@@ -187,6 +270,20 @@ def main():
                 print("[no text encoded yet]")
             continue
 
+        if user_input == ":memory":
+            memory = getattr(model.core_model, "memory", None)
+            if memory is None:
+                memory = getattr(model.core_model.pipeline, "memory", None)
+            if memory is None:
+                print("[memory] No memory module found")
+            elif hasattr(memory, "stats"):
+                stats = memory.stats()
+                for k, v in stats.items():
+                    print(f"  {k}: {v}")
+            else:
+                print(f"[memory] {type(memory).__name__} (no stats method)")
+            continue
+
         if user_input.startswith(":transfer "):
             target = user_input[10:].strip().lower()
             if target not in DOMAIN_IDX:
@@ -221,31 +318,38 @@ def main():
                 continue
             inv2, ew2, dom2, _, _ = encode_text(model, text2)
             sim = cosine_sim(last_invariant, inv2)
-            print(f"[compare]")
-            print(f' Text 1: "{last_text[:60]}"')
+            print("[compare]")
+            print(f' Text 1: "{(last_text or "")[:60]}"')
             print(f' Text 2: "{text2[:60]}"')
             print(f" Cosine similarity (invariant space): {sim:.4f}")
-            print(
-                f" Text 1 dominant expert: {last_expert_weights.argmax() and DOMAIN_NAMES[last_expert_weights.argmax().item()]}"
-            )
+            text1_expert = "unknown"
+            if last_expert_weights is not None:
+                text1_expert = DOMAIN_NAMES[last_expert_weights.argmax().item()]
+            print(f" Text 1 dominant expert: {text1_expert}")
             print(f" Text 2 dominant expert: {dom2}")
-            print(f" Expert weights (text 2):")
+            print(" Expert weights (text 2):")
             print(format_bar(ew2))
             continue
 
         # --- Regular text encoding ---
-        invariant, expert_weights, dominant, out, aux_state = encode_text(
-            model, user_input
-        )
+        invariant, expert_weights, dominant, _, _ = encode_text(model, user_input)
         last_invariant = invariant
         last_text = user_input
         last_expert_weights = expert_weights
 
-        print(f"\nModel:")
+        expert_info = (
+            f"Dominant: {dominant.upper()}\n"
+            f"Weights: {', '.join(f'{n}={w:.3f}' for n, w in zip(DOMAIN_NAMES, expert_weights.tolist()))}"
+        )
+        print("\nModel:")
         print(f" Dominant expert : {dominant.upper()}")
         print(f" Invariant norm : {invariant.norm().item():.4f}")
-        print(f" Expert routing :")
+        print(" Expert routing :")
         print(format_bar(expert_weights))
+
+        llm_reply = query_llm(user_input, expert_info)
+        if llm_reply is not None:
+            print(f"\nLLM ({LLM_BACKEND}): {llm_reply}")
         print()
 
 

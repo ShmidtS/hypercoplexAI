@@ -157,6 +157,7 @@ class TitansMemoryModule(nn.Module):
         k32 = k.detach().float()
         v32 = v.detach().float()
         # Create fp32 leaf copy of memory weights (detached from main param)
+        # TTT inner loop: detach creates a separate leaf tensor for local gradient updates. Gradient still flows through retrieve() path.
         mem_w = self.memory.weight.detach().float().requires_grad_(True)
         k_agg = k32.mean(0) if k32.dim() > 1 else k32
         v_agg = v32.mean(0) if v32.dim() > 1 else v32

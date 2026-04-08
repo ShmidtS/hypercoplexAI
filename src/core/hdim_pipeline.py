@@ -193,50 +193,48 @@ class HDIMPipeline(nn.Module):
         input_is_invariant: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Полный кроссдоменный перенос: source → target."""
-        # Run entire pipeline in fp32: geometric_product returns float32
-        with torch.autocast(device_type='cuda', enabled=False):
-            if input_is_invariant:
-                g_source = None
-                u_inv = x
-            else:
-                g_source, u_inv = self.encode_domain(x, source_domain)
+        if input_is_invariant:
+            g_source = None
+            u_inv = x
+        else:
+            g_source, u_inv = self.encode_domain(x, source_domain)
 
-            u_mem, memory_state = self._apply_memory(
-                u_inv,
-                update_memory=update_memory,
-                memory_mode=memory_mode,
-            )
+        u_mem, memory_state = self._apply_memory(
+            u_inv,
+            update_memory=update_memory,
+            memory_mode=memory_mode,
+        )
 
-            source_rotor = self.domain_encoder.get_rotor(source_domain)
-            target_rotor = self.domain_encoder.get_rotor(target_domain)
+        source_rotor = self.domain_encoder.get_rotor(source_domain)
+        target_rotor = self.domain_encoder.get_rotor(target_domain)
 
-            output, router_state = self.transfer_engine.transfer(
-                u_mem=u_mem,
-                source_rotor=source_rotor,
-                target_rotor=target_rotor,
-                g_source=g_source,
-                input_is_invariant=input_is_invariant,
-            )
+        output, router_state = self.transfer_engine.transfer(
+            u_mem=u_mem,
+            source_rotor=source_rotor,
+            target_rotor=target_rotor,
+            g_source=g_source,
+            input_is_invariant=input_is_invariant,
+        )
 
-            transfer_state = TransferState(
-                g_source=g_source,
-                u_inv=u_inv,
-                u_mem=u_mem,
-                u_route=router_state.get("u_route", u_mem),
-                g_target=router_state["g_target"],
-                output=output,
-                memory_loss=memory_state.loss,
-                memory_retrieved=memory_state.retrieved,
-                memory_updated=memory_state.updated,
-                memory_alpha=memory_state.alpha,
-                memory_eta=memory_state.eta,
-                memory_theta=memory_state.theta,
-                router_state=router_state,
-                memory_mode=memory_mode,
-                update_memory=update_memory,
-                input_is_invariant=input_is_invariant,
-            )
-            return output, transfer_state.to_dict()
+        transfer_state = TransferState(
+            g_source=g_source,
+            u_inv=u_inv,
+            u_mem=u_mem,
+            u_route=router_state.get("u_route", u_mem),
+            g_target=router_state["g_target"],
+            output=output,
+            memory_loss=memory_state.loss,
+            memory_retrieved=memory_state.retrieved,
+            memory_updated=memory_state.updated,
+            memory_alpha=memory_state.alpha,
+            memory_eta=memory_state.eta,
+            memory_theta=memory_state.theta,
+            router_state=router_state,
+            memory_mode=memory_mode,
+            update_memory=update_memory,
+            input_is_invariant=input_is_invariant,
+        )
+        return output, transfer_state.to_dict()
 
     def forward(
         self,
