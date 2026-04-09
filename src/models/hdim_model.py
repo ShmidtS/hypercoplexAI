@@ -437,8 +437,8 @@ class HDIMModel(nn.Module):
         ) = self._allocate_state_tensors(batch_size=batch_size, device=device, dtype=dtype)
 
         _num_experts = pipeline.moe.num_experts
-        train_scores_snapshot = torch.empty(_num_experts, device=device, dtype=dtype)
-        expert_usage = torch.empty(_num_experts, device=device, dtype=dtype)
+        train_scores_snapshot = torch.zeros(_num_experts, device=device, dtype=dtype)
+        expert_usage = torch.zeros(_num_experts, device=device, dtype=dtype)
 
         # 1) Encode
         g_source = pipeline.encoder(x)
