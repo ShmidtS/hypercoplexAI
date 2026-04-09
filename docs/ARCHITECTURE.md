@@ -170,7 +170,7 @@
 | `[maxscore_router.py](../src/core/maxscore_router.py)`               | `MaxScoreRouter`             | Maximum Score Routing (Wang et al. ACL 2025), min-cost max-flow, SoftTopk      | **Stable** |
 | `[msa_attention.py](../src/core/msa_attention.py)`                   | `MSASparseIndex`             | Memory Sparse Attention: top-k + chunk compression, O(log N) retrieval         | **Stable** |
 |                                                                      | `MSAOverflowBuffer`          | MSA-backed overflow для EpisodicMemory, multi-hop retrieval                    | **Stable** |
-|                                                                      | `MSAAugmentedSemanticMemory` | SemanticMemory с опциональным MSA sparse retrieval                             | **Stable** |
+|                                                                      | `MSAMemory`                  | Prototype-based sparse retrieval с MSA index, ring buffer overflow, batched store | **Stable** |
 | `[hbma_memory.py](../src/core/hbma_memory.py)`                       | `HBMAMemory`                 | 4-system brain-inspired: Working/Episodic/Semantic/Procedural                  | **Stable** |
 |                                                                      | `WorkingMemory`              | Круговой буфер, salience-filtered attention                                    | **Stable** |
 |                                                                      | `EpisodicMemory`             | Surprise-gated binding, temporal ordering, overflow                            | **Stable** |
@@ -419,7 +419,7 @@ if self.use_shared_expert:
 | `MSAConfig`                  | Конфигурация: dim, top_k, chunk_size, num_heads, temperature         |
 | `MSASparseIndex`             | Router projectors (W_KR, W_QR) + top-k selection + chunk compression |
 | `MSAOverflowBuffer`          | MSA-backed overflow для EpisodicMemory, multi-hop retrieval          |
-| `MSAAugmentedSemanticMemory` | SemanticMemory с опциональным MSA sparse retrieval (drop-in)         |
+| `MSAMemory`                  | Prototype-based sparse retrieval, ring buffer overflow, batched store |
 
 
 **Алгоритм MSA:**

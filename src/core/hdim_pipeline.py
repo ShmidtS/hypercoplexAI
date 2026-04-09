@@ -87,6 +87,7 @@ class HDIMPipeline(nn.Module):
         top_k: int = 2,
         memory_key_dim: int = 32,
         memory_type: str = 'titans',
+        msa_config: Optional[dict] = None,
     ):
         super().__init__()
 
@@ -132,10 +133,10 @@ class HDIMPipeline(nn.Module):
             self.memory = HBMAMemoryAdapter(HBMAMemory(hidden_dim=clifford_dim))
         elif memory_type == 'msa':
             from .msa_attention import MSAMemory
+            msa_kwargs = msa_config or {}
             self.memory: MemoryInterface = MSAMemory(
                 hidden_dim=clifford_dim,
-                num_prototypes=256,
-                top_k=16,
+                **msa_kwargs,
             )
         else:
             from .hbma_memory import CLSMemory

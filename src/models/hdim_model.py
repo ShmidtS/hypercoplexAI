@@ -131,6 +131,18 @@ class HDIMConfig:
     # Phase 33: Hallucination Feedback Loop (Self-Correction)
     hallucination_feedback: bool = False # Enable hallucination feedback loop
     hallucination_feedback_config: Optional[dict] = None # Override default feedback config
+    # MSA memory configuration
+    msa_num_prototypes: int = 256
+    msa_top_k: int = 16
+    msa_chunk_size: int = 64
+    msa_num_heads: int = 4
+    msa_temperature: float = 0.07
+    msa_ema_momentum: float = 0.995
+    msa_overflow_capacity: int = 10000
+    msa_max_hops: int = 3
+    msa_interleave_threshold: float = 0.5
+    msa_compression_threshold: int = 128
+    msa_diversity_loss_weight: float = 1.0
 
     def __post_init__(self):
         # Compute num_experts from expert_names if provided
@@ -170,6 +182,20 @@ class HDIMModel(nn.Module):
         self.config = config
         self._domain_names: List[str] = config.get_domain_names()
 
+        msa_config = {
+            'num_prototypes': config.msa_num_prototypes,
+            'top_k': config.msa_top_k,
+            'chunk_size': config.msa_chunk_size,
+            'num_heads': config.msa_num_heads,
+            'temperature': config.msa_temperature,
+            'ema_momentum': config.msa_ema_momentum,
+            'overflow_capacity': config.msa_overflow_capacity,
+            'max_hops': config.msa_max_hops,
+            'interleave_threshold': config.msa_interleave_threshold,
+            'compression_threshold': config.msa_compression_threshold,
+            'diversity_loss_weight': config.msa_diversity_loss_weight,
+        }
+
         self.pipeline = HDIMPipeline(
             input_dim=config.hidden_dim,
             output_dim=config.hidden_dim,
@@ -181,6 +207,7 @@ class HDIMModel(nn.Module):
             top_k=config.top_k,
             memory_key_dim=config.memory_key_dim,
             memory_type=config.memory_type,
+            msa_config=msa_config,
         )
 
         self.dropout = nn.Dropout(config.dropout)

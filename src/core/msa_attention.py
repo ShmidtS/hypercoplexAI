@@ -17,7 +17,6 @@ Reference: MSA paper — Memory Sparse Attention for Long-Context LLMs
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -347,11 +346,13 @@ class MSAOverflowBuffer(nn.Module):
             temperature=temperature,
         )
 
-        # Overflow storage buffers (dynamic size)
-        self.register_buffer("overflow_keys", torch.zeros(0, self.key_dim))
-        self.register_buffer("overflow_vals", torch.zeros(0, dim))
-        self.register_buffer("overflow_evidence", torch.zeros(0))
+        # Overflow storage buffers (pre-allocated ring buffer)
+        self.register_buffer("overflow_keys", torch.zeros(capacity, self.key_dim))
+        self.register_buffer("overflow_vals", torch.zeros(capacity, dim))
+        self.register_buffer("overflow_evidence", torch.zeros(capacity))
         self.register_buffer("overflow_count", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("_overflow_valid", torch.zeros(capacity, dtype=torch.bool))
+        self.register_buffer("_overflow_head", torch.zeros(1, dtype=torch.long))
 
         # Feature flag state
         self._enabled = True
@@ -380,7 +381,7 @@ class MSAOverflowBuffer(nn.Module):
         value: torch.Tensor,  # [D] or [B, D]
         evidence: Optional[torch.Tensor] = None,  # [B] or scalar
     ) -> None:
-        """Store evicted slot in overflow buffer.
+        """Store evicted slot in overflow buffer (ring buffer).
 
         Args:
             key: Evicted key vector(s) [K] or [B, K]
@@ -389,35 +390,42 @@ class MSAOverflowBuffer(nn.Module):
         """
         if not self._enabled:
             return
-
-        # Ensure 2D
+        if self.max_capacity == 0:
+            return
         if key.dim() == 1:
             key = key.unsqueeze(0)
         if value.dim() == 1:
             value = value.unsqueeze(0)
-
         B = key.shape[0]
-
-        # Default evidence
         if evidence is None:
             evidence = torch.ones(B, device=key.device)
         elif evidence.dim() == 0:
             evidence = evidence.expand(B)
-
-        # Append to overflow buffers
-        self.overflow_keys = torch.cat([self.overflow_keys, key.detach()], dim=0)
-        self.overflow_vals = torch.cat([self.overflow_vals, value.detach()], dim=0)
-        self.overflow_evidence = torch.cat([self.overflow_evidence, evidence.detach()], dim=0)
-
-        # Eviction: keep only topk entries by evidence if over capacity
-        if self.overflow_keys.shape[0] > self.max_capacity:
-            _, topk_idx = self.overflow_evidence.topk(self.max_capacity)
-            topk_idx, _ = topk_idx.sort()  # preserve insertion order
-            self.overflow_keys = self.overflow_keys[topk_idx]
-            self.overflow_vals = self.overflow_vals[topk_idx]
-            self.overflow_evidence = self.overflow_evidence[topk_idx]
-
-        self.overflow_count[0] = self.overflow_keys.shape[0]
+        with torch.no_grad():
+            for i in range(B):
+                head = int(self._overflow_head[0].item())
+                if head < self.max_capacity:
+                    # Still filling
+                    self.overflow_keys[head] = key[i].detach()
+                    self.overflow_vals[head] = value[i].detach()
+                    self.overflow_evidence[head] = evidence[i].detach()
+                    self._overflow_valid[head] = True
+                    self._overflow_head[0] = head + 1
+                else:
+                    # Ring full: overwrite lowest-evidence valid entry
+                    valid_mask = self._overflow_valid
+                    if valid_mask.any():
+                        valid_evidence = self.overflow_evidence.clone()
+                        valid_evidence[~valid_mask] = float('inf')
+                        _, evict_idx = valid_evidence.min(dim=0)
+                        evict_idx = int(evict_idx.item())
+                    else:
+                        evict_idx = 0
+                    self.overflow_keys[evict_idx] = key[i].detach()
+                    self.overflow_vals[evict_idx] = value[i].detach()
+                    self.overflow_evidence[evict_idx] = evidence[i].detach()
+                    self._overflow_valid[evict_idx] = True
+            self.overflow_count[0] = self._overflow_valid.sum().item()
 
     def retrieve(
         self,
@@ -435,8 +443,7 @@ class MSAOverflowBuffer(nn.Module):
             weights: [B, K] retrieval weights
             indices: [B, K] retrieved indices
         """
-        if not self._enabled or self.overflow_count[0] == 0:
-            # Return empty if disabled or no overflow
+        if not self._enabled:
             B = query.shape[0]
             k = top_k or self.top_k
             return (
@@ -445,20 +452,34 @@ class MSAOverflowBuffer(nn.Module):
                 torch.zeros(B, k, dtype=torch.long, device=query.device),
             )
 
+        # Filter by valid mask
+        valid_mask = self._overflow_valid
+        if not valid_mask.any():
+            B = query.shape[0]
+            k = top_k or self.top_k
+            return (
+                torch.zeros(B, self.dim, device=query.device),
+                torch.zeros(B, k, device=query.device),
+                torch.zeros(B, k, dtype=torch.long, device=query.device),
+            )
+
+        valid_keys = self.overflow_keys[valid_mask]
+        valid_vals = self.overflow_vals[valid_mask]
+        valid_evidence = self.overflow_evidence[valid_mask]
 
         # Use MSA index for sparse retrieval
         # Get indices and weights from MSA (operates on keys)
         _, indices, weights = self.msa_index.query(
             self.query_proj(query) if self.query_proj is not None else query,
-            self.overflow_keys,
-            self.overflow_evidence,
+            valid_keys,
+            valid_evidence,
         )
 
-        # Gather actual values using the indices
-        # indices: [B, K], overflow_vals: [N, D]
+        # Gather actual values using the indices (relative to valid subset)
+        # indices: [B, K], valid_vals: [V, D]
         expanded_idx = indices.unsqueeze(-1).expand(-1, -1, self.dim)  # [B, K, D]
         topk_vals = torch.gather(
-            self.overflow_vals.unsqueeze(0).expand(query.shape[0], -1, -1),
+            valid_vals.unsqueeze(0).expand(query.shape[0], -1, -1),
             dim=1,
             index=expanded_idx,
         )  # [B, K, D]
@@ -494,8 +515,6 @@ class MSAOverflowBuffer(nn.Module):
         if not self._enabled:
             return primary_result, torch.zeros(query.shape[0], dtype=torch.bool, device=query.device)
 
-        B = query.shape[0]
-
         # Check which queries need overflow
         need_overflow = primary_confidence < threshold
         used_overflow = need_overflow.clone()
@@ -527,160 +546,23 @@ class MSAOverflowBuffer(nn.Module):
             )
 
             # For next hop, mark remaining low-confidence samples
-            # (simplified: one hop is usually enough)
-            need_overflow = torch.zeros_like(need_overflow)
+            remaining_confidence = (1 - overflow_weight.squeeze(-1)) * primary_confidence + overflow_weight.squeeze(-1)
+            need_overflow = remaining_confidence < threshold
 
         return blended, used_overflow
 
     def clear(self) -> None:
         """Clear overflow buffer."""
-        self.overflow_keys = torch.zeros(0, self.dim, device=self.overflow_keys.device)
-        self.overflow_vals = torch.zeros(0, self.dim, device=self.overflow_vals.device)
-        self.overflow_evidence = torch.zeros(0, device=self.overflow_evidence.device)
+        self.overflow_keys.zero_()
+        self.overflow_vals.zero_()
+        self.overflow_evidence.zero_()
         self.overflow_count.zero_()
+        self._overflow_valid.zero_()
+        self._overflow_head.zero_()
 
     def size(self) -> int:
         """Return number of items in overflow buffer."""
-        return int(self.overflow_count[0].item())
-
-
-class MSAAugmentedSemanticMemory(nn.Module):
-    prototypes: torch.Tensor
-    proto_conf: torch.Tensor
-    proto_evidence: torch.Tensor
-    proto_age: torch.Tensor
-    """SemanticMemory with optional MSA sparse retrieval.
-
-    Drop-in enhancement that:
-    - Uses dense cosine similarity when MSA disabled (backward compat)
-    - Uses sparse MSA retrieval when enabled (O(log N) scaling)
-
-    Integration point for Phase 2 MSA in SemanticMemory.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_prototypes: int = 64,
-        ema_momentum: float = 0.995,
-        temperature: float = 0.07,
-        contradiction_thresh: float = -0.3,
-        dropout: float = 0.1,
-        # MSA feature flag
-        use_msa: bool = False,
-        msa_top_k: int = 16,
-        msa_chunk_size: int = 64,
-    ) -> None:
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_prototypes = num_prototypes
-        self.ema_momentum = ema_momentum
-        self.temperature = temperature
-        self.contradiction_thresh = contradiction_thresh
-        self.use_msa = use_msa
-
-        # Core components (from SemanticMemory)
-        self.in_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        # Type router
-        self.type_router = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 4),
-        )
-
-        # Prototype storage
-        self.register_buffer(
-            "prototypes",
-            F.normalize(torch.randn(num_prototypes, hidden_dim), dim=-1)
-        )
-        self.register_buffer("proto_conf", torch.full((num_prototypes,), 0.5))
-        self.register_buffer("proto_evidence", torch.ones(num_prototypes))
-        self.register_buffer("proto_age", torch.zeros(num_prototypes))
-
-        # MSA sparse index (optional)
-        if use_msa:
-            self.msa_index = MSASparseIndex(
-                dim=hidden_dim,
-                num_prototypes=num_prototypes,
-                top_k=msa_top_k,
-                chunk_size=msa_chunk_size,
-            )
-        else:
-            self.msa_index = None
-
-    def _retrieve_dense(
-        self,
-        h: torch.Tensor,
-        prototypes: torch.Tensor,
-        conf: torch.Tensor,
-        age: torch.Tensor,
-        evidence: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dense retrieval via cosine similarity (backward compat)."""
-        h_norm = F.normalize(h, dim=-1)
-        p_norm = F.normalize(prototypes, dim=-1)
-
-        raw_sim = h_norm @ p_norm.T  # [B, P]
-        weighted_sim = raw_sim * conf.unsqueeze(0)
-
-        # Simple salience scoring
-        sal = weighted_sim + 0.1 * torch.exp(-age / 200.0).unsqueeze(0)
-        attn = F.softmax(sal / self.temperature, dim=-1)
-
-        return attn @ prototypes
-
-    def _retrieve_msa(
-        self,
-        h: torch.Tensor,
-        prototypes: torch.Tensor,
-        evidence: torch.Tensor,
-    ) -> torch.Tensor:
-        """Sparse retrieval via MSA."""
-        assert self.msa_index is not None
-        retrieved, _, _ = self.msa_index.query(h, prototypes, evidence)
-        return retrieved
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: retrieve and augment.
-
-        Args:
-            x: Input tensor [B, D]
-
-        Returns:
-            augmented: [B, D] memory-augmented representation
-        """
-        h = self.in_proj(x)
-
-        # Snap buffers
-        p_snap = self.prototypes.detach().clone()
-        conf_snap = self.proto_conf.detach().clone()
-        age_snap = self.proto_age.detach().clone()
-        ev_snap = self.proto_evidence.detach().clone()
-
-        # Choose retrieval method
-        if self.use_msa and self.msa_index is not None:
-            retrieved = self._retrieve_msa(h, p_snap, ev_snap)
-        else:
-            retrieved = self._retrieve_dense(h, p_snap, conf_snap, age_snap, ev_snap)
-
-        # Combine and output
-        combined = torch.cat([x, retrieved], dim=-1)
-        out = self.dropout(F.gelu(self.out_proj(combined)))
-        out = self.norm(out + x)
-
-        return out
-
-    def reset(self) -> None:
-        """Reset prototype buffers."""
-        nn.init.normal_(self.prototypes)
-        F.normalize(self.prototypes, dim=-1, out=self.prototypes)
-        self.proto_conf.fill_(0.5)
-        self.proto_evidence.fill_(1.0)
-        self.proto_age.zero_()
+        return int(self._overflow_valid.sum().item())
 
 
 class MSAMemory(MemoryInterface):
@@ -689,7 +571,7 @@ class MSAMemory(MemoryInterface):
     evidence: torch.Tensor
     age: torch.Tensor
     fill_count: torch.Tensor
-    _aux_loss: torch.Tensor
+    _last_diversity_loss: torch.Tensor
     _routing_counts: torch.Tensor
     """Primary memory system using MSA sparse attention.
 
@@ -719,6 +601,7 @@ class MSAMemory(MemoryInterface):
         max_hops: int = 3,
         interleave_threshold: float = 0.5,
         compression_threshold: int = 128,
+        diversity_loss_weight: float = 1.0,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -731,6 +614,7 @@ class MSAMemory(MemoryInterface):
         self.ema_momentum = ema_momentum
         self.max_hops = max_hops
         self.interleave_threshold = interleave_threshold
+        self.diversity_loss_weight = diversity_loss_weight
 
         # Projections (same pattern as MSAAugmentedSemanticMemory)
         self.in_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -781,10 +665,14 @@ class MSAMemory(MemoryInterface):
         )
 
         # Track auxiliary loss
-        self.register_buffer("_aux_loss", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("_last_diversity_loss", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer(
             "_routing_counts", torch.zeros(num_prototypes, dtype=torch.float32)
         )
+
+        # Phase 22 feature flags
+        self.use_gradient_surprise = False
+        self.use_adaptive_forgetting = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -807,33 +695,47 @@ class MSAMemory(MemoryInterface):
     def _compute_routing_diversity_loss(
         self,
         topk_indices: torch.Tensor,  # [B, K]
+        topk_weights: Optional[torch.Tensor] = None,  # [B, K]
     ) -> torch.Tensor:
         """Auxiliary loss encouraging even prototype usage.
 
-        Uses a soft count-based penalty: if some prototypes are heavily
-        over-used relative to uniform, the loss increases.
+        Uses soft routing weights for differentiable gradient signal,
+        scaled by 1/n to produce values in ~0.01-0.1 range for n=256.
+        EMA decay of routing counts happens per forward step.
         """
         B = topk_indices.shape[0]
         if B == 0:
             return torch.tensor(0.0, device=topk_indices.device, dtype=torch.float32)
 
-        # Update running routing counts (detached)
-        with torch.no_grad():
-            flat = topk_indices.detach().reshape(-1)
-            ones = torch.ones_like(flat, dtype=torch.float32)
-            self._routing_counts.scatter_add_(0, flat, ones)
-
-        # Compute diversity loss: L_div = CV(counts)^2
-        # Coefficient of variation squared — 0 when perfectly uniform
         n = int(self.fill_count[0].item())
         if n < 2:
             return torch.tensor(0.0, device=topk_indices.device, dtype=torch.float32)
 
-        counts = self._routing_counts[:n]
-        mean_c = counts.mean().clamp(min=1e-8)
-        var_c = ((counts - mean_c) ** 2).mean()
-        cv_sq = var_c / (mean_c ** 2 + 1e-8)
-        return cv_sq
+        # Compute soft routing distribution per prototype
+        if topk_weights is not None:
+            # Differentiable path: aggregate soft routing weights per prototype
+            soft_counts = torch.zeros(n, device=topk_indices.device, dtype=torch.float32)
+            # topk_weights shape: [B, K], topk_indices shape: [B, K]
+            flat_indices = topk_indices.reshape(-1)  # [B*K]
+            flat_weights = topk_weights.reshape(-1)   # [B*K]
+            soft_counts.scatter_add_(0, flat_indices, flat_weights)
+            counts = soft_counts
+        else:
+            # Non-differentiable fallback: hard counts
+            with torch.no_grad():
+                step_counts = torch.zeros(n, device=topk_indices.device, dtype=torch.float32)
+                flat = topk_indices.detach().reshape(-1)
+                ones = torch.ones_like(flat, dtype=torch.float32)
+                step_counts.scatter_add_(0, flat, ones)
+                self._routing_counts[:n].mul_(0.9).add_(step_counts, alpha=0.1)
+            counts = self._routing_counts[:n]
+
+        uniform = counts.sum() / n
+        if uniform < 1e-8:
+            return torch.tensor(0.0, device=topk_indices.device, dtype=torch.float32)
+        deviation = ((counts - uniform) ** 2).mean() / (uniform ** 2 + 1e-8)
+        normalized_loss = deviation / n
+        return normalized_loss
 
     def _evict_to_overflow(self, slot_idx: int) -> None:
         """Evict prototype at slot_idx to overflow buffer."""
@@ -842,45 +744,52 @@ class MSAMemory(MemoryInterface):
         ev = self.evidence[slot_idx].detach().clone()
         self.overflow.store(key.unsqueeze(0), val.unsqueeze(0), ev.unsqueeze(0))
 
-    def _store_invariant(self, h: torch.Tensor) -> None:
-        """Store a new invariant into the primary buffer.
-
-        If buffer is full, evict lowest-evidence prototype to overflow.
-        Uses EMA update for existing similar prototypes.
-        """
+    def _store_invariant_batched(self, x: torch.Tensor) -> None:
+        """Batched store: single matmul instead of B sequential cosine scans."""
+        B = x.shape[0]
         n = int(self.fill_count[0].item())
-
         with torch.no_grad():
-            # Check if similar prototype exists (cosine sim > 0.95)
+            h_norm = F.normalize(x, dim=-1)  # [B, D]
             if n > 0:
-                h_norm = F.normalize(h, dim=-1)
-                p_norm = F.normalize(self.prototypes[:n], dim=-1)
-                sim = (h_norm @ p_norm.T).squeeze(0)  # [n]
-                max_sim, max_idx = sim.max(dim=0)
-
-                if max_sim > 0.95:
-                    # EMA update existing prototype
-                    slot = int(max_idx.item())
+                p_norm = F.normalize(self.prototypes[:n], dim=-1)  # [n, D]
+                sim = h_norm @ p_norm.T  # [B, n]
+                max_sim, max_idx = sim.max(dim=-1)  # [B]
+            else:
+                max_sim = torch.zeros(B, device=x.device)
+                max_idx = torch.zeros(B, device=x.device, dtype=torch.long)
+            ema_mask = max_sim > 0.95
+            new_mask = ~ema_mask
+            # EMA updates (batched for unique slots)
+            if ema_mask.any():
+                ema_indices = max_idx[ema_mask]
+                ema_vectors = x[ema_mask]
+                unique_slots = ema_indices.unique()
+                for slot in unique_slots:
+                    items = ema_vectors[ema_indices == slot]
+                    avg_update = items.mean(dim=0)
                     momentum = self.ema_momentum
-                    self.prototypes[slot] = momentum * self.prototypes[slot] + (1 - momentum) * h.squeeze(0)
+                    self.prototypes[slot] = momentum * self.prototypes[slot] + (1 - momentum) * avg_update
                     self.prototypes[slot] = F.normalize(self.prototypes[slot], dim=-1)
-                    self.evidence[slot] = self.evidence[slot] + 1.0
-                    self.confidence[slot] = torch.clamp(
-                        self.confidence[slot] + 0.05, max=1.0
-                    )
+                    self.evidence[slot] = self.evidence[slot] + items.shape[0]
+                    self.confidence[slot] = torch.clamp(self.confidence[slot] + 0.05, max=1.0)
                     self.age[slot] = 0.0
-                    return
+            # New insertions (sequential due to fill_count mutation)
+            if new_mask.any():
+                new_vectors = x[new_mask]
+                for j in range(new_vectors.shape[0]):
+                    self._insert_new_prototype(new_vectors[j:j+1])
 
-            # New prototype needed
+    def _insert_new_prototype(self, h: torch.Tensor) -> None:
+        """Insert a single new prototype into the primary buffer."""
+        n = int(self.fill_count[0].item())
+        with torch.no_grad():
             if n < self.num_prototypes:
-                # Free slot available
                 self.prototypes[n] = F.normalize(h.squeeze(0), dim=-1)
                 self.confidence[n] = 0.5
                 self.evidence[n] = 1.0
                 self.age[n] = 0.0
                 self.fill_count[0] = n + 1
             else:
-                # Buffer full: evict lowest-evidence prototype
                 _, evict_idx = self.evidence.min(dim=0)
                 evict_idx = int(evict_idx.item())
                 self._evict_to_overflow(evict_idx)
@@ -912,8 +821,7 @@ class MSAMemory(MemoryInterface):
 
         # Store new invariants before retrieval (so they're available immediately)
         if update_memory:
-            for i in range(B):
-                self._store_invariant(x[i : i + 1])
+            self._store_invariant_batched(x)
 
         # Project input for retrieval
         h = self.in_proj(x)
@@ -963,9 +871,10 @@ class MSAMemory(MemoryInterface):
                 / (x.norm(dim=-1, keepdim=True) + 1e-8)
             )
 
-        # Auxiliary loss: routing diversity
-        diversity_loss = self._compute_routing_diversity_loss(topk_indices)
-        self._aux_loss = diversity_loss.detach()
+        # Auxiliary loss: routing diversity (keep gradient for self-regulation)
+        diversity_loss = self._compute_routing_diversity_loss(topk_indices, topk_weights=topk_weights)
+        weighted_diversity_loss = diversity_loss * self.diversity_loss_weight
+        self._last_diversity_loss = weighted_diversity_loss
 
         # Age all prototypes
         with torch.no_grad():
@@ -973,7 +882,7 @@ class MSAMemory(MemoryInterface):
 
         return MemoryResult(
             output=output,
-            loss=diversity_loss,
+            loss=weighted_diversity_loss,
             updated=update_memory,
             surprise=surprise.detach(),
         )
@@ -997,6 +906,7 @@ class MSAMemory(MemoryInterface):
             self.fill_count.zero_()
             self._routing_counts.zero_()
             self.overflow.clear()
+            self._last_diversity_loss.fill_(0.0)
 
         elif strategy == "geometric":
             # Soft decay: reduce confidence and evidence, reset age
@@ -1005,8 +915,6 @@ class MSAMemory(MemoryInterface):
             self.confidence[:n] = decay * self.confidence[:n] + (1 - decay) * uniform_conf[:n]
             self.evidence[:n] = (self.evidence[:n] * decay).clamp(min=1.0)
             self.age[:n] = 0.0
-            # Decay routing counts but don't zero
-            self._routing_counts.mul_(decay)
 
         elif strategy == "stabilize":
             # Only normalize evidence and confidence
@@ -1014,8 +922,7 @@ class MSAMemory(MemoryInterface):
                 total_ev = self.evidence[:n].sum().clamp(min=1e-8)
                 self.evidence[:n] = (self.evidence[:n] / total_ev) * n
                 self.confidence[:n] = self.confidence[:n].clamp(0.1, 1.0)
-            self._routing_counts.mul_(0.9)
 
     def memory_loss(self) -> torch.Tensor:
         """Current auxiliary memory loss (routing diversity)."""
-        return self._aux_loss
+        return self._last_diversity_loss

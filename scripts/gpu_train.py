@@ -911,6 +911,16 @@ def main() -> None:
     parser.add_argument("--memory_type", type=str, default="titans",
                         choices=["titans", "hippocampus", "neocortex", "cls", "hbma", "msa"],
                         help="Memory module type (default: titans)")
+    # MSA (Memory-augmented Sparse Attention) parameters
+    parser.add_argument('--msa_num_prototypes', type=int, default=256, help='MSA number of prototypes')
+    parser.add_argument('--msa_top_k', type=int, default=16, help='MSA top-k for sparse retrieval')
+    parser.add_argument('--msa_chunk_size', type=int, default=64, help='MSA chunk size for sparse index')
+    parser.add_argument('--msa_num_heads', type=int, default=4, help='MSA number of attention heads')
+    parser.add_argument('--msa_temperature', type=float, default=0.07, help='MSA retrieval temperature')
+    parser.add_argument('--msa_overflow_capacity', type=int, default=10000, help='MSA overflow buffer capacity')
+    parser.add_argument('--msa_max_hops', type=int, default=3, help='MSA max retrieval hops')
+    parser.add_argument('--msa_interleave_threshold', type=float, default=0.5, help='MSA interleave confidence threshold')
+    parser.add_argument('--msa_diversity_weight', type=float, default=1.0, help='MSA diversity loss weight')
     # Temperature scheduling
     parser.add_argument("--temp_schedule", type=str, default="none",
                         choices=["none", "warm_restart"],
@@ -962,6 +972,15 @@ def main() -> None:
         clifford_q=args.clifford_q,
         clifford_r=args.clifford_r,
         memory_type=getattr(args, 'memory_type', 'titans'),
+        msa_num_prototypes=args.msa_num_prototypes,
+        msa_top_k=args.msa_top_k,
+        msa_chunk_size=args.msa_chunk_size,
+        msa_num_heads=args.msa_num_heads,
+        msa_temperature=args.msa_temperature,
+        msa_overflow_capacity=args.msa_overflow_capacity,
+        msa_max_hops=args.msa_max_hops,
+        msa_interleave_threshold=args.msa_interleave_threshold,
+        msa_diversity_loss_weight=args.msa_diversity_weight,
     )
     clifford_dim = 2 ** (args.clifford_p + args.clifford_q + args.clifford_r)
     print(f"Clifford algebra: Cl({args.clifford_p},{args.clifford_q},{args.clifford_r}) dim={clifford_dim}")

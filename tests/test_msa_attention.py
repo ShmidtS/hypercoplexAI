@@ -15,7 +15,6 @@ from src.core.msa_attention import (
     MSAOverflowBuffer,
     MSAConfig,
     MSASparseIndex,
-    MSAAugmentedSemanticMemory,
 )
 
 
@@ -197,176 +196,6 @@ class TestMSASparseIndex:
 
         assert h.grad is not None
         assert h.grad.shape == h.shape
-
-
-class TestMSAAugmentedSemanticMemory:
-    """Test suite for MSA-augmented SemanticMemory."""
-
-    @pytest.fixture
-    def memory_dense(self):
-        """Create SemanticMemory with MSA disabled."""
-        return MSAAugmentedSemanticMemory(
-            hidden_dim=64,
-            num_prototypes=32,
-            use_msa=False,
-        )
-
-    @pytest.fixture
-    def memory_msa(self):
-        """Create SemanticMemory with MSA enabled."""
-        return MSAAugmentedSemanticMemory(
-            hidden_dim=64,
-            num_prototypes=32,
-            use_msa=True,
-            msa_top_k=8,
-        )
-
-    @pytest.fixture
-    def batch_input(self):
-        """Generate test input."""
-        return torch.randn(4, 64)
-
-    def test_backward_compatibility_disabled(self, memory_dense, batch_input):
-        """Test that MSA disabled mode works identically to original."""
-        memory_dense.eval()
-        with torch.no_grad():
-            output = memory_dense(batch_input)
-
-        assert output.shape == batch_input.shape
-
-    def test_msa_enabled_forward(self, memory_msa, batch_input):
-        """Test that MSA enabled mode produces valid output."""
-        memory_msa.eval()
-        with torch.no_grad():
-            output = memory_msa(batch_input)
-
-        assert output.shape == batch_input.shape
-
-    def test_msa_enabled_by_default(self, batch_input):
-        """Test that MSA is enabled by default in SemanticMemory."""
-        from src.core.hbma_memory import SemanticMemory
-        memory = SemanticMemory(hidden_dim=64, num_prototypes=32)
-        assert memory.use_msa is True
-        assert memory.msa_index is not None
-
-    def test_msa_enabled_when_requested(self):
-        """Test that MSA is properly initialized when requested."""
-        memory = MSAAugmentedSemanticMemory(
-            hidden_dim=64,
-            num_prototypes=32,
-            use_msa=True,
-        )
-        assert memory.use_msa is True
-        assert memory.msa_index is not None
-
-    def test_output_stability_dense(self, memory_dense, batch_input):
-        """Test that dense mode produces stable outputs."""
-        memory_dense.eval()
-        with torch.no_grad():
-            out1 = memory_dense(batch_input)
-            out2 = memory_dense(batch_input)
-
-        assert torch.allclose(out1, out2, atol=1e-5)
-
-    def test_output_stability_msa(self, memory_msa, batch_input):
-        """Test that MSA mode produces stable outputs."""
-        memory_msa.eval()
-        with torch.no_grad():
-            out1 = memory_msa(batch_input)
-            out2 = memory_msa(batch_input)
-
-        assert torch.allclose(out1, out2, atol=1e-5)
-
-    def test_reset_clears_state(self, memory_msa):
-        """Test that reset clears prototype state."""
-        memory_msa.proto_conf.fill_(0.9)
-        memory_msa.proto_evidence.fill_(100.0)
-
-        memory_msa.reset()
-
-        assert torch.allclose(memory_msa.proto_conf, torch.full_like(memory_msa.proto_conf, 0.5))
-        assert torch.allclose(memory_msa.proto_evidence, torch.ones_like(memory_msa.proto_evidence))
-
-    def test_gradient_flow_both_modes(self, memory_dense, memory_msa, batch_input):
-        """Test gradients flow in both modes."""
-        # Dense mode
-        x = batch_input.requires_grad_(True)
-        out = memory_dense(x)
-        out.sum().backward()
-        assert x.grad is not None
-
-        # MSA mode
-        x = batch_input.requires_grad_(True)
-        out = memory_msa(x)
-        out.sum().backward()
-        assert x.grad is not None
-
-
-class TestMSAIntegrationScenarios:
-    """Integration tests for MSA in realistic scenarios."""
-
-    def test_large_prototype_scaling(self):
-        """Test MSA handles large prototype counts efficiently."""
-        # Simulate scaled-up SemanticMemory
-        memory = MSAAugmentedSemanticMemory(
-            hidden_dim=128,
-            num_prototypes=256,
-            use_msa=True,
-            msa_top_k=16,
-            msa_chunk_size=64,
-        )
-        memory.compression_threshold = 128
-
-        batch = torch.randn(8, 128)
-        output = memory(batch)
-
-        assert output.shape == batch.shape
-
-    def test_small_batch_efficiency(self):
-        """Test MSA works efficiently with small batches."""
-        memory = MSAAugmentedSemanticMemory(
-            hidden_dim=64,
-            num_prototypes=64,
-            use_msa=True,
-        )
-
-        single_input = torch.randn(1, 64)
-        output = memory(single_input)
-
-        assert output.shape == single_input.shape
-
-    def test_mode_switching_consistency(self):
-        """Test that switching between modes maintains consistency."""
-        hidden_dim = 64
-        num_prototypes = 32
-
-        # Create both modes
-        memory_dense = MSAAugmentedSemanticMemory(
-            hidden_dim=hidden_dim,
-            num_prototypes=num_prototypes,
-            use_msa=False,
-        )
-        memory_msa = MSAAugmentedSemanticMemory(
-            hidden_dim=hidden_dim,
-            num_prototypes=num_prototypes,
-            use_msa=True,
-        )
-
-        # Copy prototypes to ensure same starting point
-        memory_msa.prototypes.copy_(memory_dense.prototypes.detach())
-
-        batch = torch.randn(4, hidden_dim)
-
-        memory_dense.eval()
-        memory_msa.eval()
-
-        with torch.no_grad():
-            out_dense = memory_dense(batch)
-            out_msa = memory_msa(batch)
-
-        # Both should produce valid outputs (not necessarily identical)
-        assert out_dense.shape == batch.shape
-        assert out_msa.shape == batch.shape
 
 
 class TestMSAEdgeCases:
@@ -552,8 +381,9 @@ class TestMSAOverflowBuffer:
         overflow_buffer.store(key, value)
 
         assert overflow_buffer.size() == 1
-        assert overflow_buffer.overflow_keys.shape == (1, 32)
-        assert overflow_buffer.overflow_vals.shape == (1, 64)
+        assert overflow_buffer._overflow_valid.sum().item() == 1
+        assert overflow_buffer.overflow_keys.shape[1] == 32
+        assert overflow_buffer.overflow_vals.shape[1] == 64
 
     def test_store_batch(self, overflow_buffer, batch_data):
         """Test storing a batch of items."""
@@ -563,8 +393,8 @@ class TestMSAOverflowBuffer:
         overflow_buffer.store(keys, values, evidence)
 
         assert overflow_buffer.size() == B
-        assert overflow_buffer.overflow_keys.shape == (B, 32)
-        assert overflow_buffer.overflow_vals.shape == (B, 64)
+        assert overflow_buffer.overflow_keys.shape[1] == 32
+        assert overflow_buffer.overflow_vals.shape[1] == 64
 
     def test_retrieve_from_empty(self, overflow_buffer):
         """Test retrieval from empty buffer returns zeros."""
