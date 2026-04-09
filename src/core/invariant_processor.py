@@ -32,6 +32,7 @@ class InvariantMemoryState:
     alpha: Optional[torch.Tensor] = None  # memory blend gate (Titans)
     eta: Optional[torch.Tensor] = None    # momentum learning rate (Titans)
     theta: Optional[torch.Tensor] = None  # gradient step size (Titans)
+    surprise: Optional[torch.Tensor] = None  # surprise signal (Titans)
 
 
 class InvariantProcessor(nn.Module):
@@ -88,6 +89,7 @@ class InvariantProcessor(nn.Module):
                 retrieved=torch.zeros_like(u_inv),
                 loss=torch.zeros((), device=u_inv.device, dtype=u_inv.dtype),
                 updated=False,
+                surprise=torch.zeros(1, device=u_inv.device, dtype=u_inv.dtype),
             )
             return u_inv, empty_state
 
@@ -105,6 +107,7 @@ class InvariantProcessor(nn.Module):
             alpha=result.alpha,
             eta=result.eta,
             theta=result.theta,
+            surprise=result.surprise,
         )
 
         return result.output, state

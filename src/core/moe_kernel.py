@@ -101,7 +101,7 @@ class MoEKernelState:
     dispatch_weights: torch.Tensor  # (B, num_slots)
     combine_weights: torch.Tensor  # (B, num_slots)
     expert_names: List[str]
-    top_expert_idx: torch.Tensor  # (B,) — индекс наиболее используемого эксперта
+    top_expert_idx: torch.Tensor  # (B, top_k) — top-k expert indices per sample
     slot_outputs: Optional[torch.Tensor] = None # (num_slots, D) — реальные выходы экспертов
 
     def total_loss(self) -> torch.Tensor:
@@ -109,7 +109,9 @@ class MoEKernelState:
 
     def dominant_expert_names(self) -> List[str]:
         """Возвращает имена доминирующего эксперта для каждого токена."""
-        return [self.expert_names[int(i)] for i in self.top_expert_idx.tolist()]
+        # top_expert_idx shape: (..., top_k) — take first column for dominant
+        idx = self.top_expert_idx[..., 0] if self.top_expert_idx.dim() >= 2 else self.top_expert_idx
+        return [self.expert_names[int(i)] for i in idx.flatten().tolist()]
 
 
 # ============================================================
@@ -786,7 +788,9 @@ class MoEKernel(nn.Module):
         expert_weights_per_token = combine_reshaped.mean(-1)  # (T, E)
         expert_usage = expert_weights_per_token.mean(0).detach()  # (E,)
         routing_entropy = -(expert_weights_per_token * (expert_weights_per_token + 1e-8).log()).sum(-1).mean()
-        top_expert_idx = expert_weights_per_token.argmax(-1)  # (T,)
+        # top-k expert indices: (T, top_k) instead of just argmax (T,)
+        _top_k = min(2, self.num_experts)
+        top_expert_idx = expert_weights_per_token.topk(_top_k, dim=-1).indices  # (T, top_k)
 
         # 8. EMA train_scores + bias update (только во время обучения)
         if self.training:
@@ -805,7 +809,7 @@ class MoEKernel(nn.Module):
             dispatch_weights=dispatch.reshape(*orig_shape[:-1], self.num_slots),
             combine_weights=combine.reshape(*orig_shape[:-1], self.num_slots),
             expert_names=self.expert_names,
-            top_expert_idx=top_expert_idx.reshape(orig_shape[:-1]),
+            top_expert_idx=top_expert_idx.reshape(*orig_shape[:-1], _top_k),
  slot_outputs=slot_outputs,
         )
         return output.reshape(orig_shape), state

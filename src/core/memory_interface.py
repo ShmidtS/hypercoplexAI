@@ -155,10 +155,13 @@ class HBMAMemoryAdapter(MemoryInterface):
         loss = self.hbma.memory_loss() if hasattr(self.hbma, 'memory_loss') else torch.tensor(0.0, device=x.device, dtype=x.dtype)
         # HBMA updates internally whenever self.hbma.training is True
         actually_updated = update_memory and self.hbma.training
+        # Compute surprise as normalized deviation from input
+        surprise = (output - x).norm(dim=-1, keepdim=True) / (x.norm(dim=-1, keepdim=True) + 1e-8)
         return MemoryResult(
             output=output,
             loss=loss,
             updated=actually_updated,
+            surprise=surprise.detach(),
         )
 
     def reset(self, strategy: str = 'geometric') -> None:

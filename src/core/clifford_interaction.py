@@ -4,6 +4,8 @@ Inspired by CliffordNet (arXiv:2601.06793) - "All You Need is Geometric Algebra"
 Preserves grade structure of multivectors unlike GELU which destroys it.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -212,7 +214,11 @@ class CliffordInteractionLayer(nn.Module):
         use_vectorized: bool = True
     ):
         super().__init__()
-        assert dim == 16, f"CliffordInteractionLayer expects dim=16 for Cl_{{3,1,0}}, got {dim}"
+        if dim & (dim - 1) != 0 or dim < 4:
+            raise ValueError(
+                f"CliffordInteractionLayer: dim={dim} must be a power of 2 >= 4 "
+                f"(algebra dimension is 2^n)."
+            )
 
         self.dim = dim
         self.shifts = shifts
@@ -227,8 +233,15 @@ class CliffordInteractionLayer(nn.Module):
         # Vectorized PyTorch forward (default: True for performance)
         self.use_vectorized = use_vectorized
 
-        # Clifford algebra Cl_{3,1,0} for HDIM
-        self.clifford = CliffordAlgebra(p=3, q=1, r=0)
+        # Clifford algebra: match p,q,r to dim (2^(p+q+r) = dim)
+        if dim == 16:
+            self.clifford = CliffordAlgebra(p=3, q=1, r=0)
+        elif dim == 32:
+            self.clifford = CliffordAlgebra(p=4, q=1, r=0)
+        else:
+            # Dynamic: infer n from dim=2^n, use p=n-1,q=1,r=0
+            n = int(math.log2(dim))
+            self.clifford = CliffordAlgebra(p=max(n - 1, 1), q=1, r=0)
 
         # Learnable weights for inner/wedge mixing
         self.inner_weight = nn.Parameter(torch.tensor(0.5))
@@ -342,20 +355,22 @@ class CliffordInteractionLayer(nn.Module):
             # Accumulate interaction outputs
             interaction_output = torch.zeros_like(x)
 
+            # Compute geometric product once, reuse for inner and wedge
+            needs_product = self.use_inner or self.use_wedge
+            if needs_product:
+                ab = self.clifford.geometric_product_batch(x, C_all)  # (num_shifts, B, T, D)
+
             # Process inner product if enabled (fully vectorized)
             if self.use_inner:
-                # Use batched geometric product: (num_shifts, B, T, D)
-                product = self.clifford.geometric_product_batch(x, C_all)
                 # Extract scalar part (grade-0, index 0) and sum over shifts
-                scalar_parts = product[..., 0:1]  # (num_shifts, B, T, 1)
+                scalar_parts = ab[..., 0:1]  # (num_shifts, B, T, 1)
                 inner_sum = scalar_parts.sum(dim=0)  # (B, T, 1)
                 inner_weighted = torch.sigmoid(self.inner_weight) * inner_sum
                 interaction_output = interaction_output + inner_weighted
 
             # Process wedge product if enabled (fully vectorized)
             if self.use_wedge:
-                # ab: x (B,T,D) * C_all (num_shifts, B,T,D)
-                ab = self.clifford.geometric_product_batch(x, C_all)  # (num_shifts, B, T, D)
+                # Reuse ab from above (already computed)
 
                 # ba: C_all * x for each shift
                 # Reshape for batch processing
@@ -426,15 +441,25 @@ class CliffordInteractionLayer(nn.Module):
                 C_local = torch.zeros_like(x)
 
             # Compute geometric interactions using CliffordAlgebra
-            if self.use_inner:
+            # Compute ab once and reuse for both inner and wedge
+            needs_inner = self.use_inner
+            needs_wedge = self.use_wedge
+            if needs_inner or needs_wedge:
+                ab = self.clifford.geometric_product(x, C_local)  # (B, T, D)
+
+            if needs_inner:
                 # Inner product: scalar part <x*C>_0
-                inner = self._compute_inner(x, C_local) # (B, T, 1)
+                inner = ab[..., 0:1]  # (B, T, 1)
                 inner = torch.sigmoid(self.inner_weight) * inner
                 interaction_output = interaction_output + inner
 
-            if self.use_wedge:
-                # Wedge product: bivector part (x∧C)
-                wedge = self._compute_wedge(x, C_local) # (B, T, D)
+            if needs_wedge:
+                # Wedge product: bivector part (x∧C) = (ab - ba) / 2
+                ba = self.clifford.geometric_product(C_local, x)  # (B, T, D)
+                wedge = (ab - ba) / 2.0
+                # Numerical stability
+                wedge = torch.nan_to_num(wedge, nan=0.0, posinf=1e4, neginf=-1e4)
+                wedge = torch.clamp(wedge, min=-1e3, max=1e3)
                 wedge = torch.sigmoid(self.wedge_weight) * wedge
                 interaction_output = interaction_output + wedge
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from .moe_interface import MoERouter
 
@@ -60,8 +60,10 @@ class SoftMoERouter(MoERouter):
         top_k: int = 2,  # kept for API compatibility
         temperature: float = 1.0,
         z_loss_weight: float = 0.0,
+        use_shared_expert: bool = False,
     ):
         super().__init__()
+        self.input_dim = input_dim
         self.num_experts = num_experts
         self.expert_dim = expert_dim
         self.slots_per_expert = slots_per_expert
@@ -93,13 +95,19 @@ class SoftMoERouter(MoERouter):
         )
 
         # Phase 26: Shared Expert (DeepSeek-V3)
-        self.use_shared_expert = False
-        self._shared_expert = nn.Sequential(
-            nn.Linear(input_dim, expert_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(expert_dim, input_dim),
-        )
+        # BUG-07 FIX: only create _shared_expert when use_shared_expert=True
+        self.use_shared_expert = use_shared_expert
+        self._shared_expert: Optional[nn.Module] = None
+        if self.use_shared_expert:
+            self._shared_expert = nn.Sequential(
+                nn.Linear(self.input_dim, self.expert_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.expert_dim, self.input_dim),
+            )
+
+        # BUG-08 FIX: define use_bias_balancing in __init__
+        self.use_bias_balancing = False
 
         # Phase 26: Auxiliary-Loss-Free Balancing (DeepSeek-V3)
         # Per-expert bias terms that dynamically adjust routing
@@ -115,13 +123,14 @@ class SoftMoERouter(MoERouter):
 
     def _compute_dispatch_combine(
         self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Вычисляет dispatch и combine матрицы.
 
         Returns:
             dispatch: (T, num_slots) — веса для агрегации токенов в слоты
             combine:  (T, num_slots) — веса для агрегации выходов экспертов
+            z_loss: scalar tensor or None — router z-loss for stability
         """
         # logits: (T, num_slots)
         logits = self.dispatch_proj(x) / self.temperature
@@ -132,12 +141,11 @@ class SoftMoERouter(MoERouter):
             bias_expanded = bias.repeat_interleave(self.slots_per_expert)  # (num_slots,)
             logits = logits + bias_expanded.unsqueeze(0)  # broadcast over batch
 
-        # Router z-loss (ST-MoE): penalize large logit magnitudes
+        # BUG-09 FIX: compute z_loss locally, return it — do NOT store on self
+        z_loss: Optional[torch.Tensor] = None
         if self.z_loss_weight > 0:
             lse = torch.logsumexp(logits, dim=-1)
-            self._z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
-        else:
-            self._z_loss = None
+            z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
 
         T = x.shape[0]
         # C1 FIX: guard for T=1 — dim=0 softmax with single row returns all-ones
@@ -149,7 +157,7 @@ class SoftMoERouter(MoERouter):
             dispatch = F.softmax(logits, dim=0)   # (T, num_slots)
         # combine: нормализация по слотам (каждый токен получает mix слотов)
         combine = F.softmax(logits, dim=-1)   # (T, num_slots)
-        return dispatch, combine
+        return dispatch, combine, z_loss
 
     def _evaluate_experts(self, slot_inputs: torch.Tensor) -> torch.Tensor:
         """
@@ -185,7 +193,7 @@ class SoftMoERouter(MoERouter):
         x_flat = x.reshape(-1, x.shape[-1])  # (T, D)
         T, D = x_flat.shape
 
-        dispatch, combine = self._compute_dispatch_combine(x_flat)
+        dispatch, combine, z_loss = self._compute_dispatch_combine(x_flat)
         # dispatch: (T, num_slots), combine: (T, num_slots)
 
         # Aggregate tokens into expert slots: X̃ = dispatch.T @ X
@@ -202,7 +210,7 @@ class SoftMoERouter(MoERouter):
 
         # Phase 26: Shared Expert (DeepSeek-V3) — always-on FFN
         if self.use_shared_expert:
-            shared_out = self._shared_expert(x_flat)
+            shared_out = self._shared_expert(x_flat)  # type: ignore[union-attr]
             output = output + shared_out
 
         combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
@@ -233,8 +241,9 @@ class SoftMoERouter(MoERouter):
         routing_entropy = -(gate_weights * (gate_weights + 1e-8).log()).sum(dim=-1).mean()
 
         # Add z_loss to router loss for stability
-        z_loss = self._z_loss if self._z_loss is not None else torch.zeros((), device=x.device, dtype=x.dtype)
-        if self.z_loss_weight > 0 and self._z_loss is not None:
+        if z_loss is None:
+            z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
+        if self.z_loss_weight > 0:
             router_loss = router_loss + self.z_loss_weight * z_loss
 
         router_state: Dict[str, Any] = {
@@ -311,6 +320,13 @@ class SoftMoERouter(MoERouter):
     def enable_shared_expert(self) -> None:
         """Enable DeepSeek-V3 always-on shared expert."""
         self.use_shared_expert = True
+        if self._shared_expert is None:
+            self._shared_expert = nn.Sequential(
+                nn.Linear(self.input_dim, self.expert_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.expert_dim, self.input_dim),
+            ).to(device=self.dispatch_proj.weight.device, dtype=self.dispatch_proj.weight.dtype)
 
     def _update_biases(self, expert_load: torch.Tensor) -> None:
         """

@@ -87,10 +87,15 @@ class MoEKernelAdapter(MoERouter):
         }
 
         # Alias keys expected by _forward_core
+        # Compute proper top-k from expert_weights -> (..., top_k)
+        top_k = min(2, self.kernel.num_experts)
+        # expert_weights may be (B, E) or (B, T, E) — always topk along last dim
+        topk_weights, topk_indices = state.expert_weights.topk(top_k, dim=-1)  # (..., top_k)
+
         info.update({
             "gate_weights": state.expert_weights,
-            "topk_idx": state.top_expert_idx,
-            "topk_gate_weights": state.expert_weights,
+            "topk_idx": topk_indices,
+            "topk_gate_weights": topk_weights,
             "train_scores_snapshot": self.kernel.train_scores.detach().clone(),
         })
 

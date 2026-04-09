@@ -88,13 +88,18 @@ _DOMAIN_KEYWORDS = {
     "code": [
         "python", "javascript", "function", "class", "debug", "algorithm",
         "code", "program", "compile", "api", "variable", "loop", "script",
+        "implement", "binary", "search", "sort", "recursion", "array",
+        "hash", "tree", "graph", "stack", "queue", "pointer", "memory",
         "код", "программа", "функция", "класс", "отладка",
     ],
     "science": [
         "quantum", "physics", "chemistry", "biology", "experiment",
         "hypothesis", "atom", "molecule", "cell", "DNA", "gravity",
-        "energy", "theory", "entropy",
+        "energy", "theory", "entropy", "photosynthesis", "light",
+        "speed", "velocity", "radiation", "photon", "evolution",
+        "species", "organism", "temperature", "pressure", "force",
         "квантовая", "физика", "химия", "биология", "атом",
+        "фотосинтез", "эволюция", "скорость", "свет",
     ],
 }
 
@@ -110,7 +115,9 @@ def semantic_domain_hints(text: str) -> dict[str, float]:
     # Pattern-based boosts (math expressions, code snippets, etc.)
     if re.search(r'\d+\s*[+\-*/^=]\s*\d+', text) or re.search(r'[+\-*/=]\s*\d', text):
         hits["math"] = hits.get("math", 0) + 3
-    if re.search(r'[{}();]', text) or re.search(r'\bdef\b|\bclass\b|\bimport\b|\breturn\b', text):
+    # Code patterns: braces, def/class/import/return keywords, assignment operators
+    # Parentheses alone (e.g. "sin(x)") are NOT code — they appear in math too
+    if re.search(r'[{}]', text) or re.search(r'\bdef\b|\bclass\b|\bimport\b|\breturn\b', text):
         hits["code"] = hits.get("code", 0) + 3
     total_hits = sum(hits.values())
     if total_hits == 0:
@@ -195,12 +202,24 @@ def build_model():
         sd = ckpt.get("model_state_dict", ckpt)
         proj_bias = sd.get("text_encoder.projection.4.bias")
         hidden_dim = proj_bias.shape[0] if proj_bias is not None else 256
+        # Infer clifford_p from checkpoint: learnable_metric shape gives clifford_dim
+        # dim = 2^(p+q+r), with q=1,r=0 → p = log2(dim) - 1
+        _lm = sd.get("core_model.pipeline.algebra.learnable_metric")
+        if _lm is not None:
+            clifford_dim = _lm.shape[0]
+            import math
+            _pq = int(math.log2(clifford_dim))
+            clifford_p = _pq - 1  # q=1, r=0
+        else:
+            clifford_p = 3
         cfg = HDIMConfig(
             hidden_dim=hidden_dim,
             num_experts=4,
             num_domains=4,
             memory_type="titans",
             top_k=2,
+            clifford_p=clifford_p,
+            clifford_q=1,
         )
         model = build_sbert_hdim_model(cfg, soft_router=True, freeze_sbert=True)
         _patch_moe_kernel(
@@ -313,7 +332,15 @@ def format_bar(weights, width=20):
 
 
 def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
-    return F.cosine_similarity(a, b, dim=-1).item()
+    """Cosine similarity with dimension alignment for potentially mismatched tensors."""
+    if a.dim() == 1:
+        a = a.unsqueeze(0)
+    if b.dim() == 1:
+        b = b.unsqueeze(0)
+    min_dim = min(a.shape[-1], b.shape[-1])
+    a_aligned = a[..., :min_dim]
+    b_aligned = b[..., :min_dim]
+    return F.cosine_similarity(a_aligned, b_aligned, dim=-1).item()
 
 
 _EXPERT_RESPONSE_TEMPLATES = {

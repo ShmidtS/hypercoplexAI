@@ -210,12 +210,16 @@ class MaxScoreRouter(MoERouter):
         # Load balancing loss
         router_loss = self._compute_load_balance_loss(scores)
 
-        # Add entropy regularization
-        router_loss = router_loss + self.entropy_weight * (-entropy)
+        # Add entropy regularization (maximize entropy = minimize negative entropy)
+        router_loss = router_loss - self.entropy_weight * entropy
 
         # Add z-loss if enabled
         if self.z_loss_weight > 0:
             router_loss = router_loss + self.z_loss_weight * z_loss
+
+        # BUG-06 FIX: Clamp to non-negative — entropy subtraction can make loss negative,
+        # causing gradient ascent instead of descent
+        router_loss = torch.clamp(router_loss, min=0.0)
 
         # Update EMA train scores during training
         if self.training:

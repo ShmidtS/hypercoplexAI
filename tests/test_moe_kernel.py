@@ -311,7 +311,7 @@ class TestMoEKernelForward:
     def test_state_top_expert_idx(self, kernel):
         x = torch.randn(16, 64)
         _, state = kernel(x)
-        assert state.top_expert_idx.shape == (16,)
+        assert state.top_expert_idx.shape == (16, 2)
         assert state.top_expert_idx.max().item() <= 3
 
     def test_dominant_expert_names(self, kernel):

@@ -194,7 +194,7 @@ class OnlineLearner(nn.Module):
         self.gradient_mode = gradient_mode
         self.gradient_scale = gradient_scale
 
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._init_device = device  # Store for replay buffer default
 
         # Experience replay buffer (on CPU to save VRAM)
         self.replay_buffer = ReplayBuffer(
@@ -219,6 +219,11 @@ class OnlineLearner(nn.Module):
 
         # Online optimizer state (lazy init)
         self._optimizer = None
+
+    @property
+    def device(self) -> torch.device:
+        """Derive device from model buffers (tracks .to() calls)."""
+        return self.ema_weights.device
 
     def _init_ema(self, reference_weight: torch.Tensor) -> None:
         """Initialize EMA weights from reference."""

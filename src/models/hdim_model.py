@@ -109,7 +109,7 @@ class HDIMConfig:
     num_domains: int = 4
     num_experts: Optional[int] = None  # None -> computed from expert_names or default
     dropout: float = 0.1
-    clifford_p: int = 4  # Phase 25: Cl(4,1,0) dim=32 vs old Cl(3,1,0) dim=16
+    clifford_p: int = 3  # Cl(3,1,0) dim=16, matches CliffordInteractionLayer default
     clifford_q: int = 1
     clifford_r: int = 0
     top_k: int = 2
@@ -486,13 +486,16 @@ class HDIMModel(nn.Module):
             online_loss = _loss
 
         # 4) MoE routing per group
-        u_route = torch.empty_like(u_mem)
+        u_route = torch.zeros_like(u_mem)
         router_loss = torch.zeros((), device=device, dtype=dtype)
         z_loss = torch.zeros((), device=device, dtype=dtype)
         routing_entropy = torch.zeros((), device=device, dtype=dtype)
 
         all_slot_outputs: List[torch.Tensor] = []
         for mask in group_masks:
+            # Guard: skip groups with 0 elements to avoid empty MoE input
+            if mask.sum().item() == 0:
+                continue
             group_route, group_router_state = pipeline.moe(u_mem[mask])
             u_route[mask] = group_route.to(dtype=u_route.dtype)
 

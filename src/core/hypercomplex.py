@@ -59,8 +59,11 @@ class CliffordAlgebra(nn.Module):
         Вычисляет знак и индекс результата перестановки базисных элементов.
         Возвращает (sign, result_index) для e_a * e_b.
 
-        Sort-based approach: merge bits, cancel duplicates via metric,
-        then sort into canonical order tracking permutation parity for sign.
+        Merge-based approach: insert b_bits into a_bits one at a time.
+        When a duplicate b_bit is found, count the number of elements
+        after it in result_bits (anticommutation swaps needed to bring it
+        to the duplicate), then square via metric and remove.
+        New bits are appended. Final sort into canonical order with parity.
         """
         a_bits = [i for i in range(self.n) if a_idx & (1 << i)]
         b_bits = [i for i in range(self.n) if b_idx & (1 << i)]
@@ -71,6 +74,9 @@ class CliffordAlgebra(nn.Module):
         # Merge b_bits: duplicates get squared via metric, new bits appended
         for b in b_bits:
             if b in result_bits:
+                pos = result_bits.index(b)
+                num_after = len(result_bits) - pos - 1
+                sign *= (-1.0) ** num_after  # anticommutation swaps
                 sign *= float(self.metric[b].item())
                 result_bits.remove(b)
             else:
@@ -157,8 +163,8 @@ class CliffordAlgebra(nn.Module):
         flat_indices = indices.reshape(D * D)
         result.scatter_add_(-1, flat_indices.expand(*a.shape[:-1], D * D), flat_weighted)
         # nan_to_num prevents NaN propagation; clamp prevents gradient explosion
-        result = torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
-        result = torch.clamp(result, min=-1e3, max=1e3)
+        result = torch.nan_to_num(result, nan=0.0, posinf=1e8, neginf=-1e8)
+        result = torch.clamp(result, min=-1e6, max=1e6)
 
         # Learnable metric scaling (CliffordNet, 2026) — Phase 22
         if self.use_learnable_metric:
@@ -222,8 +228,8 @@ class CliffordAlgebra(nn.Module):
         result.scatter_add_(-1, flat_indices.expand(*b.shape[:-1], D * D), flat_weighted)
 
         # Numerical stability
-        result = torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
-        result = torch.clamp(result, min=-1e3, max=1e3)
+        result = torch.nan_to_num(result, nan=0.0, posinf=1e8, neginf=-1e8)
+        result = torch.clamp(result, min=-1e6, max=1e6)
 
         # Learnable metric scaling
         if self.use_learnable_metric:
@@ -273,20 +279,24 @@ class CliffordAlgebra(nn.Module):
 
     def sandwich(self, R: torch.Tensor, x: torch.Tensor, *, unit: bool = False) -> torch.Tensor:
         """
-        Сэндвич-произведение: R x R^{-1}, где R^{-1} = reverse(R) / ||R||².
+        Сэндвич-произведение: R x R^{-1}.
 
-        unit=False (default): epsilon для численной стабильности.
-          Для обучаемых/ненормализованных роторов, ||R|| может быть ≈0.
+        R^{-1} = ~R / <R * ~R>_0 всегда. Знак квадратичной формы
+        сохраняется для сигнатур Cl(p,q,0) с q>0 (timelike роторы).
 
-        unit=True: epsilon НЕ добавляется (теоремная корректность).
-          Для единичных роторов (||R||≈1): R⁻¹ = ~R, sandwich(R,x) = R⊗x⊗~R.
+        unit=True: epsilon НЕ добавляется. Для единичных роторов
+          <R*~R>_0 = ±1, и R^{-1} = ~R/<R*~R>_0 корректно.
           Удовлетворяет теоремам sandwich_norm_preservation,
           sandwich_identity, sandwich_composition.
+
+        unit=False: epsilon 1e-8 добавляется для численной стабильности.
+          Для обучаемых/ненормализованных роторов, <R*~R>_0 может быть ≈0.
         """
         R_rev = self.reverse(R)
+        R_R_rev = self.geometric_product(R, R_rev)
+        quad_form = R_R_rev[..., 0:1]  # <R * ~R>_0, shape (..., 1)
         eps = 0.0 if unit else 1e-8
-        norm_sq = (self.norm(R) ** 2 + eps).unsqueeze(-1)  # (..., 1)
-        R_inv = R_rev / norm_sq  # broadcast по последнему dim
+        R_inv = R_rev / (quad_form + eps)
         Rx = self.geometric_product(R, x)
         result = self.geometric_product(Rx, R_inv)
         return result

@@ -237,19 +237,30 @@ class HallucinationDetector(nn.Module):
         )
 
     def from_router_state(
-        self, router_state: dict, routing_repr: Optional[torch.Tensor] = None, **memory_kwargs
+        self, router_state: dict, routing_repr: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None, **memory_kwargs
     ) -> HallucinationDetectionResult:
         """Extract signals from MoE router_state dict and compute risk.
 
         Args:
             router_state: Dict from SoftMoERouter.forward() or MoEKernel forward state
             routing_repr: Optional routing representations for eigen_score computation
+            device: Target device for fallback tensors. If None, derived from router_state.
             **memory_kwargs: memory_mismatch, memory_loss, hidden_states from TitansMemory
 
         Returns:
             HallucinationDetectionResult
         """
-        routing_entropy = router_state.get("routing_entropy", torch.tensor(0.0, dtype=torch.float32))
+        # BUG-12 FIX: derive device from router_state or use explicit device param
+        _ref = router_state.get("gate_weights", router_state.get("scores", None))
+        _device = device if device is not None else (
+            _ref.device if _ref is not None else torch.device('cpu')
+        )
+        _dtype = _ref.dtype if _ref is not None else torch.float32
+
+        routing_entropy = router_state.get("routing_entropy", None)
+        if routing_entropy is None:
+            routing_entropy = torch.tensor(0.0, device=_device, dtype=_dtype)
         gate_weights = router_state.get("gate_weights", router_state.get("scores", None))
         topk_gate = router_state.get("topk_gate_weights", None)
 

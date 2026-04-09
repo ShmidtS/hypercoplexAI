@@ -347,6 +347,12 @@ class HallucinationFeedbackLoop(nn.Module):
         self.expert_names = expert_names
         self.enabled = enabled
 
+        # Per-expert hallucination rates as buffer (survives serialization)
+        self.register_buffer(
+            "expert_hallucination_rates",
+            torch.zeros(len(expert_names)),
+        )
+
         # Sub-components
         self.threshold_checker = RiskThresholdChecker(thresholds)
         self.routing_strategy = ReRoutingStrategy(expert_names)
@@ -493,6 +499,11 @@ class HallucinationFeedbackLoop(nn.Module):
             hallucination_occurred: Whether hallucination was detected.
         """
         self.routing_strategy.update_expert_history(expert, hallucination_occurred)
+        # Also update the buffer for serialization
+        if expert in self.expert_names:
+            idx = self.expert_names.index(expert)
+            current = self.expert_hallucination_rates[idx].item()
+            self.expert_hallucination_rates[idx] = 0.9 * current + 0.1 * float(hallucination_occurred)
 
     def step(self) -> None:
         """Increment internal step counter."""
