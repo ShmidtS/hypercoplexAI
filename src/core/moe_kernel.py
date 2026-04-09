@@ -535,12 +535,25 @@ class MoEKernel(nn.Module):
         D = self.input_dim
         H = self.config.expert_hidden_dim
 
+        # Find first and last Linear layers by type (not fragile index)
+        def _first_linear(seq: nn.Sequential) -> nn.Linear:
+            for m in seq:
+                if isinstance(m, nn.Linear):
+                    return m
+            raise RuntimeError("No Linear layer found in expert Sequential")
+
+        def _last_linear(seq: nn.Sequential) -> nn.Linear:
+            for m in reversed(seq):
+                if isinstance(m, nn.Linear):
+                    return m
+            raise RuntimeError("No Linear layer found in expert Sequential")
+
         # Stack weights: (E, S, D) -> process each expert's slots
         # W1: (E, H, D), W2: (E, D, H)
-        W1_stack = torch.stack([expert.net[0].weight for expert in self.experts], dim=0)  # (E, H, D)
-        W2_stack = torch.stack([expert.net[3].weight for expert in self.experts], dim=0)  # (E, D, H)
-        b1_stack = torch.stack([expert.net[0].bias for expert in self.experts], dim=0)    # (E, H)
-        b2_stack = torch.stack([expert.net[3].bias for expert in self.experts], dim=0)    # (E, D)
+        W1_stack = torch.stack([_first_linear(expert.net).weight for expert in self.experts], dim=0)  # (E, H, D)
+        W2_stack = torch.stack([_last_linear(expert.net).weight for expert in self.experts], dim=0)  # (E, D, H)
+        b1_stack = torch.stack([_first_linear(expert.net).bias for expert in self.experts], dim=0)    # (E, H)
+        b2_stack = torch.stack([_last_linear(expert.net).bias for expert in self.experts], dim=0)    # (E, D)
 
         # Reshape slot_inputs to (E, S, D)
         x = slot_inputs.view(E, S, D)  # (E, S, D)

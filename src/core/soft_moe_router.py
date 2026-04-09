@@ -104,7 +104,7 @@ class SoftMoERouter(MoERouter):
         # Phase 26: Auxiliary-Loss-Free Balancing (DeepSeek-V3)
         # Per-expert bias terms that dynamically adjust routing
         self.use_aux_loss_free = False
-        self._expert_bias = nn.Parameter(torch.zeros(num_experts))
+        self.register_buffer("_expert_bias", torch.zeros(num_experts))
         self._aux_lr = 0.001  # bias adjustment rate
         self._bias_step = 0
         self._bias_update_frequency = 0
@@ -141,8 +141,9 @@ class SoftMoERouter(MoERouter):
 
         T = x.shape[0]
         # C1 FIX: guard for T=1 — dim=0 softmax with single row returns all-ones
+        # For T=1, dispatch should be uniform over slots: each slot gets equal weight
         if T == 1:
-            dispatch = F.softmax(logits, dim=-1)  # (1, num_slots) softmax over slots
+            dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype) / self.num_slots
         else:
             # dispatch: нормализация по токенам (каждый слот получает mix токенов)
             dispatch = F.softmax(logits, dim=0)   # (T, num_slots)
@@ -336,7 +337,7 @@ class SoftMoERouter(MoERouter):
 
         # Sign-based update: overloaded -> negative delta (decrease bias)
         delta = torch.sign(expert_load - self._target_load)
-        self._expert_bias.data.add_(delta, alpha=-self._aux_lr)
+        self._expert_bias.add_(delta, alpha=-self._aux_lr)
 
     def enable_aux_loss_free(self, aux_lr: float = 0.001, bias_update_frequency: int = 100) -> None:
         """Enable Auxiliary-Loss-Free balancing (DeepSeek-V3).

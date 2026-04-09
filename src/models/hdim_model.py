@@ -504,12 +504,19 @@ class HDIMModel(nn.Module):
                 "z_loss", torch.zeros((), device=device, dtype=dtype)
             ).to(dtype=dtype)
             routing_entropy = routing_entropy + group_router_state["routing_entropy"].to(dtype=dtype)
-            train_scores_snapshot.copy_(group_router_state["train_scores_snapshot"].to(dtype=dtype))
-            expert_usage.copy_(group_router_state["expert_usage"].to(dtype=dtype))
+            train_scores_snapshot = train_scores_snapshot + group_router_state["train_scores_snapshot"].to(dtype=dtype)
+            expert_usage = expert_usage + group_router_state["expert_usage"].to(dtype=dtype)
 
             # Collect slot_outputs from MoEKernel if present
             if "slot_outputs" in group_router_state and group_router_state["slot_outputs"] is not None:
                 all_slot_outputs.append(group_router_state["slot_outputs"])
+
+        # Normalize per-group accumulations by number of groups
+        num_groups = len(group_masks)
+        if num_groups > 1:
+            routing_entropy = routing_entropy / num_groups
+            train_scores_snapshot = train_scores_snapshot / num_groups
+            expert_usage = expert_usage / num_groups
 
         # 5) Transfer
         step2 = pipeline.algebra.geometric_product(R_transfer, u_route)
@@ -590,8 +597,7 @@ class HDIMModel(nn.Module):
         update_memory: bool = True,
         memory_mode: str = "update",
     ) -> (
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
-        | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], HDIMAuxState]
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[HDIMAuxState]]
     ):
         """Run the HDIM forward pass for same-domain reconstruction batches."""
         x = self.dropout(x)
@@ -636,12 +642,12 @@ class HDIMModel(nn.Module):
                 z_loss=z_loss,
                 memory_updated=memory_updated,
                 runtime=runtime,
-            hallucination_risk=_hallucination_risk,
-            memory_surprise=_memory_surprise,
-            feedback_action=_feedback_action,
+                hallucination_risk=_hallucination_risk,
+                memory_surprise=_memory_surprise,
+                feedback_action=_feedback_action,
             )
             return output, routing_weights, invariant, _slot_outputs, aux_state
-        return output, routing_weights, invariant, _slot_outputs
+        return output, routing_weights, invariant, _slot_outputs, None
 
     def transfer(
         self,

@@ -119,27 +119,32 @@ class HallucinationDetector(nn.Module):
         space indicates uncertainty. Low singular value sum = high variance =
         potential hallucination.
 
+        Processes each sample independently (batch dimension preserved).
+
         Args:
             routing_repr: (batch, clifford_dim) — routing representations
             top_k: Number of singular values to consider
 
         Returns:
-            eigen_score: (batch,) — inverse singular value sum
+            eigen_score: (batch,) — per-sample inverse singular value sum
         """
         if routing_repr.dim() == 1:
             routing_repr = routing_repr.unsqueeze(0)
 
-        # Center representations
-        centered = routing_repr - routing_repr.mean(dim=0, keepdim=True)
+        batch_size = routing_repr.shape[0]
 
-        # Compute singular values
-        _, S, _ = torch.linalg.svd(centered, full_matrices=False)
+        # Per-sample eigen score computation
+        scores = []
+        for i in range(batch_size):
+            sample = routing_repr[i : i + 1]  # (1, clifford_dim)
+            # Center single sample (degenerate: centering a single vector gives 0,
+            # so use the vector itself as the representation)
+            _, S, _ = torch.linalg.svd(sample, full_matrices=False)
+            k = min(top_k, S.shape[0])
+            eigen_score_i = 1.0 / (S[:k].sum() + 1e-8)
+            scores.append(eigen_score_i)
 
-        # EigenScore: inverse of normalized singular value sum
-        # Higher score = more variance = more uncertainty = potential hallucination
-        eigen_score = 1.0 / (S[:top_k].sum() + 1e-8)
-
-        return eigen_score.expand(routing_repr.shape[0])
+        return torch.stack(scores)  # (batch,)
 
     def compute_hallucination_risk(
         self,
@@ -196,8 +201,8 @@ class HallucinationDetector(nn.Module):
         else:
             eigen_score = torch.zeros_like(routing_entropy)
 
-        # Normalize eigen_score to [0, 1] via sigmoid (centered at 5.0)
-        norm_eigen = torch.sigmoid(eigen_score - 5.0)
+        # Normalize eigen_score to [0, 1] via sigmoid (centered at 1.0 — expected mean)
+        norm_eigen = torch.sigmoid(eigen_score - 1.0)
 
         # Combined risk via 5-signal weighted sum
         risk = (

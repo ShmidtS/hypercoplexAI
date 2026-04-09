@@ -58,38 +58,43 @@ class CliffordAlgebra(nn.Module):
         """
         Вычисляет знак и индекс результата перестановки базисных элементов.
         Возвращает (sign, result_index) для e_a * e_b.
+
+        Sort-based approach: merge bits, cancel duplicates via metric,
+        then sort into canonical order tracking permutation parity for sign.
         """
-        a_bits = []
-        b_bits = []
-        for i in range(self.n):
-            if a_idx & (1 << i):
-                a_bits.append(i)
-            if b_idx & (1 << i):
-                b_bits.append(i)
+        a_bits = [i for i in range(self.n) if a_idx & (1 << i)]
+        b_bits = [i for i in range(self.n) if b_idx & (1 << i)]
 
         sign = 1.0
         result_bits = list(a_bits)
 
+        # Merge b_bits: duplicates get squared via metric, new bits appended
         for b in b_bits:
-            # Переставляем b через result_bits
-            pos = len(result_bits)
-            swaps = 0
-            for i in range(len(result_bits) - 1, -1, -1):
-                if result_bits[i] < b:
-                    break
-                if result_bits[i] == b:
-                    sign *= float(self.metric[b].item())
-                    sign *= (-1.0) ** swaps
-                    result_bits.pop(i)
-                    pos = -1
-                    break
-                swaps += 1
-            if pos != -1:
-                sign *= (-1.0) ** swaps
-                result_bits.insert(pos - swaps, b)
+            if b in result_bits:
+                sign *= float(self.metric[b].item())
+                result_bits.remove(b)
+            else:
+                result_bits.append(b)
 
-        result_idx = sum(1 << b for b in result_bits)
+        # Sort result_bits into canonical order, tracking permutation parity
+        sorted_bits, parity = self._sort_with_parity(result_bits)
+        sign *= (-1.0) ** parity
+
+        result_idx = sum(1 << bit for bit in sorted_bits)
         return sign, result_idx
+
+    @staticmethod
+    def _sort_with_parity(arr):
+        """Bubble sort returning (sorted_list, parity) where parity is 0 (even) or 1 (odd)."""
+        arr = list(arr)
+        parity = 0
+        n = len(arr)
+        for i in range(n):
+            for j in range(0, n - i - 1):
+                if arr[j] > arr[j + 1]:
+                    arr[j], arr[j + 1] = arr[j + 1], arr[j]
+                    parity ^= 1
+        return arr, parity
 
     def _build_cayley_table(self):
         """
@@ -257,11 +262,14 @@ class CliffordAlgebra(nn.Module):
         """
         Норма мультивектора: ||x||_Cl = sqrt(<x * x̃>_0)
         Скалярная часть произведения x и его реверса.
+        Возвращает magnitude (всегда >= 0); знак scalar_part сохраняет
+        метрическую сигнатуру (spacelike > 0, timelike < 0).
         """
         x_rev = self.reverse(x)
         product = self.geometric_product(x, x_rev)
         scalar_part = product[..., 0]  # Grade-0 компонент
-        return torch.sqrt(torch.clamp(scalar_part.abs(), min=1e-8))
+        magnitude = torch.sqrt(torch.clamp(scalar_part.abs(), min=1e-8))
+        return magnitude
 
     def sandwich(self, R: torch.Tensor, x: torch.Tensor, *, unit: bool = False) -> torch.Tensor:
         """

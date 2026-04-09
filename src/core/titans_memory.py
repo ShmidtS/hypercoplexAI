@@ -63,10 +63,14 @@ class TitansMemoryModule(nn.Module):
         # Momentum state S (не параметр, а буфер)
         self.register_buffer('momentum_S', torch.zeros(val_dim, key_dim))
 
-        # Гейты α (forget), η (momentum), θ (lr) — проекции из входа
-        self.gate_proj = nn.Linear(key_dim + val_dim, 3, bias=True) # 3 скаляра
-        nn.init.zeros_(self.gate_proj.weight)
-        nn.init.constant_(self.gate_proj.bias, 0.5) # начальные значения ~0.5
+        # Гейты α (forget), η (momentum), θ (lr) — two-layer projection
+        self.gate_proj = nn.Sequential(
+            nn.Linear(key_dim + val_dim, hidden_dim, bias=True),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3, bias=True),
+        )
+        nn.init.zeros_(self.gate_proj[2].weight)
+        nn.init.constant_(self.gate_proj[2].bias, 0.5)  # начальные значения ~0.5
 
         # Phase 22: gradient-based surprise + adaptive forgetting
         self.use_gradient_surprise: bool = False
@@ -159,10 +163,12 @@ class TitansMemoryModule(nn.Module):
         # Create fp32 leaf copy of memory weights (detached from main param)
         # TTT inner loop: detach creates a separate leaf tensor for local gradient updates. Gradient still flows through retrieve() path.
         mem_w = self.memory.weight.detach().float().requires_grad_(True)
-        k_agg = k32.mean(0) if k32.dim() > 1 else k32
-        v_agg = v32.mean(0) if v32.dim() > 1 else v32
+        # Weighted aggregation: use sum instead of mean to preserve per-token magnitude.
+        # mean() loses per-token information; sum() preserves total signal strength.
+        k_agg = k32.sum(0) if k32.dim() > 1 else k32
+        v_agg = v32.sum(0) if v32.dim() > 1 else v32
         kv_agg = torch.cat([k_agg, v_agg], dim=-1)
-        gates = torch.sigmoid(self.gate_proj(kv_agg.to(self.gate_proj.weight.dtype)))
+        gates = torch.sigmoid(self.gate_proj(kv_agg.to(self.gate_proj[0].weight.dtype)))
         alpha = gates[..., 0].float()
         eta   = gates[..., 1].float()
         theta = gates[..., 2].float()
@@ -264,4 +270,17 @@ class TitansMemoryModule(nn.Module):
                 norm = self.momentum_S.norm()
                 if norm > self._MEMORY_MAX_NORM:
                     self.momentum_S.mul_(self._MEMORY_MAX_NORM / (norm + 1e-8))
+
+    def stats(self) -> dict:
+        """Return memory statistics for monitoring.
+
+        Returns:
+            Dict with: memory_size, momentum_value, is_frozen, last_loss
+        """
+        return {
+            "memory_size": self.memory.weight.shape,
+            "momentum_value": self.momentum_S.norm().item(),
+            "is_frozen": self._frozen,
+            "last_loss": self.memory(self.memory.weight.new_zeros(1, self.key_dim)).detach().norm().item(),
+        }
 

@@ -45,7 +45,7 @@ def test_model_forward(model, cfg):
     bsz = 4
     x = torch.randn(bsz, cfg.hidden_dim)
     domain_id = torch.zeros(bsz, dtype=torch.long)
-    out, routing, inv, slot_outputs = model(x, domain_id)
+    out, routing, inv, slot_outputs, _ = model(x, domain_id)
     assert out.shape == (bsz, cfg.hidden_dim)
     assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
@@ -834,7 +834,7 @@ def test_round_trip_transfer_same_domain(model, cfg):
     x = torch.randn(4, cfg.hidden_dim)
     domain_id = torch.zeros(4, dtype=torch.long)
     with torch.no_grad():
-        out, _, _, _ = model(x, domain_id, update_memory=False, memory_mode="retrieve")
+        out, _, _, _, _ = model(x, domain_id, update_memory=False, memory_mode="retrieve")
     assert out.shape == x.shape
 
 

@@ -123,6 +123,7 @@ class MaxScoreRouter(MoERouter):
         temperature: float = 10.0,
         entropy_weight: float = 0.01,
         z_loss_weight: float = 0.0,
+        route_only: bool = True,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -131,6 +132,7 @@ class MaxScoreRouter(MoERouter):
         self.temperature = temperature
         self.entropy_weight = entropy_weight
         self.z_loss_weight = z_loss_weight
+        self.route_only = route_only
 
         # num_slots for MoERouter interface compatibility
         self.num_slots = num_experts
@@ -185,19 +187,25 @@ class MaxScoreRouter(MoERouter):
             lse = torch.logsumexp(gate_logits, dim=-1)
             z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
 
-        # Softmax to get routing probabilities
-        scores = F.softmax(gate_logits, dim=-1)  # (T, E)
+        # Temperature-scaled softmax on raw logits (single softmax, not double)
+        scores = F.softmax(gate_logits / self.temperature, dim=-1)  # (T, E)
 
-        # SoftTopk: differentiable top-k selection
-        topk_weights, topk_indices = self._soft_topk(scores)  # (T, k), (T, k)
+        # SoftTopk: differentiable top-k selection from raw logits
+        topk_weights, topk_indices = self._soft_topk(gate_logits)  # (T, k), (T, k)
 
         # Compute routing entropy for monitoring
         entropy = self._compute_entropy(scores)
 
-        # NOTE: MaxScoreRouter is a pure router -- it computes optimal dispatch
-        # weights but does NOT apply experts. Use with an external expert executor.
-        # For the standard pipeline, use SoftMoERouter or MoEKernel instead.
-        output = x_flat
+        # NOTE: MaxScoreRouter is a pure router when route_only=True -- it computes
+        # optimal dispatch weights but does NOT apply experts. Use with an external
+        # expert executor. For the standard pipeline, use SoftMoERouter or MoEKernel.
+        # When route_only=False, output is routing weights for external combination.
+        if self.route_only:
+            output = x_flat
+            output_shape = orig_shape
+        else:
+            output = scores
+            output_shape = orig_shape[:-1] + (self.num_experts,)
 
         # Load balancing loss
         router_loss = self._compute_load_balance_loss(scores)
@@ -235,38 +243,36 @@ class MaxScoreRouter(MoERouter):
             "routing_entropy": entropy,
         }
 
-        return output.reshape(orig_shape), info
+        return output.reshape(output_shape), info
 
     def _soft_topk(
-        self, scores: torch.Tensor, dim: int = -1
+        self, logits: torch.Tensor, dim: int = -1
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Differentiable soft top-k selection.
 
         Implements SoftTopk operator from Wang et al.:
-        1. Hard top-k: select top-k scores
-        2. Softmax over top-k with temperature scaling
+        1. Hard top-k: select top-k logits
+        2. Temperature-scaled softmax over top-k for differentiability
         3. Renormalize weights to sum to 1
 
         This is differentiable through the softmax step,
         while maintaining sparse selection via hard top-k.
 
         Args:
-            scores: (T, E) routing scores (softmax probabilities)
+            logits: (T, E) raw gate logits (NOT softmax probabilities)
             dim: Dimension to select from (default: -1)
 
         Returns:
             topk_soft: (T, k) differentiable top-k weights
             topk_idx: (T, k) indices of selected experts
         """
-        # Hard top-k selection
-        topk_vals, topk_idx = scores.topk(self.top_k, dim=dim)
+        # Hard top-k selection on raw logits
+        topk_vals, topk_idx = logits.topk(self.top_k, dim=dim)
 
-        # Softmax over top-k for differentiability
-        # Temperature controls sharpness: higher T = softer (more uniform) selection
-        # Division by T makes softmax gentler: exp(x/T) vs exp(x)
+        # Single temperature-scaled softmax over top-k for differentiability
         topk_soft = F.softmax(topk_vals / self.temperature, dim=dim)
 
-        # Renormalize to sum to 1 (already softmax, but for safety)
+        # Renormalize to sum to 1 (softmax already normalizes, but for safety)
         topk_soft = topk_soft / (topk_soft.sum(dim=dim, keepdim=True) + 1e-8)
 
         return topk_soft, topk_idx

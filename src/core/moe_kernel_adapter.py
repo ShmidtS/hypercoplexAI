@@ -91,7 +91,7 @@ class MoEKernelAdapter(MoERouter):
             "gate_weights": state.expert_weights,
             "topk_idx": state.top_expert_idx,
             "topk_gate_weights": state.dispatch_weights,
-            "train_scores_snapshot": state.expert_usage,
+            "train_scores_snapshot": self.kernel.train_scores.detach().clone(),
         })
 
         return output, info

@@ -46,7 +46,7 @@ class TestTitansInit:
 
         # Проверка размерностей весов
         assert memory_module.memory.weight.shape == (64, 32)
-        assert memory_module.gate_proj.weight.shape == (3, 96)  # 3 gates, key_dim + val_dim
+        assert memory_module.gate_proj[2].weight.shape == (3, 64)  # 3 gates, hidden_dim
 
         # Проверка начальных значений
         assert torch.all(memory_module.momentum_S == 0)

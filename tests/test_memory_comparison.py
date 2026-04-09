@@ -54,7 +54,7 @@ def _train_one_epoch(
     for X, D in loader:
         X, D = X.to(device), D.to(device)
         optimizer.zero_grad()
-        out, routing_weights, invariant, _ = model(X, D)
+        out, routing_weights, invariant, _, _ = model(X, D)
         # Reconstruction loss
         loss_recon = nn.functional.mse_loss(out, X)
         # Routing entropy loss (encourage diverse routing)
@@ -83,7 +83,7 @@ def _eval_model(
     with torch.no_grad():
         for X, D in loader:
             X, D = X.to(device), D.to(device)
-            out, routing_weights, invariant, _ = model(X, D)
+            out, routing_weights, invariant, _, _ = model(X, D)
             loss = nn.functional.mse_loss(out, X)
             eps = 1e-8
             rw_norm = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + eps)
@@ -204,7 +204,7 @@ class TestMemoryComparison:
         m = HDIMModel(cfg)
         x = torch.randn(8, 64)
         d = torch.randint(0, 4, (8,))
-        out, rw, inv, _ = m(x, d)
+        out, rw, inv, _, _ = m(x, d)
         assert out.shape == (8, 64)
         assert rw.shape == (8, 4)  # num_experts=4
         assert inv.shape == (8, 64)
@@ -215,7 +215,7 @@ class TestMemoryComparison:
         m = HDIMModel(cfg)
         x = torch.randn(8, 64)
         d = torch.randint(0, 4, (8,))
-        out, rw, inv, _ = m(x, d)
+        out, rw, inv, _, _ = m(x, d)
         assert out.shape == (8, 64)
         assert rw.shape == (8, 4)
         assert inv.shape == (8, 64)

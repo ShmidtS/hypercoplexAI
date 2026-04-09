@@ -809,45 +809,8 @@ class HDIMTrainer:
                         pair_relation_label, pair_weight,
                         temperature=temp,
                     )
-            # AnglE loss поверх InfoNCE (если включён)
-            total_loss = infonce
-            if getattr(self, 'lambda_angle', 0.0) > 0:
-                angle = self._compute_angle_loss(
-                    exported_invariant,
-                    pair_exported_target,
-                    pair_relation_label,
-                    pair_weight,
-                )
-                total_loss = total_loss + self.lambda_angle * angle
-            # SupCon loss (Supervised Contrastive, если group_id доступен)
-            if getattr(self, 'lambda_supcon', 0.0) > 0 and pair_group_id is not None:
-                supcon = self._compute_supcon_loss(
-                    exported_invariant,
-                    pair_exported_target,
-                    pair_relation_label,
-                    pair_weight,
-                    pair_group_id,
-                )
-                total_loss = total_loss + self.lambda_supcon * supcon
-            # DCL loss (Decoupled Contrastive, Yeh et al. 2022)
-            if getattr(self, 'lambda_dcl', 0.0) > 0:
-                dcl = self._compute_dcl_loss(
-                    exported_invariant,
-                    pair_exported_target,
-                    pair_relation_label,
-                    pair_weight,
-                    temperature=temp,
-                )
-                total_loss = total_loss + self.lambda_dcl * dcl
-            # Uniformity + Alignment loss (Wang & Isola, ICML 2020)
-            if getattr(self, 'lambda_uniformity', 0.0) > 0:
-                uni_align = self._compute_uniformity_alignment_loss(
-                    exported_invariant,
-                    pair_exported_target,
-                    pair_relation_label,
-                )
-                total_loss = total_loss + self.lambda_uniformity * uni_align
-            return total_loss
+            # AnglE loss поверх InfoNCE (если включён) — added directly to loss_total in _compute_batch_losses
+            return infonce
 
         # Legacy ranking margin fallback
         if pair_group_id is None:
@@ -964,7 +927,7 @@ class HDIMTrainer:
         self,
         aux_state: HDIMAuxState,
         batch: Dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         pair_target_state = self._extract_pair_target_state(batch)
         if pair_target_state is None:
             iso_target = self._extract_iso_targets(batch, aux_state)
@@ -976,7 +939,7 @@ class HDIMTrainer:
             pair_exported_target,
             batch,
         )
-        return iso_target, loss_pair
+        return iso_target, loss_pair, pair_exported_target
     def _compute_router_diagnostics(
         self, aux_state: HDIMAuxState
     ) -> Dict[str, torch.Tensor]:
@@ -1093,7 +1056,7 @@ class HDIMTrainer:
                 )
                 recon_target = encoding
         training_invariant = self._training_invariant(aux_state)
-        iso_target, loss_pair = self._compute_pair_loss_terms(aux_state, batch)
+        iso_target, loss_pair, pair_exported_target = self._compute_pair_loss_terms(aux_state, batch)
         loss_recon = self._compute_reconstruction_loss(output, recon_target)
         loss_iso = self._compute_pair_iso_loss(training_invariant, iso_target, batch)
         loss_routing = aux_state.router_loss
@@ -1148,6 +1111,37 @@ class HDIMTrainer:
             + self.lambda_matryoshka * loss_matryoshka
             + self.lambda_expert_ortho * loss_expert_ortho
         )
+
+        # Pairwise auxiliary losses (added directly with their own lambdas)
+        pair_group_id = self._resolve_pair_group_id(batch)
+        if pair_relation_label is not None and pair_weight is not None and pair_exported_target is not None:
+            _prl_typed = pair_relation_label.to(self.device, dtype=training_invariant.dtype)
+            _pw_typed = pair_weight.to(self.device, dtype=training_invariant.dtype)
+            if self.lambda_angle > 0:
+                loss_angle = self._compute_angle_loss(
+                    aux_state.exported_invariant, pair_exported_target,
+                    _prl_typed, _pw_typed,
+                )
+                loss_total = loss_total + self.lambda_angle * loss_angle
+            if self.lambda_supcon > 0 and pair_group_id is not None:
+                loss_supcon = self._compute_supcon_loss(
+                    aux_state.exported_invariant, pair_exported_target,
+                    _prl_typed, _pw_typed, pair_group_id,
+                )
+                loss_total = loss_total + self.lambda_supcon * loss_supcon
+            if self.lambda_dcl > 0:
+                loss_dcl = self._compute_dcl_loss(
+                    aux_state.exported_invariant, pair_exported_target,
+                    _prl_typed, _pw_typed,
+                    temperature=self._effective_temperature(),
+                )
+                loss_total = loss_total + self.lambda_dcl * loss_dcl
+            if self.lambda_uniformity > 0:
+                loss_uniformity = self._compute_uniformity_alignment_loss(
+                    aux_state.exported_invariant, pair_exported_target,
+                    _prl_typed,
+                )
+                loss_total = loss_total + self.lambda_uniformity * loss_uniformity
         batch_losses = {
             "loss_total": loss_total,
             "loss_recon": loss_recon,
@@ -1210,7 +1204,8 @@ class HDIMTrainer:
             if torch.isnan(loss_total) or torch.isinf(loss_total):
                 # Force scale reduction for stability
                 new_scale = max(scaler.get_scale() * 0.5, 1.0)
-                scaler.update(new_scale)
+                scaler.set_scale(new_scale)
+                scaler.update()
                 self._last_grad_norm = float('inf')
                 self._step += 1
                 return loss_total.detach()
@@ -1228,18 +1223,23 @@ class HDIMTrainer:
             if has_nan_grad:
                 # NaN grads found — skip step and reduce scale to prevent
                 # permanent scaler corruption from non-finite gradients.
-                scaler.update(max(scaler.get_scale() * 0.5, 1.0))
+                new_scale = max(scaler.get_scale() * 0.5, 1.0)
+                scaler.set_scale(new_scale)
+                scaler.update()
             else:
                 scaler.step(self.optimizer)
                 scaler.update()
         else:
             loss_total.backward()
+            has_nan_grad = False
             for p in self.model.parameters():
                 if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
                     p.grad.zero_()
+                    has_nan_grad = True
             grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
-            self.optimizer.step()
+            if not has_nan_grad:
+                self.optimizer.step()
         self._step += 1
         self._last_loss_components = {
             k: v.item() if isinstance(v, torch.Tensor) and v.dim() == 0 else v

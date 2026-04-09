@@ -35,11 +35,13 @@ class CliffordInteractionExpert(nn.Module):
         self,
         input_dim: int,
         shifts: List[int] = [1, 2, 4],
-        use_gate: bool = True
+        use_gate: bool = True,
+        algebra: Optional[CliffordAlgebra] = None,
     ):
         super().__init__()
         self.shifts = shifts
         self.use_gate = use_gate
+        self.algebra = algebra or CliffordAlgebra(p=3, q=1, r=0)
 
         if use_gate:
             # Learnable gate for combining scalar/bivector
@@ -97,16 +99,52 @@ class CliffordInteractionExpert(nn.Module):
         """Scalar part: <a*b>_0
 
         This is the grade-0 extraction of the geometric product.
+        Uses CliffordAlgebra.geometric_product to compute the correct
+        Clifford inner product (not Euclidean dot product).
+
+        Handles arbitrary input_dim by processing in chunks of algebra.dim.
         """
-        return (a * b).sum(dim=-1)
+        D = a.shape[-1]
+        alg_dim = self.algebra.dim
+        if D == alg_dim:
+            product = self.algebra.geometric_product(a, b)
+            return product[..., 0]
+        # Process in chunks of algebra.dim along last dimension
+        n_chunks = D // alg_dim
+        if n_chunks == 0:
+            # Fallback: input smaller than algebra dim, use element-wise
+            return (a * b).sum(dim=-1)
+        a_chunks = a[..., :n_chunks * alg_dim].reshape(*a.shape[:-1], n_chunks, alg_dim)
+        b_chunks = b[..., :n_chunks * alg_dim].reshape(*b.shape[:-1], n_chunks, alg_dim)
+        product = self.algebra.geometric_product(a_chunks, b_chunks)
+        scalar_per_chunk = product[..., 0]  # (..., n_chunks)
+        return scalar_per_chunk.sum(dim=-1)
 
     def _wedge_product(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """Bivector part: a∧b = (a*b - b*a) / 2
 
-        This preserves multivector structure unlike element-wise GELU.
+        Uses CliffordAlgebra.geometric_product for the correct
+        anticommutative part of the geometric product.
+
+        Handles arbitrary input_dim by processing in chunks of algebra.dim.
         """
-        # Anticommutative part of geometric product
-        return (a * b - b * a) / 2
+        D = a.shape[-1]
+        alg_dim = self.algebra.dim
+        if D == alg_dim:
+            ab = self.algebra.geometric_product(a, b)
+            ba = self.algebra.geometric_product(b, a)
+            return (ab - ba) / 2
+        # Process in chunks of algebra.dim along last dimension
+        n_chunks = D // alg_dim
+        if n_chunks == 0:
+            # Fallback: element-wise anticommutative part (will be 0 for commutative)
+            return (a * b - b * a) / 2
+        a_chunks = a[..., :n_chunks * alg_dim].reshape(*a.shape[:-1], n_chunks, alg_dim)
+        b_chunks = b[..., :n_chunks * alg_dim].reshape(*b.shape[:-1], n_chunks, alg_dim)
+        ab = self.algebra.geometric_product(a_chunks, b_chunks)
+        ba = self.algebra.geometric_product(b_chunks, a_chunks)
+        wedge_per_chunk = (ab - ba) / 2
+        return wedge_per_chunk.reshape(*a.shape[:-1], n_chunks * alg_dim)
 
 
 class CliffordFFN(nn.Module):

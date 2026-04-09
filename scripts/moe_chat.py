@@ -163,7 +163,7 @@ def build_model():
             f"[init] Checkpoint loaded from {checkpoint_path}: epoch={epoch}{score_str} ({len(result.missing_keys)} missing keys)"
         )
     else:
-        cfg = HDIMConfig(hidden_dim=64, num_experts=4, num_domains=4, top_k=2)
+        cfg = HDIMConfig(hidden_dim=256, num_experts=4, num_domains=4, top_k=2)
         model = build_sbert_hdim_model(cfg, soft_router=False, freeze_sbert=True)
         _patch_moe_kernel(
             model.core_model,
@@ -207,15 +207,22 @@ def encode_text(model, text: str):
         dom = torch.zeros(1, dtype=torch.long, device=DEVICE)
         out, _, _, _, aux_state = model(enc, dom, return_state=True, memory_mode="retrieve")
         expert_weights = aux_state.expert_usage.cpu()
-        top_idx = expert_weights.argmax().item()
+        # Normalize routing scores to probabilities for display/dominant detection
+        weights_sum = expert_weights.sum().clamp(min=1e-8)
+        expert_probs = expert_weights / weights_sum
+        top_idx = expert_probs.argmax().item()
         exported_inv = aux_state.exported_invariant
-        return exported_inv, expert_weights, DOMAIN_NAMES[top_idx], out, aux_state
+        return exported_inv, expert_probs, DOMAIN_NAMES[top_idx], out, aux_state
 
 
 def format_bar(weights, width=20):
     bars = []
+    w_max = max(weights.tolist()) if weights.numel() > 0 else 1.0
+    w_max = max(w_max, 1e-8)
     for name, w in zip(DOMAIN_NAMES, weights.tolist()):
-        filled = int(w * width)
+        normed = w / w_max
+        filled = int(normed * width)
+        filled = max(0, min(filled, width))
         bar = "#" * filled + "-" * (width - filled)
         bars.append(f" {name:8s} [{bar}] {w:.3f}")
     return "\n".join(bars)
@@ -276,12 +283,10 @@ def main():
                 memory = getattr(model.core_model.pipeline, "memory", None)
             if memory is None:
                 print("[memory] No memory module found")
-            elif hasattr(memory, "stats"):
+            else:
                 stats = memory.stats()
                 for k, v in stats.items():
                     print(f"  {k}: {v}")
-            else:
-                print(f"[memory] {type(memory).__name__} (no stats method)")
             continue
 
         if user_input.startswith(":transfer "):
@@ -350,6 +355,25 @@ def main():
         llm_reply = query_llm(user_input, expert_info)
         if llm_reply is not None:
             print(f"\nLLM ({LLM_BACKEND}): {llm_reply}")
+        else:
+            # Built-in expert response when no LLM backend configured
+            expert_descriptions = {
+                "math": "Mathematical reasoning, equations, proofs, numerical analysis",
+                "language": "Linguistic analysis, semantics, grammar, text comprehension",
+                "code": "Programming, algorithms, software architecture, debugging",
+                "science": "Scientific method, physics, chemistry, biology, experiments",
+            }
+            conf = expert_weights.max().item()
+            print(f"\nExpert [{dominant.upper()}] (confidence: {conf:.1%}):")
+            print(f"  Domain: {expert_descriptions.get(dominant, 'general')}")
+            print(f"  Routed via Clifford invariant (norm={invariant.norm().item():.4f})")
+            if conf > 0.5:
+                print(f"  High confidence routing to {dominant} expert.")
+            elif conf > 0.3:
+                print(f"  Moderate confidence — input spans multiple domains.")
+            else:
+                print(f"  Low confidence — input is ambiguous across domains.")
+            print(f"  To get full AI responses, set HDIM_LLM_BACKEND=openai or anthropic")
         print()
 
 

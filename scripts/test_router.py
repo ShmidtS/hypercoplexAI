@@ -3,6 +3,7 @@
 
 import torch
 from src.models.hdim_model import HDIMModel, HDIMConfig
+from src.models.model_factory import _patch_moe_kernel
 
 print('=== HDIM MoE ROUTER TEST ===\n')
 
@@ -16,6 +17,7 @@ config = HDIMConfig(
 )
 
 model = HDIMModel(config)
+_patch_moe_kernel(model, expert_names=["math", "language", "code", "science"])
 model.eval()
 
 print('Router Architecture:')

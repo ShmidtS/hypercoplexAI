@@ -195,8 +195,7 @@ class HDIMKernelChat:
 			if len(result) == 5:
 				output, routing_weights, invariant, slot_outputs, aux_state = result
 			else:
-				output, routing_weights, invariant, slot_outputs = result[:4]
-				aux_state = result[-1] if len(result) > 4 else None
+				output, routing_weights, invariant, slot_outputs, aux_state = result
 
 			if isinstance(output, tuple):
 				embeddings = output[0]
@@ -209,8 +208,8 @@ class HDIMKernelChat:
 				embedding = np.array(embeddings[0])
 
 			dominant_expert = pred_domain
-			if aux_state is not None and hasattr(aux_state, "expert_weights"):
-				expert_weights = aux_state.expert_weights
+			if aux_state is not None and hasattr(aux_state, "expert_usage"):
+				expert_weights = aux_state.expert_usage
 				if isinstance(expert_weights, torch.Tensor):
 					expert_weights = expert_weights.reshape(-1, expert_weights.shape[-1])
 					weights_arr = expert_weights[0].detach().cpu().numpy()
@@ -218,13 +217,11 @@ class HDIMKernelChat:
 					weights_arr = np.array(expert_weights)
 			elif routing_weights is not None:
 				weights_arr = routing_weights[0].detach().cpu().numpy() if routing_weights.dim() > 1 else routing_weights.detach().cpu().numpy()
-			elif aux_state is not None and hasattr(aux_state, "expert_usage"):
-				weights_arr = aux_state.expert_usage.detach().cpu().numpy()
 			else:
 				weights_arr = np.zeros(self.config.num_experts, dtype=np.float32)
 
-			if aux_state is not None and hasattr(aux_state, "top_expert_idx"):
-				top_expert_idx = aux_state.top_expert_idx
+			if aux_state is not None and hasattr(aux_state, "topk_idx"):
+				top_expert_idx = aux_state.topk_idx
 				if isinstance(top_expert_idx, torch.Tensor):
 					dominant_expert = int(top_expert_idx.reshape(-1)[0].item())
 			elif isinstance(weights_arr, np.ndarray) and weights_arr.size > 0:

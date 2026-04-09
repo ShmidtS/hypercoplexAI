@@ -147,7 +147,7 @@ def compute_hdim_embeddings(
             batch = texts[i:i + batch_size]
             enc = model.encode_texts(batch, device=dev)
             dom = torch.zeros(enc.shape[0], dtype=torch.long, device=dev)
-            _, _, inv, _ = model(enc, dom, return_state=True, memory_mode="none")
+            _, _, inv, _, _ = model(enc, dom, return_state=True, memory_mode="none")
             all_embeddings.append(inv.cpu())
 
     return torch.cat(all_embeddings, dim=0)

@@ -192,21 +192,21 @@ def _patch_moe_kernel(
             import torch
 
             output, state = self.kernel(x)
-            top_k = min(2, state.expert_weights.shape[-1])
+            top_k = min(self.top_k, state.expert_weights.shape[-1])
             topk_weights, topk_idx = state.expert_weights.topk(top_k, dim=-1)
             topk_weights_norm = topk_weights / topk_weights.sum(
                 -1, keepdim=True
             ).clamp_min(1e-8)
             router_state = {
                 "loss": state.total_loss(),
-                "router_loss": state.total_loss(),
+                "router_loss": state.router_loss + state.ortho_loss,
                 "z_loss": state.z_loss,
                 "gate_weights": state.expert_weights,
                 "scores": state.expert_weights,
                 "expert_usage": state.expert_usage,
                 "routing_entropy": state.routing_entropy,
                 "dispatch_weights": state.dispatch_weights,
-                "train_scores_snapshot": state.expert_usage,
+                "train_scores_snapshot": self.kernel.train_scores.detach().clone(),
                 "topk_idx": topk_idx,
                 "topk_gate_weights": topk_weights_norm,
                 "moe_kernel_state": state,

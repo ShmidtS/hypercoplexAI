@@ -39,6 +39,7 @@ from .online_lora import (
     OnlineLoRAManager,
     wrap_with_online_lora,
 )
+from .online_learner import OnlineLearner, ReplayBuffer, OnlineLearnerConfig
 
 # SRP components (refactored from HDIMPipeline)
 from .domain_encoder import DomainEncoder
@@ -66,6 +67,8 @@ __all__ = [
     # Online-LoRA
     'OnlineLoRA', 'OnlineLoRALinear', 'OnlineLoRAConv', 'OnlineLoRAConfig', 'OnlineLoRAManager',
     'wrap_with_online_lora',
+    # Online Learner
+    'OnlineLearner', 'ReplayBuffer', 'OnlineLearnerConfig',
     # SRP Components
     'DomainEncoder', 'InvariantProcessor', 'InvariantMemoryState', 'TransferEngine',
 ]
