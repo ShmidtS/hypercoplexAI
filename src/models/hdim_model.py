@@ -99,7 +99,7 @@ class HDIMConfig:
         clifford_r: Nilpotent basis vectors.
         top_k: Number of active experts per token.
         memory_key_dim: Dimensionality of Titans memory keys.
-        memory_type: Memory module type: titans | hippocampus | neocortex | cls | hbma.
+        memory_type: Memory module type: titans | hippocampus | neocortex | cls | hbma | msa.
         domain_names: Explicit domain name list. If None, auto-generates
             ['domain_0', 'domain_1', ...] up to num_domains.
         expert_names: Explicit expert name list. If provided, num_experts is computed from it.
@@ -114,7 +114,7 @@ class HDIMConfig:
     clifford_r: int = 0
     top_k: int = 2
     memory_key_dim: int = 32
-    memory_type: str = "titans"  # titans | hippocampus | neocortex | cls | hbma
+    memory_type: str = "titans"  # titans | hippocampus | neocortex | cls | hbma | msa
     domain_names: Optional[List[str]] = None
     expert_names: Optional[List[str]] = None  # New field for dynamic expert names
     text: HDIMTextConfig = field(default_factory=HDIMTextConfig)

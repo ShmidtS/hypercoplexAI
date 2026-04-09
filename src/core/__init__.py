@@ -49,6 +49,7 @@ from .transfer_engine import TransferEngine
 
 # Memory interface
 from .memory_interface import MemoryInterface, TitansAdapter, HBMAMemoryAdapter
+from .msa_attention import MSAMemory
 
 # Continual normalization
 from .continual_norm import ContinualNorm
@@ -82,7 +83,7 @@ __all__ = [
     # SRP Components
     'DomainEncoder', 'InvariantProcessor', 'InvariantMemoryState', 'TransferEngine',
     # Memory interface
-    'MemoryInterface', 'TitansAdapter', 'HBMAMemoryAdapter',
+    'MemoryInterface', 'TitansAdapter', 'HBMAMemoryAdapter', 'MSAMemory',
     # Continual normalization
     'ContinualNorm',
     # Clifford interaction layers

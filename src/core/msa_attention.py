@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .memory_interface import MemoryInterface, MemoryResult
+
 
 @dataclass
 class MSAConfig:
@@ -50,6 +52,8 @@ class MSAConfig:
 
 
 class MSASparseIndex(nn.Module):
+    compressed_chunks: torch.Tensor
+    chunk_counts: torch.Tensor
     """MSA sparse index for prototype retrieval.
 
     Key components from paper:
@@ -297,6 +301,10 @@ class MSASparseIndex(nn.Module):
 
 
 class MSAOverflowBuffer(nn.Module):
+    overflow_keys: torch.Tensor
+    overflow_vals: torch.Tensor
+    overflow_evidence: torch.Tensor
+    overflow_count: torch.Tensor
     """MSA-backed overflow buffer for EpisodicMemory.
 
     Implements Memory Interleave for multi-hop retrieval:
@@ -537,6 +545,10 @@ class MSAOverflowBuffer(nn.Module):
 
 
 class MSAAugmentedSemanticMemory(nn.Module):
+    prototypes: torch.Tensor
+    proto_conf: torch.Tensor
+    proto_evidence: torch.Tensor
+    proto_age: torch.Tensor
     """SemanticMemory with optional MSA sparse retrieval.
 
     Drop-in enhancement that:
@@ -628,6 +640,7 @@ class MSAAugmentedSemanticMemory(nn.Module):
         evidence: torch.Tensor,
     ) -> torch.Tensor:
         """Sparse retrieval via MSA."""
+        assert self.msa_index is not None
         retrieved, _, _ = self.msa_index.query(h, prototypes, evidence)
         return retrieved
 
@@ -668,3 +681,341 @@ class MSAAugmentedSemanticMemory(nn.Module):
         self.proto_conf.fill_(0.5)
         self.proto_evidence.fill_(1.0)
         self.proto_age.zero_()
+
+
+class MSAMemory(MemoryInterface):
+    prototypes: torch.Tensor
+    confidence: torch.Tensor
+    evidence: torch.Tensor
+    age: torch.Tensor
+    fill_count: torch.Tensor
+    _aux_loss: torch.Tensor
+    _routing_counts: torch.Tensor
+    """Primary memory system using MSA sparse attention.
+
+    Replaces Titans/HBMA with prototype-based sparse retrieval:
+    - Primary buffer: num_prototypes slots for stored invariants
+    - Overflow: MSAOverflowBuffer for evicted prototypes
+    - Retrieval: MSASparseIndex top-k selection + softmax blending
+    - Memory Interleave: fallback to overflow when confidence is low
+    - Blend gate: x + gate * retrieved
+    - Auxiliary loss: routing diversity (encourage even prototype usage)
+    - Surprise signal: normalized deviation from input
+
+    Implements MemoryInterface contract for drop-in use in HDIMPipeline.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_prototypes: int = 256,
+        top_k: int = 16,
+        chunk_size: int = 64,
+        num_heads: int = 4,
+        temperature: float = 0.07,
+        ema_momentum: float = 0.995,
+        dropout: float = 0.1,
+        overflow_capacity: int = 10000,
+        max_hops: int = 3,
+        interleave_threshold: float = 0.5,
+        compression_threshold: int = 128,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_prototypes = num_prototypes
+        self.top_k = min(top_k, num_prototypes)
+        self.chunk_size = chunk_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.temperature = temperature
+        self.ema_momentum = ema_momentum
+        self.max_hops = max_hops
+        self.interleave_threshold = interleave_threshold
+
+        # Projections (same pattern as MSAAugmentedSemanticMemory)
+        self.in_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.drop = nn.Dropout(dropout)
+
+        # Blend gate: x + gate * retrieved
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 1),
+        )
+
+        # Primary prototype storage
+        self.register_buffer(
+            "prototypes",
+            F.normalize(torch.randn(num_prototypes, hidden_dim), dim=-1),
+        )
+        self.register_buffer("confidence", torch.full((num_prototypes,), 0.5))
+        self.register_buffer("evidence", torch.ones(num_prototypes))
+        self.register_buffer("age", torch.zeros(num_prototypes))
+        self.register_buffer(
+            "fill_count", torch.zeros(1, dtype=torch.long)
+        )
+
+        # MSA sparse index for primary retrieval
+        self.sparse_index = MSASparseIndex(
+            dim=hidden_dim,
+            num_prototypes=num_prototypes,
+            top_k=top_k,
+            chunk_size=chunk_size,
+            num_heads=num_heads,
+            temperature=temperature,
+            compression_threshold=compression_threshold,
+        )
+
+        # Overflow buffer for evicted prototypes
+        self.overflow = MSAOverflowBuffer(
+            dim=hidden_dim,
+            num_prototypes=min(overflow_capacity, 1024),
+            max_hops=max_hops,
+            top_k=top_k,
+            chunk_size=chunk_size,
+            num_heads=num_heads,
+            temperature=temperature,
+            capacity=overflow_capacity,
+        )
+
+        # Track auxiliary loss
+        self.register_buffer("_aux_loss", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer(
+            "_routing_counts", torch.zeros(num_prototypes, dtype=torch.float32)
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _active_prototypes(self) -> torch.Tensor:
+        """Return only filled prototype slots."""
+        n = int(self.fill_count[0].item())
+        if n == 0:
+            return torch.zeros(0, self.hidden_dim, device=self.prototypes.device)
+        return self.prototypes[:n]
+
+    def _active_evidence(self) -> torch.Tensor:
+        """Return evidence for filled slots only."""
+        n = int(self.fill_count[0].item())
+        if n == 0:
+            return torch.zeros(0, device=self.evidence.device)
+        return self.evidence[:n]
+
+    def _compute_routing_diversity_loss(
+        self,
+        topk_indices: torch.Tensor,  # [B, K]
+    ) -> torch.Tensor:
+        """Auxiliary loss encouraging even prototype usage.
+
+        Uses a soft count-based penalty: if some prototypes are heavily
+        over-used relative to uniform, the loss increases.
+        """
+        B = topk_indices.shape[0]
+        if B == 0:
+            return torch.tensor(0.0, device=topk_indices.device, dtype=torch.float32)
+
+        # Update running routing counts (detached)
+        with torch.no_grad():
+            flat = topk_indices.detach().reshape(-1)
+            ones = torch.ones_like(flat, dtype=torch.float32)
+            self._routing_counts.scatter_add_(0, flat, ones)
+
+        # Compute diversity loss: L_div = CV(counts)^2
+        # Coefficient of variation squared — 0 when perfectly uniform
+        n = int(self.fill_count[0].item())
+        if n < 2:
+            return torch.tensor(0.0, device=topk_indices.device, dtype=torch.float32)
+
+        counts = self._routing_counts[:n]
+        mean_c = counts.mean().clamp(min=1e-8)
+        var_c = ((counts - mean_c) ** 2).mean()
+        cv_sq = var_c / (mean_c ** 2 + 1e-8)
+        return cv_sq
+
+    def _evict_to_overflow(self, slot_idx: int) -> None:
+        """Evict prototype at slot_idx to overflow buffer."""
+        key = self.prototypes[slot_idx].detach().clone()
+        val = self.prototypes[slot_idx].detach().clone()
+        ev = self.evidence[slot_idx].detach().clone()
+        self.overflow.store(key.unsqueeze(0), val.unsqueeze(0), ev.unsqueeze(0))
+
+    def _store_invariant(self, h: torch.Tensor) -> None:
+        """Store a new invariant into the primary buffer.
+
+        If buffer is full, evict lowest-evidence prototype to overflow.
+        Uses EMA update for existing similar prototypes.
+        """
+        n = int(self.fill_count[0].item())
+
+        with torch.no_grad():
+            # Check if similar prototype exists (cosine sim > 0.95)
+            if n > 0:
+                h_norm = F.normalize(h, dim=-1)
+                p_norm = F.normalize(self.prototypes[:n], dim=-1)
+                sim = (h_norm @ p_norm.T).squeeze(0)  # [n]
+                max_sim, max_idx = sim.max(dim=0)
+
+                if max_sim > 0.95:
+                    # EMA update existing prototype
+                    slot = int(max_idx.item())
+                    momentum = self.ema_momentum
+                    self.prototypes[slot] = momentum * self.prototypes[slot] + (1 - momentum) * h.squeeze(0)
+                    self.prototypes[slot] = F.normalize(self.prototypes[slot], dim=-1)
+                    self.evidence[slot] = self.evidence[slot] + 1.0
+                    self.confidence[slot] = torch.clamp(
+                        self.confidence[slot] + 0.05, max=1.0
+                    )
+                    self.age[slot] = 0.0
+                    return
+
+            # New prototype needed
+            if n < self.num_prototypes:
+                # Free slot available
+                self.prototypes[n] = F.normalize(h.squeeze(0), dim=-1)
+                self.confidence[n] = 0.5
+                self.evidence[n] = 1.0
+                self.age[n] = 0.0
+                self.fill_count[0] = n + 1
+            else:
+                # Buffer full: evict lowest-evidence prototype
+                _, evict_idx = self.evidence.min(dim=0)
+                evict_idx = int(evict_idx.item())
+                self._evict_to_overflow(evict_idx)
+                self.prototypes[evict_idx] = F.normalize(h.squeeze(0), dim=-1)
+                self.confidence[evict_idx] = 0.5
+                self.evidence[evict_idx] = 1.0
+                self.age[evict_idx] = 0.0
+
+    # ------------------------------------------------------------------
+    # MemoryInterface contract
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        update_memory: bool = False,
+    ) -> MemoryResult:
+        """Retrieve from MSA prototype memory + optional update.
+
+        Args:
+            x: Input tensor [B, D]
+            update_memory: Whether to store x as a prototype
+
+        Returns:
+            MemoryResult with output, loss, updated, surprise
+        """
+        B, D = x.shape
+        device = x.device
+
+        # Store new invariants before retrieval (so they're available immediately)
+        if update_memory:
+            for i in range(B):
+                self._store_invariant(x[i : i + 1])
+
+        # Project input for retrieval
+        h = self.in_proj(x)
+
+        n = int(self.fill_count[0].item())
+
+        # Edge case: not enough prototypes yet
+        if n < self.top_k:
+            gate_val = torch.sigmoid(self.gate(x))  # [B, 1]
+            output = x + gate_val * torch.zeros_like(x)
+            surprise = torch.zeros(B, 1, device=device, dtype=torch.float32)
+            return MemoryResult(
+                output=self.norm(output),
+                loss=torch.tensor(0.0, device=device, dtype=torch.float32),
+                updated=update_memory,
+                surprise=surprise.detach(),
+            )
+
+        # Primary retrieval via MSA sparse index
+        active_p = self._active_prototypes()
+        active_ev = self._active_evidence()
+        retrieved, topk_indices, topk_weights = self.sparse_index.query(
+            h, active_p, active_ev
+        )
+
+        # Compute primary confidence (mean of top-k weights as proxy)
+        primary_confidence = topk_weights.max(dim=-1).values  # [B]
+
+        # Memory Interleave: fallback to overflow if confidence low
+        if self.overflow.is_enabled() and self.overflow.size() > 0:
+            retrieved, _ = self.overflow.retrieve_with_interleave(
+                query=h,
+                primary_result=retrieved,
+                primary_confidence=primary_confidence,
+                threshold=self.interleave_threshold,
+            )
+
+        # Blend gate: x + gate * retrieved
+        gate_val = torch.sigmoid(self.gate(x))  # [B, 1]
+        output = x + gate_val * retrieved
+        output = self.drop(self.norm(output))
+
+        # Surprise signal: normalized deviation from input
+        with torch.no_grad():
+            surprise = (
+                (output.detach() - x).norm(dim=-1, keepdim=True)
+                / (x.norm(dim=-1, keepdim=True) + 1e-8)
+            )
+
+        # Auxiliary loss: routing diversity
+        diversity_loss = self._compute_routing_diversity_loss(topk_indices)
+        self._aux_loss = diversity_loss.detach()
+
+        # Age all prototypes
+        with torch.no_grad():
+            self.age[:n] += 1.0
+
+        return MemoryResult(
+            output=output,
+            loss=diversity_loss,
+            updated=update_memory,
+            surprise=surprise.detach(),
+        )
+
+    def reset(self, strategy: str = "geometric") -> None:
+        """Reset memory state.
+
+        Strategies:
+            'hard'      -- full reset (zero all prototypes, clear overflow)
+            'geometric' -- soft decay (EMA decay of confidence, age reset)
+            'stabilize' -- only normalize evidence and confidence
+        """
+        n = int(self.fill_count[0].item())
+
+        if strategy == "hard":
+            nn.init.normal_(self.prototypes)
+            F.normalize(self.prototypes, dim=-1, out=self.prototypes)
+            self.confidence.fill_(0.5)
+            self.evidence.fill_(1.0)
+            self.age.zero_()
+            self.fill_count.zero_()
+            self._routing_counts.zero_()
+            self.overflow.clear()
+
+        elif strategy == "geometric":
+            # Soft decay: reduce confidence and evidence, reset age
+            decay = 0.7
+            uniform_conf = torch.full_like(self.confidence, 0.5)
+            self.confidence[:n] = decay * self.confidence[:n] + (1 - decay) * uniform_conf[:n]
+            self.evidence[:n] = (self.evidence[:n] * decay).clamp(min=1.0)
+            self.age[:n] = 0.0
+            # Decay routing counts but don't zero
+            self._routing_counts.mul_(decay)
+
+        elif strategy == "stabilize":
+            # Only normalize evidence and confidence
+            if n > 0:
+                total_ev = self.evidence[:n].sum().clamp(min=1e-8)
+                self.evidence[:n] = (self.evidence[:n] / total_ev) * n
+                self.confidence[:n] = self.confidence[:n].clamp(0.1, 1.0)
+            self._routing_counts.mul_(0.9)
+
+    def memory_loss(self) -> torch.Tensor:
+        """Current auxiliary memory loss (routing diversity)."""
+        return self._aux_loss

@@ -130,6 +130,13 @@ class HDIMPipeline(nn.Module):
         elif memory_type == 'hbma':
             from .hbma_memory import HBMAMemory
             self.memory = HBMAMemoryAdapter(HBMAMemory(hidden_dim=clifford_dim))
+        elif memory_type == 'msa':
+            from .msa_attention import MSAMemory
+            self.memory: MemoryInterface = MSAMemory(
+                hidden_dim=clifford_dim,
+                num_prototypes=256,
+                top_k=16,
+            )
         else:
             from .hbma_memory import CLSMemory
             self.memory = HBMAMemoryAdapter(CLSMemory(hidden_dim=clifford_dim))

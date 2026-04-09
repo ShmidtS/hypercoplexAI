@@ -3,6 +3,7 @@
 Supports:
 - TitansMemoryModule (k, v memory matrix + momentum buffer)
 - HBMAMemory (Working, Episodic, Semantic, Procedural subsystems)
+- MSAMemory (MSA sparse attention prototype memory)
 - MemoryInterface adapters (TitansAdapter, HBMAMemoryAdapter)
 
 Features:
@@ -29,6 +30,7 @@ import torch.nn as nn
 from src.core.titans_memory import TitansMemoryModule
 from src.core.hbma_memory import HBMAMemory, CLSMemory
 from src.core.memory_interface import TitansAdapter, HBMAMemoryAdapter
+from src.core.msa_attention import MSAMemory
 
 
 # Version for persistence format compatibility
@@ -40,7 +42,7 @@ class PersistenceMetadata:
     """Metadata for persisted memory state."""
     version: str = PERSISTENCE_VERSION
     timestamp: str = ""
-    memory_type: str = ""  # "titans" | "hbma" | "adapter"
+    memory_type: str = ""  # "titans" | "hbma" | "adapter" | "msa"
     hidden_dim: int = 0
     compressed: bool = False
     checksum: str = ""
@@ -278,6 +280,8 @@ class MemoryPersistence:
             return memory.titans, "titans"
         elif isinstance(memory, HBMAMemoryAdapter):
             return memory.hbma, "hbma"
+        elif isinstance(memory, MSAMemory):
+            return memory, "msa"
         elif isinstance(memory, TitansMemoryModule):
             return memory, "titans"
         elif isinstance(memory, (HBMAMemory, CLSMemory)):
@@ -290,7 +294,7 @@ class MemoryPersistence:
         state = memory.state_dict()
 
         # Add type annotations for reconstruction
-        result = {"_type": type(memory).__name__}
+        result: dict[str, torch.Tensor | str] = {"_type": type(memory).__name__}
 
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
