@@ -21,9 +21,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
+
+# Force line-buffered stdout/stderr for Windows file redirection
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(line_buffering=True)
 from typing import Any, Optional
 
 import torch
@@ -434,7 +441,6 @@ def run_gpu_training(
         print("Using Automatic Mixed Precision (AMP)")
 
     total_steps = args.epochs * max(1, getattr(args, 'num_samples', 500) // args.batch_size)
-    scheduler, scheduler_needs_score = _build_scheduler(optimizer, args, total_steps)
 
     trainer = HDIMTrainer(
         model, optimizer,
@@ -511,6 +517,8 @@ def run_gpu_training(
         temp_lr_mult = getattr(args, 'temperature_lr_mult', 0.1)
         optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * temp_lr_mult})
         print(f"Learnable temperature enabled (init={trainer._log_temp.exp().item():.4f})")
+    # Build scheduler AFTER all param groups are added (including learnable_temperature)
+    scheduler, scheduler_needs_score = _build_scheduler(optimizer, args, total_steps)
     real_pairs_path = getattr(args, 'real_pairs', None)
     if real_pairs_path:
         from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
@@ -758,6 +766,15 @@ def run_gpu_training(
 
 
 def main() -> None:
+    # Load .env file (HF_TOKEN etc)
+    _env_path = Path(__file__).resolve().parents[1] / ".env"
+    if _env_path.exists():
+        for line in _env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, val = line.partition("=")
+                os.environ.setdefault(key.strip(), val.strip())
+
     parser = argparse.ArgumentParser(description="HDIM GPU Training Script")
     # Core training
     parser.add_argument("--epochs", type=int, default=30)
@@ -921,6 +938,7 @@ def main() -> None:
     parser.add_argument('--msa_max_hops', type=int, default=3, help='MSA max retrieval hops')
     parser.add_argument('--msa_interleave_threshold', type=float, default=0.5, help='MSA interleave confidence threshold')
     parser.add_argument('--msa_diversity_weight', type=float, default=1.0, help='MSA diversity loss weight')
+    parser.add_argument('--msa_ema_momentum', type=float, default=0.995, help='MSA EMA momentum for prototype updates')
     # Temperature scheduling
     parser.add_argument("--temp_schedule", type=str, default="none",
                         choices=["none", "warm_restart"],
@@ -981,6 +999,7 @@ def main() -> None:
         msa_max_hops=args.msa_max_hops,
         msa_interleave_threshold=args.msa_interleave_threshold,
         msa_diversity_loss_weight=args.msa_diversity_weight,
+        msa_ema_momentum=args.msa_ema_momentum,
     )
     clifford_dim = 2 ** (args.clifford_p + args.clifford_q + args.clifford_r)
     print(f"Clifford algebra: Cl({args.clifford_p},{args.clifford_q},{args.clifford_r}) dim={clifford_dim}")
