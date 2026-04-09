@@ -143,3 +143,4 @@ context_portal/
 artifacts/
 data/
 pytest*/
+formalization/.lake/
