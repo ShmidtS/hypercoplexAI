@@ -150,7 +150,7 @@ class MemoryPersistence:
             raise FileNotFoundError(f"Memory file not found: {path}")
 
         # Load saved dict
-        save_dict = torch.load(path, map_location="cpu", weights_only=False)
+        save_dict = torch.load(path, map_location="cpu", weights_only=True)
 
         # Validate version
         saved_version = save_dict.get("version", "unknown")
@@ -352,7 +352,7 @@ class MemoryPersistence:
 
     def _compute_checksum(self, state: dict[str, Any]) -> str:
         """Compute simple checksum of state tensors."""
-        hasher = __import__("hashlib").md5()
+        hasher = __import__("hashlib").sha256()
         for key in sorted(state.keys()):
             value = state[key]
             if isinstance(value, torch.Tensor):
