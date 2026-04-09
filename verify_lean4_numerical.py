@@ -995,7 +995,7 @@ torch.manual_seed(42)
 router = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128, z_loss_weight=0.01)
 for _ in range(10):
     x = torch.randn(8, 64)
-    output, state, _ = router(x)
+    output, state = router(x)
     z_loss = state['z_loss']
     # z_loss = (logsumexp)^2 >= 0 always
     if z_loss.item() < -1e-8:
@@ -1295,7 +1295,7 @@ results.append(('soft_moe_dispatch_combine_normalize', status))
 print('\n--- 64. soft_moe_expert_gradient_flow ---')
 moe = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128)
 x = torch.randn(8, 64, requires_grad=True)
-output, _, _ = moe(x)
+output, _ = moe(x)
 loss = output.sum()
 loss.backward()
 grad_ok = (x.grad is not None) and (x.grad.abs().sum() > 0) and not torch.isnan(x.grad).any()
@@ -1854,7 +1854,7 @@ router = SoftMoERouter(input_dim=64, num_experts=4, slots_per_expert=1)
 router.eval()
 x94 = torch.randn(32, 64)
 with torch.no_grad():
-    output, state, _ = router(x94)
+    output, state = router(x94)
 expert_usage = state['expert_usage']  # (num_experts,)
 # All experts should receive > 0 weight
 dead_experts = (expert_usage < 1e-8).sum().item()
@@ -1917,7 +1917,7 @@ router97.use_aux_loss_free = True
 x97 = torch.randn(100, 64)
 for _ in range(10):
     with torch.no_grad():
-        _, _, _ = router97(x97)
+        _, _ = router97(x97)
     if router97._expert_bias.abs().max().item() > 10.0:
         all_ok = False
         break
@@ -1955,11 +1955,10 @@ results.append(('learnable_temperature_range', status))
 print('\n--- 99. shared_expert_residual_connection ---')
 all_ok = True
 torch.manual_seed(990)
-router99 = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128)
-router99.use_shared_expert = True
+router99 = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128, use_shared_expert=True)
 x99 = torch.randn(8, 64)
 with torch.no_grad():
-    output99, _, _ = router99(x99)
+    output99, _ = router99(x99)
 if torch.isnan(output99).any() or torch.isinf(output99).any():
     all_ok = False
 if output99.abs().max().item() < 1e-6:
@@ -2163,7 +2162,7 @@ router108 = SoftMoERouter(input_dim=64, num_experts=4, slots_per_expert=2)
 router108.eval()
 x108 = torch.randn(128, 64)
 with torch.no_grad():
-    _, state108, _ = router108(x108)
+    _, state108 = router108(x108)
     usage = state108['expert_usage']
     # Uniform distribution would be 0.25 per expert
     expected = 1.0 / 4

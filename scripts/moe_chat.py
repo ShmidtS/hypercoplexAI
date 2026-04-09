@@ -93,6 +93,7 @@ _DOMAIN_KEYWORDS = {
         "code", "program", "compile", "api", "variable", "loop", "script",
         "implement", "binary", "search", "sort", "recursion", "array",
         "hash", "tree", "graph", "stack", "queue", "pointer", "memory",
+        "bfs", "dfs", "traversal", "breadth", "depth",
         "код", "программа", "функция", "класс", "отладка",
     ],
     "science": [
