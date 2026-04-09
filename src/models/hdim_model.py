@@ -349,24 +349,24 @@ class HDIMModel(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        raw_invariant = torch.empty(
+        raw_invariant = torch.zeros(
             batch_size, self.pipeline.clifford_dim, device=device, dtype=dtype,
         )
-        memory_augmented_invariant = torch.empty(
+        memory_augmented_invariant = torch.zeros(
             batch_size, self.pipeline.clifford_dim, device=device, dtype=dtype,
         )
-        exported_invariant = torch.empty(
+        exported_invariant = torch.zeros(
             batch_size, self.pipeline.clifford_dim, device=device, dtype=dtype,
         )
         _num_experts = self.pipeline.moe.num_experts
         _top_k = self.pipeline.moe.top_k
-        routing_weights = torch.empty(
+        routing_weights = torch.zeros(
             batch_size, _num_experts, device=device, dtype=dtype,
         )
-        topk_idx = torch.empty(
+        topk_idx = torch.zeros(
             batch_size, _top_k, device=device, dtype=torch.long,
         )
-        topk_gate_weights = torch.empty(
+        topk_gate_weights = torch.zeros(
             batch_size, _top_k, device=device, dtype=dtype,
         )
         return (

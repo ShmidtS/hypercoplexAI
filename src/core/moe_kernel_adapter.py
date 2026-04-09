@@ -90,7 +90,7 @@ class MoEKernelAdapter(MoERouter):
         info.update({
             "gate_weights": state.expert_weights,
             "topk_idx": state.top_expert_idx,
-            "topk_gate_weights": state.dispatch_weights,
+            "topk_gate_weights": state.expert_weights,
             "train_scores_snapshot": self.kernel.train_scores.detach().clone(),
         })
 
