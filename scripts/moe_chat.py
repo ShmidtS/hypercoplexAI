@@ -69,6 +69,60 @@ from src.models.model_factory import build_sbert_hdim_model, _patch_moe_kernel
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DOMAIN_NAMES = ["math", "language", "code", "science"]
 DOMAIN_IDX = {n: i for i, n in enumerate(DOMAIN_NAMES)}
+SEMANTIC_BLEND = 0.6
+
+_DOMAIN_KEYWORDS = {
+    "math": [
+        "equation", "formula", "calculate", "integral", "derivative", "matrix",
+        "proof", "theorem", "algebra", "geometry", "probability", "statistics",
+        "solve", "number", "function", "sum", "plus", "minus", "multiply",
+        "divide", "square", "root", "logarithm", "fraction", "percentage",
+        "арифметика", "сложение", "умножение",
+        "математика", "формула", "уравнение", "интеграл", "производная",
+    ],
+    "language": [
+        "translate", "grammar", "sentence", "word", "meaning", "linguistic",
+        "syntax", "semantics", "poem", "story", "text",
+        "язык", "перевод", "грамматика", "предложение", "текст",
+    ],
+    "code": [
+        "python", "javascript", "function", "class", "debug", "algorithm",
+        "code", "program", "compile", "api", "variable", "loop", "script",
+        "код", "программа", "функция", "класс", "отладка",
+    ],
+    "science": [
+        "quantum", "physics", "chemistry", "biology", "experiment",
+        "hypothesis", "atom", "molecule", "cell", "DNA", "gravity",
+        "energy", "theory", "entropy",
+        "квантовая", "физика", "химия", "биология", "атом",
+    ],
+}
+
+
+def semantic_domain_hints(text: str) -> dict[str, float]:
+    """Compute domain weight hints from keyword matching on lowercased text."""
+    import re
+    low = text.lower()
+    hits: dict[str, int] = {}
+    for domain, keywords in _DOMAIN_KEYWORDS.items():
+        count = sum(1 for kw in keywords if kw in low)
+        hits[domain] = count
+    # Pattern-based boosts (math expressions, code snippets, etc.)
+    if re.search(r'\d+\s*[+\-*/^=]\s*\d+', text) or re.search(r'[+\-*/=]\s*\d', text):
+        hits["math"] = hits.get("math", 0) + 3
+    if re.search(r'[{}();]', text) or re.search(r'\bdef\b|\bclass\b|\bimport\b|\breturn\b', text):
+        hits["code"] = hits.get("code", 0) + 3
+    total_hits = sum(hits.values())
+    if total_hits == 0:
+        return {n: 0.25 for n in DOMAIN_NAMES}
+    raw: dict[str, float] = {}
+    for domain in DOMAIN_NAMES:
+        raw[domain] = hits.get(domain, 0) / total_hits
+    total_raw = sum(raw.values())
+    if total_raw < 1e-8:
+        return {n: 0.25 for n in DOMAIN_NAMES}
+    return {n: raw[n] / total_raw for n in DOMAIN_NAMES}
+
 
 LLM_BACKEND = os.environ.get("HDIM_LLM_BACKEND", "none")
 LLM_MODEL = os.environ.get("HDIM_LLM_MODEL", "")
@@ -177,7 +231,12 @@ def build_model():
 
     model.to(DEVICE)
     # Fix runaway expert bias from run_018 (science bias was 5.22)
+    # and router_proj weight collapse (row norms range 0.2-1.0, rows collinear).
+    # Root cause: training co-adapted router_proj + _expert_bias; clamping or
+    # normalizing alone is insufficient because row directions remain collinear.
+    # Fix: zero bias + orthogonal reinit of router_proj (expert weights kept).
     _moe = model.core_model.pipeline.moe
+    _kernel = getattr(_moe, "kernel", _moe)
     # _expert_bias may be on MoEKernel directly or under .kernel (adapter pattern)
     for _attr in ("_expert_bias",):
         _target = None
@@ -189,8 +248,18 @@ def build_model():
             bias_vals = getattr(_target, _attr).data
             max_bias = bias_vals.abs().max().item()
             if max_bias > 1.0:
-                print(f"[init] Clamping expert bias (max={max_bias:.2f} -> clamp 1.0)")
-                bias_vals.clamp_(-1.0, 1.0)
+                print(f"[init] Resetting expert bias (max={max_bias:.2f} -> 0.0)")
+                bias_vals.zero_()
+    # Re-initialize router_proj with orthogonal rows (fixes co-adaptation collapse)
+    if hasattr(_kernel, "router_proj"):
+        _rp = _kernel.router_proj.weight.data
+        _row_norms = _rp.norm(dim=1)
+        _norm_ratio = _row_norms.max() / _row_norms.min().clamp(min=1e-8)
+        _cos = torch.nn.functional.cosine_similarity(_rp.unsqueeze(1), _rp.unsqueeze(0), dim=2)
+        _offdiag = _cos[_cos != 1.0].abs().max().item()
+        if _norm_ratio > 2.0 or _offdiag > 0.8:
+            print(f"[init] Re-initializing router_proj (norm ratio={_norm_ratio:.2f}, max cosine={_offdiag:.2f})")
+            torch.nn.init.orthogonal_(_kernel.router_proj.weight)
     model.eval()
     print("[init] Model ready.")
     print(f"[init] Experts: {DOMAIN_NAMES}")
@@ -200,19 +269,34 @@ def build_model():
 
 
 def encode_text(model, text: str):
-    """Encode text and run through HDIMModel. Returns (exported_invariant, expert_weights, dominant_expert, out, aux_state)."""
+    """Encode text and run through HDIMModel. Returns (exported_invariant, expert_weights, dominant_expert, out, aux_state).
+
+    expert_weights are blended with semantic keyword hints (SEMANTIC_BLEND controls
+    the weight of keyword hints vs model routing).
+    """
     text = str(text)
     with torch.no_grad():
         enc = model.encode_texts([text], device=DEVICE)
         dom = torch.zeros(1, dtype=torch.long, device=DEVICE)
         out, _, _, _, aux_state = model(enc, dom, return_state=True, memory_mode="retrieve")
-        expert_weights = aux_state.expert_usage.cpu()
+        expert_weights = aux_state.routing_weights[0].cpu()
         # Normalize routing scores to probabilities for display/dominant detection
         weights_sum = expert_weights.sum().clamp(min=1e-8)
         expert_probs = expert_weights / weights_sum
-        top_idx = expert_probs.argmax().item()
+        # Blend with semantic keyword hints
+        semantic_hints = semantic_domain_hints(text)
+        blended: dict[str, float] = {}
+        for name in DOMAIN_NAMES:
+            model_w = expert_probs[DOMAIN_IDX[name]].item()
+            sem_w = semantic_hints.get(name, 0.25)
+            blended[name] = (1 - SEMANTIC_BLEND) * model_w + SEMANTIC_BLEND * sem_w
+        total = sum(blended.values())
+        for name in blended:
+            blended[name] /= total
+        blended_weights = torch.tensor([blended[n] for n in DOMAIN_NAMES])
+        top_idx: int = int(blended_weights.argmax().item())
         exported_inv = aux_state.exported_invariant
-        return exported_inv, expert_probs, DOMAIN_NAMES[top_idx], out, aux_state
+        return exported_inv, blended_weights, DOMAIN_NAMES[top_idx], out, aux_state
 
 
 def format_bar(weights, width=20):
@@ -230,6 +314,49 @@ def format_bar(weights, width=20):
 
 def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
     return F.cosine_similarity(a, b, dim=-1).item()
+
+
+_EXPERT_RESPONSE_TEMPLATES = {
+    "math": (
+        "Математический анализ: '{text}' — это задача из области математического "
+        "рассуждения. Ключевые аспекты: формализация задачи, поиск инвариантов, "
+        "построение доказательства."
+    ),
+    "language": (
+        "Лингвистический анализ: '{text}' — текст с выраженной языковой структурой. "
+        "Аспекты: семантическое поле, синтаксическая конструкция, прагматический контекст."
+    ),
+    "code": (
+        "Программный анализ: '{text}' — задача из области программирования. "
+        "Подход: декомпозиция, выбор алгоритма, реализация, тестирование."
+    ),
+    "science": (
+        "Научный анализ: '{text}' — вопрос из области естественных наук. "
+        "Метод: формулировка гипотезы, экспериментальная проверка, анализ данных."
+    ),
+}
+
+
+def generate_expert_response(
+    dominant: str, user_text: str, confidence: float, expert_weights: torch.Tensor
+) -> str:
+    """Generate a meaningful expert response with blended domain weights."""
+    template = _EXPERT_RESPONSE_TEMPLATES.get(dominant, "Анализ: '{text}'")
+    snippet = user_text[:80] + ("..." if len(user_text) > 80 else "")
+    lines = [
+        f"\nExpert [{dominant.upper()}] (confidence: {confidence:.1%}):",
+        f"  {template.format(text=snippet)}",
+        f"  Routed via Clifford invariant + semantic blend (alpha={SEMANTIC_BLEND})",
+    ]
+    if confidence > 0.5:
+        lines.append("  Высокая уверенность маршрутизации.")
+    elif confidence < 0.3:
+        lines.append("  Низкая уверенность — запрос может относиться к нескольким доменам.")
+    lines.append("  Domain weights:")
+    for name, w in zip(DOMAIN_NAMES, expert_weights.tolist()):
+        lines.append(f"    {name:8s} {w:5.1%}")
+    lines.append("  To get full AI responses, set HDIM_LLM_BACKEND=openai or anthropic")
+    return "\n".join(lines)
 
 
 def main():
@@ -329,7 +456,7 @@ def main():
             print(f" Cosine similarity (invariant space): {sim:.4f}")
             text1_expert = "unknown"
             if last_expert_weights is not None:
-                text1_expert = DOMAIN_NAMES[last_expert_weights.argmax().item()]
+                text1_expert = DOMAIN_NAMES[int(last_expert_weights.argmax().item())]
             print(f" Text 1 dominant expert: {text1_expert}")
             print(f" Text 2 dominant expert: {dom2}")
             print(" Expert weights (text 2):")
@@ -356,24 +483,8 @@ def main():
         if llm_reply is not None:
             print(f"\nLLM ({LLM_BACKEND}): {llm_reply}")
         else:
-            # Built-in expert response when no LLM backend configured
-            expert_descriptions = {
-                "math": "Mathematical reasoning, equations, proofs, numerical analysis",
-                "language": "Linguistic analysis, semantics, grammar, text comprehension",
-                "code": "Programming, algorithms, software architecture, debugging",
-                "science": "Scientific method, physics, chemistry, biology, experiments",
-            }
             conf = expert_weights.max().item()
-            print(f"\nExpert [{dominant.upper()}] (confidence: {conf:.1%}):")
-            print(f"  Domain: {expert_descriptions.get(dominant, 'general')}")
-            print(f"  Routed via Clifford invariant (norm={invariant.norm().item():.4f})")
-            if conf > 0.5:
-                print(f"  High confidence routing to {dominant} expert.")
-            elif conf > 0.3:
-                print(f"  Moderate confidence — input spans multiple domains.")
-            else:
-                print(f"  Low confidence — input is ambiguous across domains.")
-            print(f"  To get full AI responses, set HDIM_LLM_BACKEND=openai or anthropic")
+            print(generate_expert_response(dominant, user_input, conf, expert_weights))
         print()
 
 

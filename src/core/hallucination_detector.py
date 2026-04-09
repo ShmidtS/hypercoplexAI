@@ -95,7 +95,7 @@ class HallucinationDetector(nn.Module):
             # Default weights: 5 signals combined
             # entropy: 25%, confidence: 20%, mismatch: 20%, semantic: 20%, eigen: 15%
             self.register_buffer("weight_entropy", torch.tensor(0.25))
-            self.register_buffer("weight_confidence", torch.tensor(-0.20))
+            self.register_buffer("weight_confidence", torch.tensor(0.20))
             self.register_buffer("weight_mismatch", torch.tensor(0.20))
             self.register_buffer("weight_semantic", torch.tensor(0.20))
             self.register_buffer("weight_eigen", torch.tensor(0.15))
@@ -249,7 +249,7 @@ class HallucinationDetector(nn.Module):
         Returns:
             HallucinationDetectionResult
         """
-        routing_entropy = router_state.get("routing_entropy", torch.tensor(0.0))
+        routing_entropy = router_state.get("routing_entropy", torch.tensor(0.0, dtype=torch.float32))
         gate_weights = router_state.get("gate_weights", router_state.get("scores", None))
         topk_gate = router_state.get("topk_gate_weights", None)
 
@@ -259,7 +259,7 @@ class HallucinationDetector(nn.Module):
         elif gate_weights is not None:
             moe_confidence = gate_weights.max(dim=-1).values
         else:
-            moe_confidence = torch.tensor(0.0)
+            moe_confidence = torch.tensor(0.0, device=routing_entropy.device, dtype=routing_entropy.dtype)
 
         return self.compute_hallucination_risk(
             routing_entropy=routing_entropy,

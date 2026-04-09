@@ -11,6 +11,7 @@ Run: python tests/test_nan_inf_forward.py
 """
 
 import sys
+import pytest
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -22,6 +23,15 @@ from src.core.hypercomplex import CliffordAlgebra
 from src.core.soft_moe_router import SoftMoERouter
 from src.core.hbma_memory import SemanticMemory, HBMAMemory
 from src.models.hdim_model import HDIMModel, HDIMConfig
+
+def _cuda_usable():
+    try:
+        torch.zeros(1).cuda()
+        return True
+    except (AssertionError, RuntimeError):
+        return False
+
+requires_cuda = pytest.mark.skipif(not _cuda_usable(), reason="Requires CUDA")
 
 
 def check_tensor(tensor: torch.Tensor, name: str) -> dict:
@@ -64,6 +74,7 @@ def print_diagnostics(diag: dict):
         print(f"    range: [{diag['min']:.4e}, {diag['max']:.4e}]")
 
 
+@requires_cuda
 def test_geometric_product_overflow():
     """Test geometric_product for fp16 overflow in outer product."""
     print("\n" + "="*60)
@@ -110,6 +121,7 @@ def test_geometric_product_overflow():
         "geometric_product produced NaN/Inf"
 
 
+@requires_cuda
 def test_soft_moe_router_nan():
     """Test SoftMoERouter for NaN in dispatch/combine matrices."""
     print("\n" + "="*60)
@@ -175,6 +187,7 @@ def test_soft_moe_router_nan():
         "SoftMoERouter produced NaN/Inf"
 
 
+@requires_cuda
 def test_hbma_semantic_scatter():
     """Test HBMA SemanticMemory scatter operations for dtype mismatch."""
     print("\n" + "="*60)
@@ -226,6 +239,7 @@ def test_hbma_semantic_scatter():
         "HBMA SemanticMemory produced NaN/Inf"
 
 
+@requires_cuda
 def test_full_hdim_forward():
     """Test full HDIM model forward pass with Phase 26 config."""
     print("\n" + "="*60)
@@ -303,6 +317,7 @@ def test_full_hdim_forward():
         "Full HDIM forward produced NaN/Inf"
 
 
+@requires_cuda
 def test_extreme_values():
     """Test model behavior with extreme input values."""
     print("\n" + "="*60)

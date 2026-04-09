@@ -30,7 +30,8 @@ from .moe_interface import MoERouter
 from .moe_kernel_adapter import MoEKernelAdapter
 from .soft_moe_router import SoftMoERouter
 from .maxscore_router import MaxScoreRouter, RouterCheckpoint, RouterResult
-from .hallucination_detector import HallucinationDetector, HallucinationDetectionResult, SemanticEntropyProbe
+from .hallucination_detector import HallucinationDetector, HallucinationDetectionResult
+from .semantic_entropy_probe import SemanticEntropyProbe
 from .online_lora import (
     OnlineLoRA,
     OnlineLoRALinear,
@@ -45,6 +46,15 @@ from .online_learner import OnlineLearner, ReplayBuffer, OnlineLearnerConfig
 from .domain_encoder import DomainEncoder
 from .invariant_processor import InvariantProcessor, InvariantMemoryState
 from .transfer_engine import TransferEngine
+
+# Memory interface
+from .memory_interface import MemoryInterface, TitansAdapter, HBMAMemoryAdapter
+
+# Continual normalization
+from .continual_norm import ContinualNorm
+
+# Clifford interaction layers
+from .clifford_interaction import CliffordInteractionLayer, CliffordFFN
 
 __all__ = [
     # Hypercomplex
@@ -71,4 +81,10 @@ __all__ = [
     'OnlineLearner', 'ReplayBuffer', 'OnlineLearnerConfig',
     # SRP Components
     'DomainEncoder', 'InvariantProcessor', 'InvariantMemoryState', 'TransferEngine',
+    # Memory interface
+    'MemoryInterface', 'TitansAdapter', 'HBMAMemoryAdapter',
+    # Continual normalization
+    'ContinualNorm',
+    # Clifford interaction layers
+    'CliffordInteractionLayer', 'CliffordFFN',
 ]

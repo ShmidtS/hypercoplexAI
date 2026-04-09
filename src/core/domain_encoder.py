@@ -70,6 +70,11 @@ class DomainEncoder(nn.Module):
             for name in self.domain_names
         })
 
+        # Normalize rotors after initialization to ensure ||R||=1
+        with torch.no_grad():
+            for rotor in self.domain_rotors.values():
+                rotor.R.data = torch.nn.functional.normalize(rotor.R.data, dim=-1)
+
         # Invariant extractor: мультивектор -> инвариант
         self.invariant_extractor = InvariantExtractor(algebra)
 
@@ -137,6 +142,10 @@ class DomainEncoder(nn.Module):
 
         new_rotor = DomainRotationOperator(self.algebra, domain_name=domain_name)
         new_rotor = new_rotor.to(device=device, dtype=dtype)
+
+        # Normalize rotor after initialization to ensure ||R||=1
+        with torch.no_grad():
+            new_rotor.R.data = torch.nn.functional.normalize(new_rotor.R.data, dim=-1)
 
         self.domain_rotors[domain_name] = new_rotor
         self.domain_names.append(domain_name)

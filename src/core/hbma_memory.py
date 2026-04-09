@@ -64,7 +64,7 @@ class MemorySubsystemPlugin(nn.Module, ABC):
         pass
 
     def auxiliary_loss(self) -> torch.Tensor:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, dtype=torch.float32)
 
 
 @dataclass
@@ -995,7 +995,7 @@ class HBMAMemory(nn.Module):
         # Accumulate plugin losses
         if not self._plugins:
             return base_loss
-        plugin_losses = torch.tensor(0.0, device=base_loss.device)
+        plugin_losses = torch.tensor(0.0, device=base_loss.device, dtype=base_loss.dtype)
         for p in self._plugins:
             pl = p.auxiliary_loss()
             if isinstance(pl, torch.Tensor):

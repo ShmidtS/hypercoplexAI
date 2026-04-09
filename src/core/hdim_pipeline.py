@@ -266,7 +266,7 @@ class HDIMPipeline(nn.Module):
         domain_pairs: List[Tuple[torch.Tensor, str, str]],
     ) -> torch.Tensor:
         """Потеря изоморфизма L_iso."""
-        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        total_loss = torch.tensor(0.0, device=next(self.parameters()).device, dtype=next(self.parameters()).dtype)
         for x, domain_a, domain_b in domain_pairs:
             _, u_a = self.encode_domain(x, domain_a)
             _, u_b = self.encode_domain(x, domain_b)

@@ -77,12 +77,17 @@ class ContinualNorm(nn.Module):
                 # (N, F) format
                 batch_mean = x.mean(dim=0)
                 batch_var = x.var(dim=0, unbiased=False)
+            elif x.dim() == 3:
+                # (B, T, D) format - flatten to (B*T, D) for norm
+                x_2d = x.reshape(-1, x.shape[-1])
+                batch_mean = x_2d.mean(dim=0)
+                batch_var = x_2d.var(dim=0, unbiased=False)
             elif x.dim() == 4:
                 # (N, C, H, W) format - normalize over (N, H, W)
                 batch_mean = x.mean(dim=(0, 2, 3))
                 batch_var = x.var(dim=(0, 2, 3), unbiased=False)
             else:
-                raise ValueError(f"Expected 2D or 4D tensor, got {x.dim()}D")
+                raise ValueError(f"Expected 2D, 3D or 4D tensor, got {x.dim()}D")
 
             # EMA update (continual, no task reset)
             with torch.no_grad():
@@ -99,6 +104,12 @@ class ContinualNorm(nn.Module):
 
         # Normalize using running statistics
         if x.dim() == 2:
+            # (N, F) format
+            x_norm = (x - self.running_mean) / torch.sqrt(
+                self.running_var + self.eps
+            )
+        elif x.dim() == 3:
+            # (B, T, D) format - normalize last dim, broadcast over B, T
             x_norm = (x - self.running_mean) / torch.sqrt(
                 self.running_var + self.eps
             )
@@ -110,7 +121,7 @@ class ContinualNorm(nn.Module):
 
         # Apply affine transform if enabled
         if self.affine:
-            if x.dim() == 2:
+            if x.dim() == 2 or x.dim() == 3:
                 x_norm = self.weight * x_norm + self.bias
             else:
                 x_norm = (

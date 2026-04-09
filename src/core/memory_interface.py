@@ -64,7 +64,7 @@ class MemoryInterface(nn.Module, ABC):
 
     def memory_loss(self) -> torch.Tensor:
         """Current auxiliary memory loss. Default: 0."""
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, dtype=torch.float32)
 
 
 class TitansAdapter(MemoryInterface):
@@ -152,7 +152,7 @@ class HBMAMemoryAdapter(MemoryInterface):
         # inside forward() during training.  In inference mode HBMA is
         # effectively read-only because BatchNorm/dropout layers are frozen.
         output = self.hbma(x)
-        loss = self.hbma.memory_loss() if hasattr(self.hbma, 'memory_loss') else torch.tensor(0.0, device=x.device)
+        loss = self.hbma.memory_loss() if hasattr(self.hbma, 'memory_loss') else torch.tensor(0.0, device=x.device, dtype=x.dtype)
         # HBMA updates internally whenever self.hbma.training is True
         actually_updated = update_memory and self.hbma.training
         return MemoryResult(
@@ -170,4 +170,4 @@ class HBMAMemoryAdapter(MemoryInterface):
     def memory_loss(self) -> torch.Tensor:
         if hasattr(self.hbma, 'memory_loss'):
             return self.hbma.memory_loss()
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, dtype=torch.float32)

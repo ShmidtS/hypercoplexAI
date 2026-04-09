@@ -272,7 +272,7 @@ class CliffordInteractionLayer(nn.Module):
             # Note: gate_fc is used differently in Triton version
             # We use the first row of gate_fc.weight as the gate projection
             gate_weight = self.gate_fc.weight[0]  # (D,)
-            gate_bias = self.gate_fc.bias[0] if self.gate_fc.bias is not None else torch.tensor(0.0, device=x.device)
+            gate_bias = self.gate_fc.bias[0] if self.gate_fc.bias is not None else torch.tensor(0.0, device=x.device, dtype=x.dtype)
             
             output = apply_triton_clifford_interaction(
                 x,

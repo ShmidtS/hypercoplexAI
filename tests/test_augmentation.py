@@ -98,12 +98,14 @@ class TestEmbeddingDropout:
 
 class TestMixup:
     def test_mixup_interpolates(self):
-        aug = EmbeddingAugmenter(noise_std=0.0, dropout_p=0.0, mixup_alpha=1.0)
+        # mixup internally uses noise_std*0.5 for the noisy copy,
+        # so noise_std must be > 0 for mixup to produce different output
+        aug = EmbeddingAugmenter(noise_std=0.1, dropout_p=0.0, mixup_alpha=1.0)
         aug.train()
         x = torch.randn(8, 256)
         out = aug(x, pairs_only=False)
         # Mixup should produce different embeddings
-        assert not torch.equal(out, x)
+        assert not torch.allclose(out, x, atol=1e-6)
 
     def test_mixup_with_noise(self):
         aug = EmbeddingAugmenter(noise_std=0.1, dropout_p=0.0, mixup_alpha=0.5)

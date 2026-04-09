@@ -299,7 +299,7 @@ class OnlineLearner(nn.Module):
         should_update = force_update or (surprise_mean > self.surprise_threshold and self.training)
 
         if not should_update:
-            return torch.tensor(0.0, device=x.device), False, surprise_mean
+            return torch.tensor(0.0, device=x.device, dtype=x.dtype), False, surprise_mean
 
         # Initialize EMA if needed
         self._init_ema(x.mean(dim=0))
@@ -360,7 +360,7 @@ class OnlineLearner(nn.Module):
         # Update EMA
         self._update_ema(x.mean(dim=0))
 
-        return torch.tensor(0.0, device=x.device), True
+        return torch.tensor(0.0, device=x.device, dtype=x.dtype), True
 
     def _update_selective(
         self,
@@ -396,7 +396,7 @@ class OnlineLearner(nn.Module):
             target = self.ema_weights.unsqueeze(0).expand(x.size(0), -1)
             loss = F.mse_loss(x_scaled, target) * self.gradient_scale
         else:
-            loss = torch.tensor(0.0, device=x.device)
+            loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         # Update EMA
         self._update_ema(x.mean(dim=0))
@@ -476,7 +476,7 @@ class OnlineLearner(nn.Module):
         should_update = force_update or (surprise_mean > self.surprise_threshold and self.training)
 
         if not should_update:
-            return torch.tensor(0.0, device=x.device), False, surprise_mean
+            return torch.tensor(0.0, device=x.device, dtype=x.dtype), False, surprise_mean
 
         # Initialize EMA if needed
         self._init_ema(x.mean(dim=0))
@@ -513,7 +513,7 @@ class OnlineLearner(nn.Module):
             domain_ids = batch['domain_id']
 
             # Simple intra-class contrastive loss
-            loss = torch.tensor(0.0, device=self.device)
+            loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
 
             for domain_id in domain_ids.unique():
                 domain_mask = domain_ids == domain_id

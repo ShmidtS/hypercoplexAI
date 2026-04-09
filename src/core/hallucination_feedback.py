@@ -194,9 +194,12 @@ class ReRoutingStrategy:
 
         # For medium risk, use weighted selection favoring safer experts
         if risk_level == "medium" and expert_weights is not None:
-            # Bias weights toward safer experts
+            # Bias weights toward safer experts based on safety_ranking
+            safety_ranking_map = {
+                name: 1.0 / (rank + 1) for rank, name in enumerate(self.safety_ranking)
+            }
             safety_bias = torch.tensor(
-                [1.0 / (i + 1) for i in range(len(self.expert_names))],
+                [safety_ranking_map.get(name, 0.0) for name in self.expert_names],
                 dtype=expert_weights.dtype,
                 device=expert_weights.device,
             )

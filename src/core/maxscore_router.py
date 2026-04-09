@@ -272,9 +272,6 @@ class MaxScoreRouter(MoERouter):
         # Single temperature-scaled softmax over top-k for differentiability
         topk_soft = F.softmax(topk_vals / self.temperature, dim=dim)
 
-        # Renormalize to sum to 1 (softmax already normalizes, but for safety)
-        topk_soft = topk_soft / (topk_soft.sum(dim=dim, keepdim=True) + 1e-8)
-
         return topk_soft, topk_idx
 
     def _compute_entropy(self, scores: torch.Tensor) -> torch.Tensor:
@@ -344,7 +341,7 @@ class MaxScoreRouter(MoERouter):
         Returns:
             Tensor: Scalar zero tensor
         """
-        return torch.tensor(0.0, device=self.gate.weight.device)
+        return torch.tensor(0.0, device=self.gate.weight.device, dtype=self.gate.weight.dtype)
 
     def reset_training_state(self) -> None:
         """Reset EMA train_scores to uniform distribution."""

@@ -791,7 +791,7 @@ class MoEKernel(nn.Module):
         # 8. EMA train_scores + bias update (только во время обучения)
         if self.training:
             with torch.no_grad():
-                self.train_scores.mul_(0.9).add_(0.1 * expert_usage)
+                self.train_scores.mul_(0.9).add_(expert_usage, alpha=0.1)
                 self._update_biases(expert_usage)
 
         state = MoEKernelState(

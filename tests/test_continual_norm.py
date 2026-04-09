@@ -363,7 +363,7 @@ class TestContinualNormEdgeCases:
         norm = ContinualNorm(num_features=16)
         x = torch.randn(8)  # 1D tensor
 
-        with pytest.raises(ValueError, match="Expected 2D or 4D"):
+        with pytest.raises(ValueError, match="Expected 2D, 3D or 4D"):
             norm(x)
 
     def test_single_batch(self):
