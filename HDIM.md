@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 30.0 | Дата: 2026-03-26 | **РЕКОРД: score=1.1814** (Run 18, ep13, temp=0.10, λ_pair=0.40, margin=1.0224) | Phase 30: MoEKernel buffer fix + SoftMoERouter deadlock fix | Numerical Python verification/tests 159/159 PASS + pytest 453 PASS*
+*Версия: 30.0+ | Дата: 2026-04-09 | **РЕКОРД: score=1.1814** (Run 18, ep13, temp=0.10, λ_pair=0.40, margin=1.0224) | Phase 30+: MoEKernel + Hallucination detection + Online learning + Memory persistence | Numerical Python verification 161/163 PASS + pytest 754 PASS (10 skipped)*
 
 ---
 
@@ -72,14 +72,19 @@ $$L_{balance} = -\sum_i \sum_j sim(x_i, x_j) \cdot sim(r_i, r_j)$$
 | `InvariantExtractor` | `src/core/domain_operators.py` | Извлечение инварианта |
 | `TitansMemory` | `src/core/titans_memory.py` | Ассоциативная память |
 | `SoftMoERouter` | `src/core/soft_moe_router.py` | Мягкая маршрутизация (DEFAULT, заменил R3MoERouter) |
-| `ModularMoERouter` | `src/core/modular_moe.py` | Модульный роутер (add/remove expert) |
+| `MoEKernel` | `src/core/moe_kernel.py` | Domain эксперты (math/language/code/science) |
+| `MaxScoreRouter` | `src/core/maxscore_router.py` | Wang et al. ACL 2025 max-score routing |
+| `HallucinationDetector` | `src/core/hallucination_detector.py` | 5-signal weighted risk detection |
+| `OnlineLearner` | `src/core/online_learner.py` | Continual learning (detached/selective/full) |
+| `OnlineLoRA` | `src/core/online_lora.py` | Task-free low-rank adaptation |
+| `MemoryPersistence` | `src/core/memory_persistence.py` | Atomic checkpoint + backup rotation |
+| `MSAAttention` | `src/core/msa_attention.py` | Memory Sparse Attention |
 | `SBERTEncoder` | `src/models/sbert_encoder.py` | **Simple MLP** 768→384→256 |
 | `HDIMModel` | `src/models/hdim_model.py` | Batch-facing API |
 | `TextHDIMModel` | `src/models/text_hdim_model.py` | Text entry wrapper |
 | `build_*_model` | `src/models/model_factory.py` | Единственная точка сборки моделей |
 | `HDIMTrainer` | `src/training/trainer.py` | Focal-InfoNCE + AnglE + SupCon + HardNeg + temp scheduling |
 | `gpu_train.py` | `scripts/gpu_train.py` | Основной скрипт обучения |
-| `gen_dataset_v8.py` | `scripts/gen_dataset_v8.py` | Генератор v8 датасета (330 пар) |
 
 ### Phase 10 — Что пробовали и откачали
 
@@ -179,7 +184,7 @@ from 3:  11   24   18    5    58
 total:   55  159   66   50   330
 ```
 
-**Скрипт:** `scripts/gen_dataset_v8.py` — генерирует v8 из v7 + новые пары + негативы
+**Скрипт:** v8 legacy; текущий датасет: `data/real_pairs_v10.json`
 
 ## 6. Результаты обучения
 
@@ -844,7 +849,7 @@ Real-model benchmark (SBERT + real_pairs_v10.json, 5 эп):
 | pair_margin | 0.000 | 0.902 | ∞ |
 | train_loss (ep5) | 0.930 | 0.274 | -71% |
 
-Numerical Python verification/tests: 159/159 PASS in `verify_lean4_numerical.py`. pytest: 453 PASS (+45 moe_kernel тестов).
+Numerical Python verification/tests: 161/163 PASS in `verify_lean4_numerical.py` (2 FAIL float32 tolerance). pytest: 754 PASS (10 skipped).
 
 ### Phase 29 — TitansMemory RAG API (2026-03-19)
 
@@ -877,10 +882,26 @@ src/core/
   titans_memory.py        — TitansMemoryModule: TTT memory, RAG freeze API (Phase 29)
   soft_moe_router.py      — SoftMoERouter: SharedExpert, AuxLossFree, ExpertOrtho (Phase 26)
   moe_kernel.py           — MoEKernel: 4 domain experts 560K params (Phase 28)
-  moe_kernel_adapter.py   — MoEKernelRouterAdapter: drop-in для SoftMoERouter
+  moe_kernel_adapter.py   — MoEKernelAdapter: adapts MoEKernel to MoERouter interface
+  maxscore_router.py      — MaxScoreRouter: Wang et al. ACL 2025 routing
+  moe_interface.py        — MoERouter ABC: abstract interface for all MoE
   clifford_interaction.py — CliffordInteractionLayer: CAN-style geometric nonlinearity
   hbma_memory.py          — HBMAMemory: Working/Episodic/Semantic/Procedural (4-system)
+  msa_attention.py        — MSAAttention: top-k + chunk compression
+  hallucination_detector.py — HallucinationDetector: 5-signal weighted risk
+  hallucination_feedback.py — HallucinationFeedbackLoop: risk-based rerouting
+  semantic_entropy_probe.py — SemanticEntropyProbe: uncertainty quantification
+  online_learner.py       — OnlineLearner: continual learning with gradient modes
+  online_lora.py          — OnlineLoRA: task-free low-rank adaptation
+  continual_norm.py       — ContinualNorm: streaming normalization
+  memory_persistence.py   — MemoryPersistence: atomic checkpoint + backup rotation
+  memory_interface.py     — MemoryInterface ABC + TitansAdapter + HBMAMemoryAdapter
   hdim_pipeline.py        — HDIMPipeline (оркестрация)
+  transfer_engine.py      — TransferEngine: MoE routing + sandwich + decode
+  transfer_state.py       — TransferState dataclass
+  domain_encoder.py       — DomainEncoder: encoder + rotors + invariant extraction
+  invariant_processor.py  — InvariantProcessor: memory-based processing
+  auto_config.py          — AutoConfig: automatic parameter derivation
 
 src/models/
   hdim_model.py           — HDIMModel (batch API, domain-aware)
@@ -896,23 +917,15 @@ src/training/
 
 scripts/
   gpu_train.py            — основной скрипт (AMP, scheduler, focal_gamma, temp_schedule)
-  gen_dataset_v8.py       — генератор v8 датасета (330 пар, 35.8% neg)
-  phase17_train.bat       — Phase 17 launch script (7×P0 + 5×P1 fixes, hidden=128, T=0.15)
-  phase19_train.bat       — Phase 19 launch script (антиколлапс + v7, hidden=256)
-  phase20_train.bat       — Phase 20 launch script (DCL+Uniform+batch64+v5, цель >1.20)
-
-data/
-  real_pairs_v8.json      — 330 пар (212+ / 118-) — АКТУАЛЬНЫЙ
-  real_pairs_v7.json      — 232 пары (legacy)
-  real_pairs_v6.json      — 213 пар (legacy)
-  real_pairs_v5.json      — 175 пар (Phase 9 рекорд)
-
-  phase25_train.bat       — Phase 25b: freeze_sbert_bottom_frac + weight_decay + v10 data
-  auto_tune.py            — Auto-Tuner v26 (Optuna, study hdim_autotune_v26)
+  auto_tune.py            — Auto-Tuner (Optuna)
   autoresearch_loop.py    — Automated research with IncumbentTracker
+  moe_chat.py             — Interactive MoE kernel chat
+  compare_memory_train.py — Memory comparison training
+  benchmark_comparison.py — Benchmark comparisons
+  perf_profile.py         — Performance profiling
 
 data/
-  real_pairs_v10.json     — 1036 пар (636+ / 400-) — АКТУАЛЬНЫЙ (Phase 26)
+  real_pairs_v10.json     — 1036 пар (636+ / 400-) — АКТУАЛЬНЫЙ (Phase 26+)
   real_pairs_v8.json      — 330 пар (212+ / 118-) — legacy
   real_pairs_v7.json      — 232 пары (legacy)
   real_pairs_v6.json      — 213 пар (legacy)
@@ -983,24 +996,25 @@ python scripts\gpu_train.py ^
 
 ---
 
-## 16. Phase 26 — DomainExpertPool + SharedExpert + AuxLossFree + ExpertOrtho
+## 16. Phase 26 — MoEKernel + SharedExpert + AuxLossFree + ExpertOrtho
 
 ### 16.1 Новые компоненты
 
-#### DomainExpertPool (`src/core/domain_expert_pool.py`)
+#### MoEKernel (`src/core/moe_kernel.py`)
 
-Пул из 4 frozen SBERT-энкодеров (MiniLM family) с обучаемыми projection heads:
+Заменил DomainExpertPool — domain-specific FFN эксперты (math/language/code/science):
 
-| ID | Модель | Параметры | Назначение |
-|----|--------|-----------|------------|
-| 0 | `all-MiniLM-L6-v2` | 22M frozen | General semantics |
-| 1 | `paraphrase-MiniLM-L3-v2` | 17M frozen | Paraphrase/structural similarity |
-| 2 | `multi-qa-MiniLM-L6-cos-v1` | 22M frozen | QA/domain-crossing |
-| 3 | `all-MiniLM-L12-v2` | 33M frozen | Deep semantic analysis |
+| Expert | Активация | Особенность |
+|--------|-----------|-------------|
+| `MathExpert` | Two-level bottleneck | Арифметические паттерны |
+| `LanguageExpert` | Pre-norm | Текстовая стабильность |
+| `CodeExpert` | SiLU | Логические паттерны |
+| `ScienceExpert` | Tanh | Ограниченные физические величины |
 
-- **Общий footprint:** ~94M frozen params + ~100K trainable per expert (projection head)
-- **Архитектура projection:** `Linear → LayerNorm → GELU → Dropout(0.1) → Linear`
-- **SBERT на CPU** для экономии VRAM, только projection на GPU
+- **Параметры:** ~360K trainable (vs DomainExpertPool 94M frozen + 100K trainable)
+- **SharedExpert** (DeepSeek-V3): always-on FFN для общих паттернов
+- **AuxLossFree**: bias-based load balancing вместо auxiliary loss
+- **ExpertOrtho**: штраф за сходство весовых матриц экспертов
 
 #### SharedExpert (DeepSeek-V3)
 

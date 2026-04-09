@@ -7,11 +7,9 @@
 [![Project Status](https://img.shields.io/badge/status-active-success.svg)](https://github.com/hypercoplex/hdim/issues) • [Contributing](CONTRIBUTING.md)
 
 > **Best Score:** 1.1814 (Run 18, epoch 13, temp=0.10, lambda_pair=0.40) — `pair_margin=1.0224`, `STS=0.537`
-> **Phase 28:** MoEKernel score=1.0671 | pair_margin=0.9018 | STS=0.5512 (+355% vs SoftMoERouter baseline)
-> **Phase 29:** CliffordInteractionExpert + RAG freeze API + Security fix + Package setup
-> **Phase 30:** MoEKernel _expert_bias→buffer fix + SoftMoERouter deadlock fix
-> **Numerical validation:** 159/159 Python tests PASS | 453 pytest tests PASS
-> **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + SIMBAL + CliffordInteractionExpert
+> **Phase 30+:** MoEKernel + Hallucination detection + Online learning + Memory persistence + MaxScore routing
+> **Numerical validation:** pytest 754 PASS (10 skipped) | Lean4 161/163 PASS
+> **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + HallucinationDetector + OnlineLearner + OnlineLoRA + MaxScoreRouter + MemoryPersistence + MSAAttention
 
 ---
 
@@ -132,25 +130,25 @@ G_B = R_B ⊗ U_inv ⊗ R_B⁻¹
 
 This reconstructs the target domain representation from the invariant.
 
-### Verification: 159 Numerical Tests
+### Verification: 163 Numerical Tests (161 PASS, 2 FAIL float32)
 
 All mathematical properties are numerically verified in `verify_lean4_numerical.py` (tolerance-based Python tests):
 
 
 | Category              | Theorems | Status         |
 | --------------------- | -------- | -------------- |
-| Clifford Algebra      | 67       | ✅ PASS         |
-| Sandwich Product      | 17       | ✅ PASS         |
-| Involutions           | 16       | ✅ PASS         |
-| Domain Transfer       | 11       | ✅ PASS         |
-| HBMA Memory           | 11       | ✅ PASS         |
-| SoftMoE Router        | 10       | ✅ PASS         |
-| Matryoshka Embeddings | 7        | ✅ PASS         |
-| Quaternion Operations | 9        | ✅ PASS         |
-| Training Losses       | 5        | ✅ PASS         |
-| Memory Adapters       | 5        | ✅ PASS         |
-| **MoEKernel (Ph.28)** | **11**   | ✅ PASS         |
-| **Total**             | **159**  | **✅ ALL PASS** |
+| Clifford Algebra      | 67       | PASS           |
+| Sandwich Product      | 17       | PASS           |
+| Involutions           | 16       | PASS           |
+| Domain Transfer       | 11       | PASS           |
+| HBMA Memory           | 11       | PASS           |
+| SoftMoE Router        | 10       | PASS           |
+| Matryoshka Embeddings | 7        | PASS           |
+| Quaternion Operations | 9        | PASS           |
+| Training Losses       | 5        | PASS           |
+| Memory Adapters       | 5        | PASS           |
+| **MoEKernel (Ph.28)** | **11**   | PASS           |
+| **Total**             | **163**  | **161 PASS, 2 FAIL (float32 tolerance)** |
 
 
 ---
@@ -172,8 +170,8 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │                    ENCODING LAYER                                 │  │
 │  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐            │  │
-│  │  │ SBERTEncoder│──▶│ DomainExpert│───▶│ HDIMEncoder │            │  │
-│  │  │ (frozen)    │    │ Pool (4x)   │    │ (MLP)       │            │  │
+│  │  │ SBERTEncoder│──▶│ MoEKernel   │───▶│ HDIMEncoder │            │  │
+│  │  │ (frozen)    │    │ (4 experts) │    │ (MLP)       │            │  │
 │  │  └─────────────┘    └─────────────┘    └──────┬──────┘            │  │
 │  │                                               │                   │  │
 │  │                                               ▼                   │  │
@@ -256,15 +254,27 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 
 | Component                  | Description                                                  | File                                |
 | -------------------------- | ------------------------------------------------------------ | ----------------------------------- |
-| **CliffordAlgebra**        | Cl(3,1,0) implementation with Cayley-table geometric product | `src/core/hypercomplex.py:20`       |
-| **DomainRotationOperator** | Learnable rotor for domain transformations                   | `src/core/domain_operators.py:19`   |
-| **InvariantExtractor**     | Sandwich product: R⁻¹⊗G⊗R                                    | `src/core/domain_operators.py:54`   |
-| **TitansMemoryModule**     | Test-Time Training memory (fp32-safe)                        | `src/core/titans_memory.py:30`      |
-| **HBMAMemoryAdapter**      | 4-system memory (Working, Episodic, Semantic, Procedural)    | `src/core/hbma_memory.py:20`        |
-| **SoftMoERouter**          | Soft MoE with SharedExpert + AuxLossFree                     | `src/core/soft_moe_router.py:43`    |
-| **MoEKernel**              | Full MoE kernel: math/language/code/science domain experts   | `src/core/moe_kernel.py:213`        |
-| **DomainExpertPool**       | 4 frozen SBERT experts + trainable projections               | `src/core/domain_expert_pool.py:20` |
-| **HDIMPipeline**           | End-to-end pipeline orchestrator                             | `src/core/hdim_pipeline.py:128`     |
+| **CliffordAlgebra**        | Cl(3,1,0) implementation with Cayley-table geometric product | `src/core/hypercomplex.py`          |
+| **DomainRotationOperator** | Learnable rotor for domain transformations                   | `src/core/domain_operators.py`      |
+| **InvariantExtractor**     | Sandwich product: R⁻¹⊗G⊗R                                    | `src/core/domain_operators.py`      |
+| **TitansMemoryModule**     | Test-Time Training memory (fp32-safe)                        | `src/core/titans_memory.py`         |
+| **HBMAMemory**             | 4-system memory (Working, Episodic, Semantic, Procedural)    | `src/core/hbma_memory.py`           |
+| **SoftMoERouter**          | Soft MoE with SharedExpert + AuxLossFree                     | `src/core/soft_moe_router.py`       |
+| **MoEKernel**              | Full MoE kernel: math/language/code/science domain experts   | `src/core/moe_kernel.py`            |
+| **MaxScoreRouter**         | Wang et al. ACL 2025 max-score routing with soft top-k      | `src/core/maxscore_router.py`       |
+| **MoEKernelAdapter**       | Adapts MoEKernel to MoERouter interface                      | `src/core/moe_kernel_adapter.py`    |
+| **HDIMPipeline**           | End-to-end pipeline orchestrator                             | `src/core/hdim_pipeline.py`         |
+| **HallucinationDetector**  | 5-signal weighted risk detection (entropy, confidence, mismatch, semantic, eigen) | `src/core/hallucination_detector.py` |
+| **HallucinationFeedbackLoop** | Risk-based rerouting, confidence adjustment, memory consolidation | `src/core/hallucination_feedback.py` |
+| **SemanticEntropyProbe**   | Linear probe for uncertainty quantification (Kossen ICLR 2024) | `src/core/semantic_entropy_probe.py` |
+| **OnlineLearner**          | Continual learning with gradient modes (detached/selective/full) | `src/core/online_learner.py`       |
+| **OnlineLoRA**             | Task-free low-rank adaptation (Wei et al. WACV 2025)         | `src/core/online_lora.py`          |
+| **ContinualNorm**          | Streaming normalization without task reset                    | `src/core/continual_norm.py`       |
+| **MemoryPersistence**      | Save/load/checkpoint with atomicity and backup rotation      | `src/core/memory_persistence.py`   |
+| **MSAAttention**           | Memory Sparse Attention: top-k + chunk compression            | `src/core/msa_attention.py`        |
+| **TransferEngine**         | MoE routing + sandwich transfer + decode                      | `src/core/transfer_engine.py`      |
+| **DomainEncoder**          | Encoder + rotors + invariant extraction                       | `src/core/domain_encoder.py`       |
+| **InvariantProcessor**     | Memory-based invariant processing through MemoryInterface     | `src/core/invariant_processor.py`  |
 
 
 ### Model Layer
@@ -274,7 +284,8 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 | ----------------- | ---------------------------------------------- | ----------------------------------- |
 | **HDIMModel**     | Core HDIM model with configurable architecture | `src/models/hdim_model.py:117`      |
 | **TextHDIMModel** | Text-to-embedding wrapper                      | `src/models/text_hdim_model.py:191` |
-| **SBERTEncoder**  | Frozen SBERT encoder wrapper                   | `src/models/sbert_encoder.py:20`    |
+| **SBERTEncoder**  | Frozen SBERT encoder wrapper                   | `src/models/sbert_encoder.py`       |
+| **ModernBertEncoder** | ModernBERT with Matryoshka multi-scale     | `src/models/modern_text_encoder.py` |
 
 
 ### Training Layer
@@ -282,7 +293,7 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 
 | Component       | Description                        | File                         |
 | --------------- | ---------------------------------- | ---------------------------- |
-| **HDIMTrainer** | Full training loop with all losses | `src/training/trainer.py:19` |
+| **HDIMTrainer** | Full training loop with all losses | `src/training/trainer.py` |
 
 
 ---
@@ -320,14 +331,15 @@ Geometric product rules:
 | Loss                 | Weight | Phase | Purpose                             |
 | -------------------- | ------ | ----- | ----------------------------------- |
 | Reconstruction       | 1.0    | 1     | MSE between input and output        |
-| Isomorphism          | 0.1    | 1     | MSE between transferred and target  |
-| Focal-InfoNCE        | 0.1    | 3     | Pair discrimination with focal loss |
+| Isomorphism          | 0.0    | 1     | DISABLED: conflicts with pair_loss  |
+| InfoNCE (pair)       | 0.40   | 3     | Pair discrimination (optimal)      |
 | Routing Entropy      | 0.05   | 7     | Balanced expert utilization         |
 | Z-Loss               | 0.01   | 9     | MoE collapse prevention             |
 | Memory               | 0.05   | 6     | Titans memory consistency           |
 | DCL                  | 0.2    | 20    | Decoupled Contrastive Learning      |
 | Uniformity+Alignment | 0.1    | 20    | Representation quality              |
-| Expert Ortho         | 0.02   | 26    | Expert diversity                    |
+| Expert Ortho         | 0.01   | 26    | Expert diversity                    |
+| STS                  | 0.0    | —     | DISABLED: duplicates InfoNCE        |
 
 
 ---
@@ -518,10 +530,10 @@ python scripts/auto_tune.py \
 ### Run All Tests
 
 ```bash
-# Numerical verification (159 tests, Phase 28)
+# Numerical verification (163 tests, 161 PASS, 2 FAIL float32)
 python verify_lean4_numerical.py
 
-# pytest suite (453 tests)
+# pytest suite (754 tests PASS, 10 skipped)
 python -m pytest tests/ -v
 
 # Real-model verification (MoEKernel on SBERT + real_pairs_v10.json)
@@ -567,15 +579,27 @@ hypercoplexAI/
 │   │   ├── moe_kernel_adapter.py     # MoEKernelRouterAdapter drop-in
 │   │   ├── clifford_interaction.py   # CliffordInteractionLayer (CAN)
 │   │   ├── msa_attention.py          # MSA sparse attention
-│   │   ├── domain_expert_pool.py     # DomainExpertPool + SharedExpert
+│   │   ├── maxscore_router.py        # MaxScoreRouter (Wang ACL 2025)
+│   │   ├── hallucination_detector.py # HallucinationDetector (5-signal)
+│   │   ├── hallucination_feedback.py # HallucinationFeedbackLoop
+│   │   ├── semantic_entropy_probe.py # SemanticEntropyProbe
+│   │   ├── online_learner.py         # OnlineLearner (continual learning)
+│   │   ├── online_lora.py            # OnlineLoRA (task-free LoRA)
+│   │   ├── continual_norm.py        # ContinualNorm (streaming norm)
+│   │   ├── memory_persistence.py     # MemoryPersistence (atomic checkpoint)
 │   │   ├── memory_interface.py       # MemoryInterface ABC
-│   │   ├── transfer_engine.py        # Transfer engine
+│   │   ├── transfer_engine.py        # TransferEngine
 │   │   ├── transfer_state.py         # TransferState dataclass
+│   │   ├── domain_encoder.py         # DomainEncoder
+│   │   ├── invariant_processor.py   # InvariantProcessor
+│   │   ├── moe_interface.py          # MoERouter ABC
 │   │   └── auto_config.py            # AutoConfig utilities
 │   ├── models/
 │   │   ├── hdim_model.py        # HDIMModel, HDIMConfig
 │   │   ├── text_hdim_model.py   # TextHDIMModel
 │   │   ├── sbert_encoder.py     # SBERTEncoder wrapper
+│   │   ├── modern_text_encoder.py # ModernBertEncoder, GatedMLPEncoder, HybridEncoder
+│   │   ├── metrics.py           # compute_all_metrics, analogy_feasibility_rate
 │   │   └── model_factory.py     # build_*() functions
 │   └── training/
 │       ├── trainer.py           # HDIMTrainer (all losses)
@@ -597,12 +621,26 @@ hypercoplexAI/
 │   ├── test_msa_attention.py         # MSA sparse attention
 │   ├── test_memory_interface.py      # Memory ABC
 │   ├── test_memory_comparison.py     # Memory comparison
+│   ├── test_memory_persistence.py   # MemoryPersistence
 │   ├── test_augmentation.py          # Embedding augmentations
 │   ├── test_auto_config.py           # AutoConfig
 │   ├── test_nan_inf_forward.py       # NaN/Inf protection
 │   ├── test_matryoshka_modernbert.py # Matryoshka + ModernBERT
+│   ├── test_hallucination_detector.py # HallucinationDetector
+│   ├── test_hallucination_feedback.py # HallucinationFeedbackLoop
+│   ├── test_semantic_entropy_probe.py # SemanticEntropyProbe
+│   ├── test_online_learner_gradient.py # OnlineLearner
+│   ├── test_online_lora.py           # OnlineLoRA
+│   ├── test_continual_norm.py       # ContinualNorm
+│   ├── test_maxscore_router.py      # MaxScoreRouter
+│   ├── test_production_benchmark.py  # Production benchmarks
+│   ├── test_multi_worker.py         # Multi-worker training
+│   ├── test_kernel_chat.py          # Interactive kernel chat
+│   ├── test_router.py               # Router variants
+│   ├── test_checkpoint_variants.py  # Checkpoint loading
+│   ├── test_all_modules.py          # Full module smoke test
 │   └── test_triton_performance.py    # Triton kernel benchmarks
-│   # Total: 453 tests PASS
+│   # Total: 754 tests PASS (10 skipped)
 ├── docs/
 │   ├── ARCHITECTURE.md          # Full architecture documentation
 │   └── DIAGRAMS.md              # Mermaid diagrams
@@ -707,14 +745,20 @@ training_config = {
 ### Code References
 
 
-| Component         | File                             | Key Lines |
-| ----------------- | -------------------------------- | --------- |
-| Geometric Product | `src/core/hypercomplex.py`       | L20-150   |
-| Sandwich Product  | `src/core/domain_operators.py`   | L54-103   |
-| SoftMoE Router    | `src/core/soft_moe_router.py`    | L43-250   |
-| Shared Expert     | `src/core/domain_expert_pool.py` | L115-180  |
-| Titans Memory     | `src/core/titans_memory.py`      | L30-200   |
-| HBMA Adapter      | `src/core/hbma_memory.py`        | L20-150   |
+| Component            | File                                  |
+| -------------------- | ------------------------------------- |
+| Geometric Product    | `src/core/hypercomplex.py`            |
+| Sandwich Product     | `src/core/domain_operators.py`        |
+| SoftMoE Router       | `src/core/soft_moe_router.py`         |
+| MoEKernel            | `src/core/moe_kernel.py`              |
+| Shared Expert        | `src/core/moe_kernel.py` (use_shared_expert) |
+| Titans Memory        | `src/core/titans_memory.py`           |
+| HBMA Adapter         | `src/core/hbma_memory.py`             |
+| Hallucination Detect | `src/core/hallucination_detector.py`  |
+| Online Learning      | `src/core/online_learner.py`          |
+| Memory Persistence   | `src/core/memory_persistence.py`      |
+| MaxScore Router      | `src/core/maxscore_router.py`         |
+| MSA Attention        | `src/core/msa_attention.py`           |
 
 
 ---
@@ -723,7 +767,7 @@ training_config = {
 
 ### Anti-Patterns (Do NOT)
 
-- ❌ `ModularMoERouter` — removed; use `SoftMoERouter`
+- ❌ `ModularMoERouter` — removed; use `MoEKernel` or `SoftMoERouter`
 - ❌ `reset_memory('zero')` — use `reset_memory('geometric')`
 - ❌ `batch_size < 32` — InfoNCE requires sufficient negatives
 - ❌ `temperature < 0.07` — causes overconfidence, gradient instability (optimal: 0.10)
@@ -801,4 +845,4 @@ torch.load RCE vulnerability patched — weights_only=True enforced.
 
 ---
 
-*Last updated: 2026-03-26 | Phase 30 Complete | Research prototype — API may evolve*
+*Last updated: 2026-04-09 | Phase 30+ | Research prototype — API may evolve*

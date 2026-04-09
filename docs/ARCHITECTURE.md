@@ -1,9 +1,9 @@
 # HDIM Architecture Documentation
 
-> **Дата:** 2026-03-26
-> **Версия:** Research Prototype (Phase 30)
+> **Дата:** 2026-04-09
+> **Версия:** Research Prototype (Phase 30+)
 > **Источники:** Исследовательские отчёты в `[.omc/research/](../.omc/research/)`
-> **Verification:** Numerical Python verification/tests 159/159 PASS (`verify_lean4_numerical.py`) | pytest 453 PASS
+> **Verification:** pytest 754 PASS (10 skipped) | Lean4 161/163 PASS
 
 ---
 
@@ -19,6 +19,8 @@
 8. [Публичный API](#8-публичный-api)
 9. [Конфигурации](#9-конфигурации)
 10. [Stable vs Experimental](#10-stable-vs-experimental)
+11. [Hallucination & Safety Subsystem](#11-hallucination--safety-subsystem)
+12. [Online Learning Subsystem](#12-online-learning-subsystem)
 
 ---
 
@@ -44,71 +46,104 @@
 | PRIMARY score     | `pair_margin × 1.0 + STS_exported × 0.3` | Целевая метрика                   |
 
 
-**Лучший результат:** 1.1814 (Run 18, ep13, temp=0.10, λ_pair=0.40): `pair_margin=1.0224`, `STS=0.537`
+**Лучший результат:** 1.1814 (Run 18, ep13, temp=0.10, lambda_pair=0.40): `pair_margin=1.0224`, `STS=0.537`
 
 ---
 
 ## 2. Слойная архитектура
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         HYPERCOREPLEX AI (HDIM)                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Scripts Layer                                                          │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐          │
-│  │  gpu_train.py   │  │    train.py     │  │   hdim_demo.py  │          │
-│  │  (AMP, GPU)     │  │  (CLI entry)    │  │  (demos)        │          │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘          │
-│           │                    │                    │                   │
-├───────────┼────────────────────┼────────────────────┼───────────────────┤
-│  Training Layer                                                         │
-│  ┌────────┴───────┐    ┌───────┴────────┐   ┌───────┴────────┐          │
-│  │  HDIMTrainer   │    │ ExperimentRun  │   │   Datasets     │          │
-│  │  (losses, AMP) │    │  (orchestr.)   │   │(DomainProblem) │          │
-│  └────────┬───────┘    └────────────────┘   └────────────────┘          │
-│           │                                                             │
-├───────────┼─────────────────────────────────────────────────────────────┤
-│  Model Layer                                                            │
-│  ┌────────┴────────┐  ┌─────────────────┐  ┌─────────────────┐          │
-│  │  HDIMModel      │  │ TextHDIMModel   │  │ SBERTEncoder    │          │
-│  │  (core wrapper) │◄─┤ (text wrapper)  │◄─┤ (frozen encoder)│          │
-│  └────────┬────────┘  └─────────────────┘  └─────────────────┘          │
-│           │              ┌─────────────────┐                            │
-│           └──────────────┤ model_factory   │                            │
-│                          │ (build_*)       │                            │
-│                          └─────────────────┘                            │
-├───────────┼─────────────────────────────────────────────────────────────┤
-│  Core Layer                                                             │
-│  ┌────────┴────────┐                                                    │
-│  │  HDIMPipeline   │                                                    │
-│  │  (orchestrator) │                                                    │
-│  └────────┬────────┘                                                    │
-│           │                                                             │
-│  ┌────────┴────────┬─────────────────┬─────────────────┐                │
-│  │ hypercomplex.py │domain_operators │  titans_memory  │                │
-│  │ (CliffordAlgebra│(DomainRotor,    │  (TTT memory)   │                │
-│  │  Quaternion)    │ InvariantExtr.) │                 │                │
-│  └─────────────────┴─────────────────┴─────────────────┘                │
-│           │                                                             │
-│  ┌────────┴────────┬─────────────────┬─────────────────┐                │
-│  │ soft_moe_router │domain_expert_pool│  hdim_pipeline  │               │
-│  │ (SoftMoE,       │ (4 frozen SBERT │  (HDIMEncoder,  │                │
-│  │  SharedExpert,  │  + projection)  │   HDIMDecoder)  │                │
-│  │  AuxLossFree,   │                 │                 │                │
-│  │  ExpertOrtho)   │                 │                 │                │
-│  └─────────────────┴─────────────────┴─────────────────┘                │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                            HYPERCOREPLEX AI (HDIM)                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  Scripts Layer (20 entrypoints)                                                 │
+│  ┌───────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐     │
+│  │ gpu_train.py  │ │moe_chat.py   │ │auto_tune.py  │ │benchmark_comparison│     │
+│  │ (AMP, GPU)    │ │(interactive) │ │(Optuna)      │ │(MoE vs FFN vs SBERT│     │
+│  └───────┬───────┘ └──────┬───────┘ └──────┬───────┘ └────────┬───────────┘     │
+│          └────────────────┼────────────────┼──────────────────┘                 │
+├───────────────────────────┼────────────────┼────────────────────────────────────┤
+│  Training Layer                                                                 │
+│  ┌────────┴───────┐    ┌───────┴────────┐   ┌────────────────┐                  │
+│  │  HDIMTrainer   │    │ ExperimentRun  │   │   Datasets     │                  │
+│  │  (losses, AMP) │    │  (orchestr.)   │   │(DomainProblem) │                  │
+│  └────────┬───────┘    └────────────────┘   └────────────────┘                  │
+│           │                                                                     │
+├───────────┼─────────────────────────────────────────────────────────────────────┤
+│  Model Layer                                                                    │
+│  ┌────────┴────────┐  ┌─────────────────┐  ┌─────────────────┐                  │
+│  │  HDIMModel      │  │ TextHDIMModel   │  │ SBERTEncoder    │                  │
+│  │  (core wrapper) │◄─┤ (text wrapper)  │◄─┤ (frozen encoder)│                  │
+│  └────────┬────────┘  └─────────────────┘  └─────────────────┘                  │
+│           │              ┌─────────────────┐                                    │
+│           └──────────────┤ model_factory   │                                    │
+│                          │ (build_*)       │                                  │
+│                          └─────────────────┘                                  │
+├───────────┼───────────────────────────────────────────────────────────────────┤
+│  Core Layer                                                                   │
+│  ┌────────┴────────┐                                                           │
+│  │  HDIMPipeline   │                                                           │
+│  │  (orchestrator) │                                                           │
+│  └────────┬────────┘                                                           │
+│           │                                                                    │
+│  ┌────────┴────────┬──────────────────┬──────────────────┐                    │
+│  │ hypercomplex.py │domain_operators  │  hdim_pipeline   │                    │
+│  │ (CliffordAlgebra│(DomainRotor,     │ (HDIMEncoder,    │                    │
+│  │  Quaternion)     │ InvariantExtr.)  │  HDIMDecoder)    │                    │
+│  └─────────────────┴──────────────────┴──────────────────┘                    │
+│           │                                                                    │
+│  ┌────────┴────────┬──────────────────┬──────────────────┐                    │
+│  │ soft_moe_router │   moe_kernel     │  moe_interface   │                    │
+│  │ (SoftMoE,       │ (4 named experts │  (MoERouter ABC) │                    │
+│  │  SharedExpert,  │  560K params)    │                  │                    │
+│  │  AuxLossFree,   │                  │                  │                    │
+│  │  ExpertOrtho)   │                  │                  │                    │
+│  └─────────────────┴──────────────────┴──────────────────┘                    │
+│  ┌─────────────────┬──────────────────┬──────────────────┐                    │
+│  │maxscore_router  │moe_kernel_adapter│  hbma_memory     │                    │
+│  │ (Wang ACL 2025, │ (MoEKernel→      │ (4-system brain: │                    │
+│  │  min-cost flow)  │  MoERouter)      │  Working/Episodic│                    │
+│  │                 │                  │  /Semantic/Proc.)│                    │
+│  └─────────────────┴──────────────────┴──────────────────┘                    │
+│  ┌─────────────────┬──────────────────┬──────────────────┐                    │
+│  │ msa_attention   │memory_interface  │memory_persistence│                    │
+│  │ (MSA Sparse     │ (MemoryInterface │ (save/load/      │                    │
+│  │  Index, top-k,  │  ABC, TitansAdpt │  checkpoint,     │                    │
+│  │  chunk compress)│  HBMAMemoryAdpt) │  atomic backup)  │                    │
+│  └─────────────────┴──────────────────┴──────────────────┘                    │
+│  ┌─────────────────┬──────────────────┬──────────────────┐                    │
+│  │transfer_engine  │ domain_encoder   │invariant_processor│                   │
+│  │ (MoE+sandwich+  │ (encoder+rotors+ │ (memory-based    │                    │
+│  │  decode)         │  inv. extraction)│  processing)     │                    │
+│  └─────────────────┴──────────────────┴──────────────────┘                    │
+│  ┌─────────────────┬──────────────────┬──────────────────┐                    │
+│  │transfer_state   │ online_learner   │  online_lora     │                    │
+│  │ (cross-domain   │ (continual learn,│ (task-free LoRA, │                    │
+│  │  state dataclass│  3 grad modes)   │  Linear+Conv2d)  │                    │
+│  └─────────────────┴──────────────────┴──────────────────┘                    │
+│  ┌─────────────────┬──────────────────┬──────────────────┐                    │
+│  │ continual_norm  │hallucination_    │hallucination_    │                    │
+│  │ (streaming norm │ detector         │ feedback         │                    │
+│  │  stability)     │ (5-signal risk)  │ (risk rerouting) │                    │
+│  └─────────────────┴──────────────────┴──────────────────┘                    │
+│  ┌─────────────────┐                                                        │
+│  │semantic_entropy │                                                        │
+│  │ _probe          │                                                        │
+│  │ (uncertainty    │                                                        │
+│  │  quantification)│                                                        │
+│  └─────────────────┘                                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Таблица слоёв
 
 
-| Слой         | Файлы                                                                                                                           | Ответственность                        | Публичный API                             |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- | ----------------------------------------- |
-| **Scripts**  | `[scripts/gpu_train.py](../scripts/gpu_train.py)`, `[scripts/train.py](../scripts/train.py)`, `[hdim_demo.py](../hdim_demo.py)` | Entrypoints, CLI, GPU training         | `main()`, `demo_*()`                      |
-| **Training** | `[src/training/*.py](../src/training/)`                                                                                         | Losses, regimes, datasets, checkpoints | `HDIMTrainer`, `ExperimentRunner`         |
-| **Model**    | `[src/models/*.py](../src/models/)`                                                                                             | Wrappers, encoders, factories, metrics | `HDIMModel`, `TextHDIMModel`, `build_*()` |
-| **Core**     | `[src/core/*.py](../src/core/)`                                                                                                 | Алгебра, память, роутинг, pipeline     | `HDIMPipeline`, `CliffordAlgebra`         |
+| Слой         | Файлы                                          | Ответственность                                    | Публичный API                             |
+| ------------ | ---------------------------------------------- | -------------------------------------------------- | ----------------------------------------- |
+| **Scripts**  | `[scripts/*.py](../scripts/)` (20 entrypoints) | Entrypoints, CLI, GPU training, benchmarks, demos  | `main()`, `demo_*()`                      |
+| **Training** | `[src/training/*.py](../src/training/)`        | Losses, regimes, datasets, checkpoints             | `HDIMTrainer`, `ExperimentRunner`         |
+| **Model**    | `[src/models/*.py](../src/models/)`            | Wrappers, encoders, factories, metrics             | `HDIMModel`, `TextHDIMModel`, `build_*()` |
+| **Core**     | `[src/core/*.py](../src/core/)` (25 модулей)   | Алгебра, память, роутинг, pipeline, safety, online | `HDIMPipeline`, `CliffordAlgebra`         |
 
 
 ---
@@ -118,26 +153,52 @@
 ### 3.1 Обзор модулей
 
 
-| Модуль                                                       | Класс                    | Назначение                                                                 | Статус     |
-| ------------------------------------------------------------ | ------------------------ | -------------------------------------------------------------------------- | ---------- |
-| `[hypercomplex.py](../src/core/hypercomplex.py)`             | `CliffordAlgebra`        | Алгебра Клиффорда Cl_{p,q,r}                                               | **Stable** |
-|                                                              | `QuaternionLinear`       | Кватернионный слой                                                         | **Stable** |
-|                                                              | `PHMLinear`              | Parameterized Hypercomplex                                                 | *Удалён*   |
-| `[domain_operators.py](../src/core/domain_operators.py)`     | `DomainRotationOperator` | Обучаемый ротор домена                                                     | **Stable** |
-|                                                              | `InvariantExtractor`     | Извлечение U_inv = R⁻¹GR                                                   | **Stable** |
-|                                                              | `DomainRegistry`         | Реестр доменов                                                             | **Stable** |
-| `[titans_memory.py](../src/core/titans_memory.py)`           | `TitansMemoryModule`     | Test-Time Training память                                                  | **Stable** |
-| `[soft_moe_router.py](../src/core/soft_moe_router.py)`       | `SoftMoERouter`          | Soft Mixture-of-Experts (Phase 26: SharedExpert, AuxLossFree, ExpertOrtho) | **Stable** |
-| `[moe_kernel.py](../src/core/moe_kernel.py)`                 | `MoEKernel`              | 4 доменных эксперта (math/language/code/science), 560K params, Phase 28    | **Stable** |
-|                                                              | `MoEKernelConfig`        | Dataclass конфигурации MoE-ядра                                             | **Stable** |
-|                                                              | `MoEKernelState`         | State-контейнер forward-прохода                                             | **Stable** |
-| `[domain_expert_pool.py](../src/core/domain_expert_pool.py)` | `DomainExpertPool`       | Пул из 4 frozen SBERT экспертов с trainable projections                    | **Stable** |
-|                                                              | `SharedExpert`           | Always-on FFN (DeepSeek-V3)                                                | **Stable** |
-|                                                              | `ExpertProjection`       | Trainable projection head                                                  | **Stable** |
-| `[hdim_pipeline.py](../src/core/hdim_pipeline.py)`           | `HDIMPipeline`           | Главный orchestrator                                                       | **Stable** |
-|                                                              | `HDIMEncoder`            | Кодирование → мультивектор                                                 | **Stable** |
-|                                                              | `HDIMDecoder`            | Мультивектор → выход                                                       | **Stable** |
-|                                                              | `TransferState`          | State-контейнер                                                            | **Stable** |
+| Модуль                                                               | Класс                        | Назначение                                                                     | Статус     |
+| -------------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------ | ---------- |
+| `[hypercomplex.py](../src/core/hypercomplex.py)`                     | `CliffordAlgebra`            | Алгебра Клиффорда Cl_{p,q,r}                                                   | **Stable** |
+|                                                                      | `QuaternionLinear`           | Кватернионный слой                                                             | **Stable** |
+| `[domain_operators.py](../src/core/domain_operators.py)`             | `DomainRotationOperator`     | Обучаемый ротор домена                                                         | **Stable** |
+|                                                                      | `InvariantExtractor`         | Извлечение U_inv = R⁻¹GR                                                       | **Stable** |
+|                                                                      | `DomainRegistry`             | Реестр доменов                                                                 | **Stable** |
+| `[titans_memory.py](../src/core/titans_memory.py)`                   | `TitansMemoryModule`         | Test-Time Training память                                                      | **Stable** |
+| `[soft_moe_router.py](../src/core/soft_moe_router.py)`               | `SoftMoERouter`              | Soft Mixture-of-Experts (SharedExpert, AuxLossFree, ExpertOrtho)               | **Stable** |
+| `[moe_kernel.py](../src/core/moe_kernel.py)`                         | `MoEKernel`                  | 4 доменных эксперта (math/language/code/science), 560K params                  | **Stable** |
+|                                                                      | `MoEKernelConfig`            | Dataclass конфигурации MoE-ядра                                                | **Stable** |
+|                                                                      | `MoEKernelState`             | State-контейнер forward-прохода                                                | **Stable** |
+| `[moe_interface.py](../src/core/moe_interface.py)`                   | `MoERouter` ABC              | Абстрактный интерфейс роутера (forward, get_expert_load, ortho_loss)           | **Stable** |
+| `[moe_kernel_adapter.py](../src/core/moe_kernel_adapter.py)`         | `MoEKernelAdapter`           | Адаптер MoEKernel → MoERouter interface                                        | **Stable** |
+| `[maxscore_router.py](../src/core/maxscore_router.py)`               | `MaxScoreRouter`             | Maximum Score Routing (Wang et al. ACL 2025), min-cost max-flow, SoftTopk      | **Stable** |
+| `[msa_attention.py](../src/core/msa_attention.py)`                   | `MSASparseIndex`             | Memory Sparse Attention: top-k + chunk compression, O(log N) retrieval         | **Stable** |
+|                                                                      | `MSAOverflowBuffer`          | MSA-backed overflow для EpisodicMemory, multi-hop retrieval                    | **Stable** |
+|                                                                      | `MSAAugmentedSemanticMemory` | SemanticMemory с опциональным MSA sparse retrieval                             | **Stable** |
+| `[hbma_memory.py](../src/core/hbma_memory.py)`                       | `HBMAMemory`                 | 4-system brain-inspired: Working/Episodic/Semantic/Procedural                  | **Stable** |
+|                                                                      | `WorkingMemory`              | Круговой буфер, salience-filtered attention                                    | **Stable** |
+|                                                                      | `EpisodicMemory`             | Surprise-gated binding, temporal ordering, overflow                            | **Stable** |
+|                                                                      | `SemanticMemory`             | EMA prototypes + confidence + MSA sparse retrieval                             | **Stable** |
+|                                                                      | `ProceduralMemory`           | Learnable pattern store, trigger detection                                     | **Stable** |
+|                                                                      | `ConsolidationEngine`        | Working→Episodic→Semantic pipeline                                             | **Stable** |
+|                                                                      | `CLSMemory`                  | Обратная совместимость (alias HBMAMemory)                                      | **Stable** |
+| `[memory_interface.py](../src/core/memory_interface.py)`             | `MemoryInterface` ABC        | Unified memory contract: forward, reset, memory_loss                           | **Stable** |
+|                                                                      | `TitansAdapter`              | TitansMemoryModule → MemoryInterface                                           | **Stable** |
+|                                                                      | `HBMAMemoryAdapter`          | HBMAMemory → MemoryInterface                                                   | **Stable** |
+| `[memory_persistence.py](../src/core/memory_persistence.py)`         | `MemoryPersistence`          | Save/load/checkpoint с atomicity и backup rotation                             | **Stable** |
+| `[online_learner.py](../src/core/online_learner.py)`                 | `OnlineLearner`              | Continual learning: TTT-style, replay buffer, 3 gradient modes                 | **Stable** |
+| `[online_lora.py](../src/core/online_lora.py)`                       | `OnlineLoRA`                 | Task-free low-rank adaptation для Linear и Conv2d                              | **Stable** |
+|                                                                      | `OnlineLoRALinear`           | Convenience wrapper для nn.Linear                                              | **Stable** |
+|                                                                      | `OnlineLoRAConv`             | Convenience wrapper для nn.Conv2d                                              | **Stable** |
+|                                                                      | `OnlineLoRAManager`          | Координация: batch EMA, consolidation, stats                                   | **Stable** |
+| `[continual_norm.py](../src/core/continual_norm.py)`                 | `ContinualNorm`              | Streaming normalization без task reset (IL-ETransformer)                       | **Stable** |
+|                                                                      | `ContinualNormLayer`         | LayerNorm alternative с continual EMA monitoring                               | **Stable** |
+| `[hallucination_detector.py](../src/core/hallucination_detector.py)` | `HallucinationDetector`      | 5-signal weighted risk: entropy+confidence+mismatch+eigen+semantic             | **Stable** |
+| `[hallucination_feedback.py](../src/core/hallucination_feedback.py)` | `HallucinationFeedbackLoop`  | Risk-based rerouting, confidence adjustment, memory consolidation trigger      | **Stable** |
+| `[semantic_entropy_probe.py](../src/core/semantic_entropy_probe.py)` | `SemanticEntropyProbe`       | Linear probe для uncertainty quantification (Kossen ICLR 2024)                 | **Stable** |
+| `[transfer_engine.py](../src/core/transfer_engine.py)`               | `TransferEngine`             | MoE routing + sandwich transfer + decode, инкапсуляция кроссдоменного переноса | **Stable** |
+| `[domain_encoder.py](../src/core/domain_encoder.py)`                 | `DomainEncoder`              | Encoder + rotors + invariant extraction + normalization                        | **Stable** |
+| `[invariant_processor.py](../src/core/invariant_processor.py)`       | `InvariantProcessor`         | Memory-based обработка инвариантов через MemoryInterface                       | **Stable** |
+| `[transfer_state.py](../src/core/transfer_state.py)`                 | `TransferState`              | Dataclass состояния кроссдоменного переноса                                    | **Stable** |
+| `[hdim_pipeline.py](../src/core/hdim_pipeline.py)`                   | `HDIMPipeline`               | Главный orchestrator                                                           | **Stable** |
+|                                                                      | `HDIMEncoder`                | Кодирование → мультивектор                                                     | **Stable** |
+|                                                                      | `HDIMDecoder`                | Мультивектор → выход                                                           | **Stable** |
 
 
 ### 3.2 CliffordAlgebra
@@ -274,11 +335,11 @@ if self.use_shared_expert:
 **Phase 26 нововведения:**
 
 
-| Фича                                 | Описание                                          | Включение                        |
-| ------------------------------------ | ------------------------------------------------- | -------------------------------- |
-| Shared Expert (DeepSeek-V3)          | Always-on FFN обрабатывает ВСЕ входы              | `enable_shared_expert()`         |
-| AuxLoss-Free Balancing (DeepSeek-V3) | Per-expert bias для динамической балансировки     | `enable_aux_loss_free(lr=0.001)` |
-| Expert Orthogonalization             | `L_o = ||W1 @ W1^T - I||^2 + ||W2 @ W2^T - I||^2` | `enable_expert_ortho()`          |
+| Фича                                 | Описание                                      | Включение                        |
+| ------------------------------------ | --------------------------------------------- | -------------------------------- |
+| Shared Expert (DeepSeek-V3)          | Always-on FFN обрабатывает ВСЕ входы          | `enable_shared_expert()`         |
+| AuxLoss-Free Balancing (DeepSeek-V3) | Per-expert bias для динамической балансировки | `enable_aux_loss_free(lr=0.001)` |
+| Expert Orthogonalization             | `L_o =                                        |                                  |
 
 
 **Phase 26 удаления:**
@@ -288,45 +349,297 @@ if self.use_shared_expert:
 - `similarity_preserving_loss` — заменён на AuxLossFree
 - `experts` ModuleList — заменён на batched einsum со stacked weights (`W1_stack`, `W2_stack`, `b1_stack`, `b2_stack`)
 
-### 3.7 DomainExpertPool
+### 3.7 MoEKernel
 
-**Файл:** `[src/core/domain_expert_pool.py:20](../src/core/domain_expert_pool.py:20)`
+**Файл:** `[src/core/moe_kernel.py](../src/core/moe_kernel.py)`
 
-**Назначение:** Пул из 4 frozen SBERT-энкодеров (MiniLM family) с обучаемыми projection heads.
-
-
-| ID  | Модель                      | Параметры  | Назначение                       |
-| --- | --------------------------- | ---------- | -------------------------------- |
-| 0   | `all-MiniLM-L6-v2`          | 22M frozen | General semantics                |
-| 1   | `paraphrase-MiniLM-L3-v2`   | 17M frozen | Paraphrase/structural similarity |
-| 2   | `multi-qa-MiniLM-L6-cos-v1` | 22M frozen | QA/domain-crossing               |
-| 3   | `all-MiniLM-L12-v2`         | 33M frozen | Deep semantic analysis           |
-
-
-**Общий footprint:** ~94M frozen params + ~100K trainable per expert.
+**Назначение:** 4 именованных доменных эксперта (math/language/code/science) с 560K параметров. Заменяет удалённый `DomainExpertPool`.
 
 **Ключевые классы:**
 
 
-| Класс              | Назначение                                     |
-| ------------------ | ---------------------------------------------- |
-| `DomainExpertPool` | Управление пулом экспертов, forward, routing   |
-| `DomainExpert`     | Один frozen SBERT + trainable projection       |
-| `ExpertProjection` | `Linear → LayerNorm → GELU → Dropout → Linear` |
-| `SharedExpert`     | Always-on FFN (DeepSeek-V3 pattern)            |
+| Класс             | Назначение                                           |
+| ----------------- | ---------------------------------------------------- |
+| `MoEKernel`       | MoE ядро с named domain experts                      |
+| `MoEKernelConfig` | Dataclass конфигурации (input_dim, num_experts, ...) |
+| `MoEKernelState`  | State-контейнер forward-прохода                      |
 
+
+### 3.8 MoERouter ABC
+
+**Файл:** `[src/core/moe_interface.py](../src/core/moe_interface.py)`
+
+**Назначение:** Абстрактный интерфейс для всех MoE-роутеров. Обеспечивает полиморфное использование SoftMoERouter, MoEKernel (через адаптер) и MaxScoreRouter.
+
+**Абстрактные методы:**
+
+
+| Метод                             | Сигнатура                  | Описание                   |
+| --------------------------------- | -------------------------- | -------------------------- |
+| `forward(x)`                      | `(Tensor, Dict[str, Any])` | Route input через эксперты |
+| `get_expert_load()`               | `Tensor[num_experts]`      | EMA load статистика        |
+| `expert_orthogonalization_loss()` | `Tensor`                   | Loss за диверсификацию     |
+
+
+### 3.9 MoEKernelAdapter
+
+**Файл:** `[src/core/moe_kernel_adapter.py](../src/core/moe_kernel_adapter.py)`
+
+**Назначение:** Адаптер, оборачивающий `MoEKernel` в интерфейс `MoERouter`. Переводит `MoEKernelState` → `Dict[str, Any]`, позволяя MoEKernel использоваться везде, где ожидается MoERouter.
+
+### 3.10 MaxScoreRouter
+
+**Файл:** `[src/core/maxscore_router.py](../src/core/maxscore_router.py)`
+
+**Назначение:** Maximum Score Routing (Wang et al., ACL 2025). Моделирует routing как min-cost max-flow задачу. SoftTopk оператор обеспечивает дифференцируемый top-k selection без token dropping.
+
+**Отличие от SoftMoERouter:**
+
+- SoftMoE: каждый токен использует ВСЕ эксперты через dispatch/combine
+- MaxScore: каждый токен использует top-k экспертов, но selection дифференцируем
+
+**Ключевые фичи:**
+
+- 0% token dropping
+- Дифференцируемый top-k через SoftTopk
+- Load balancing через entropy regularization
+- Checkpoint/rollback для fault tolerance
+
+### 3.11 MSAAttention (Memory Sparse Attention)
+
+**Файл:** `[src/core/msa_attention.py](../src/core/msa_attention.py)`
+
+**Назначение:** Sparse Index для SemanticMemory. Иерархическая компрессия и sparse retrieval.
+
+**Ключевые классы:**
+
+
+| Класс                        | Назначение                                                           |
+| ---------------------------- | -------------------------------------------------------------------- |
+| `MSAConfig`                  | Конфигурация: dim, top_k, chunk_size, num_heads, temperature         |
+| `MSASparseIndex`             | Router projectors (W_KR, W_QR) + top-k selection + chunk compression |
+| `MSAOverflowBuffer`          | MSA-backed overflow для EpisodicMemory, multi-hop retrieval          |
+| `MSAAugmentedSemanticMemory` | SemanticMemory с опциональным MSA sparse retrieval (drop-in)         |
+
+
+**Алгоритм MSA:**
+
+```
+KR = H @ W_KR    # Router K Projector
+QR = H @ W_QR    # Router Q Projector
+si = max_token(mean_head(cos(QR, KR)))  # routing scores
+I = Top-k({si})  # sparse selection
+compressed = mean_pool(P=64)  # chunk compression
+```
+
+**Результат:** O(log N) retrieval вместо O(N) dense cosine similarity.
+
+### 3.12 HBMAMemory
+
+**Файл:** `[src/core/hbma_memory.py](../src/core/hbma_memory.py)`
+
+**Назначение:** 4-system brain-inspired memory (McClelland et al. 1995). Drop-in замена для TitansMemory.
+
+**Подсистемы:**
+
+
+| Подсистема        | Класс              | Аналог              | Назначение                                |
+| ----------------- | ------------------ | ------------------- | ----------------------------------------- |
+| Working Memory    | `WorkingMemory`    | Prefrontal cortex   | Круговой буфер, salience-filtered context |
+| Episodic Memory   | `EpisodicMemory`   | Hippocampus CA3/CA1 | Surprise-gated binding, temporal ordering |
+| Semantic Memory   | `SemanticMemory`   | Neocortex           | EMA prototypes + confidence + MSA sparse  |
+| Procedural Memory | `ProceduralMemory` | Basal ganglia       | Learnable patterns, trigger detection     |
+
+
+**Дополнительные компоненты:**
+
+
+| Компонент               | Назначение                                                 |
+| ----------------------- | ---------------------------------------------------------- |
+| `ConsolidationEngine`   | Working→Episodic→Semantic pipeline                         |
+| `SalienceScorer`        | Multi-factor: similarity+recency+frequency+importance+type |
+| `MemorySubsystemPlugin` | ABC для расширения 5-й подсистемой                         |
+| `CLSMemory`             | Обратная совместимость (alias HBMAMemory)                  |
+
+
+### 3.13 MemoryInterface
+
+**Файл:** `[src/core/memory_interface.py](../src/core/memory_interface.py)`
+
+**Назначение:** Unified memory contract. Bridges TitansMemoryModule (k, v API) и HBMAMemory (single-input API) через общий ABC.
+
+**Ключевые классы:**
+
+
+| Класс                 | Назначение                                                 |
+| --------------------- | ---------------------------------------------------------- |
+| `MemoryResult`        | Dataclass: output, loss, updated, alpha/eta/theta/surprise |
+| `MemoryInterface` ABC | forward(x, update_memory) → MemoryResult                   |
+| `TitansAdapter`       | TitansMemoryModule → MemoryInterface                       |
+| `HBMAMemoryAdapter`   | HBMAMemory → MemoryInterface                               |
+
+
+### 3.14 MemoryPersistence
+
+**Файл:** `[src/core/memory_persistence.py](../src/core/memory_persistence.py)`
+
+**Назначение:** Save/load/checkpoint для HDIM memory систем.
+
+**Поддерживаемые типы:** TitansMemoryModule, HBMAMemory/CLSMemory, TitansAdapter, HBMAMemoryAdapter.
 
 **Ключевые методы:**
 
 
-| Метод                                          | Описание                             |
-| ---------------------------------------------- | ------------------------------------ |
-| `forward_all_experts(texts, device)`           | Stack всех экспертов: `(E, B, D)`    |
-| `forward_with_routing(texts, weights, device)` | Weighted combination + shared expert |
-| `precompute_cache(texts)`                      | Предвычисление SBERT embeddings      |
+| Метод           | Описание                                   |
+| --------------- | ------------------------------------------ |
+| `save()`        | Versioned torch.save с metadata и checksum |
+| `load()`        | Load с version validation и type matching  |
+| `checkpoint()`  | Atomic checkpoint с backup rotation        |
+| `export_json()` | Human-readable JSON экспорт с tensor stats |
 
 
-### 3.8 HDIMPipeline
+### 3.15 OnlineLearner
+
+**Файл:** `[src/core/online_learner.py](../src/core/online_learner.py)`
+
+**Назначение:** Continual learning модуль с TTT-style gradient updates, experience replay, surprise detection, EMA моделью.
+
+**3 режима градиентов:**
+
+
+| Режим       | Градиенты            | Описание                                            |
+| ----------- | -------------------- | --------------------------------------------------- |
+| `DETACHED`  | Нет                  | Безопасный режим (default), нет градиентного потока |
+| `SELECTIVE` | Только replay buffer | Градиенты для replay consolidation                  |
+| `FULL`      | Полные               | Experimental, может дестабилизировать               |
+
+
+**Ключевые компоненты:** `ReplayBuffer` (prioritized, surprise-based), `OnlineLearnerConfig`, `compute_surprise()` (1 - cosine similarity to EMA).
+
+### 3.16 OnlineLoRA
+
+**Файл:** `[src/core/online_lora.py](../src/core/online_lora.py)`
+
+**Назначение:** Task-free low-rank adaptation для continual learning без catastrophic forgetting (Wei et al., WACV 2025).
+
+**Ключевые классы:**
+
+
+| Класс               | Назначение                                   |
+| ------------------- | -------------------------------------------- |
+| `OnlineLoRA`        | Base: LoRA A+B + importance weighting + EMA  |
+| `OnlineLoRALinear`  | Convenience wrapper для nn.Linear            |
+| `OnlineLoRAConv`    | Convenience wrapper для nn.Conv2d            |
+| `OnlineLoRAManager` | Batch EMA updates, coordinated consolidation |
+| `OnlineLoRAConfig`  | rank, alpha, importance_decay, ema_decay     |
+
+
+**Алгоритм:** `output = base(x) + (x * importance) @ lora_A @ lora_B * scaling`, с gradient-based importance EMA и периодической консолидацией к EMA весам.
+
+### 3.17 ContinualNorm
+
+**Файл:** `[src/core/continual_norm.py](../src/core/continual_norm.py)`
+
+**Назначение:** Streaming normalization без task reset (IL-ETransformer-style). В отличие от BatchNorm, ContinualNorm поддерживает EMA running statistics через task boundaries.
+
+**Ключевые классы:**
+
+
+| Класс                | Назначение                                    |
+| -------------------- | --------------------------------------------- |
+| `ContinualNorm`      | BatchNorm-style continual norm, EMA без reset |
+| `ContinualNormLayer` | LayerNorm-style с continual monitoring        |
+
+
+### 3.18 HallucinationDetector
+
+**Файл:** `[src/core/hallucination_detector.py](../src/core/hallucination_detector.py)`
+
+**Назначение:** 5-signal weighted risk detection. Комбинирует сигналы из MoE routing, memory, и hidden states в hallucination_risk ∈ [0, 1].
+
+**5 сигналов:**
+
+
+| Сигнал           | Вес | Источник                   | Высокий риск при    |
+| ---------------- | --- | -------------------------- | ------------------- |
+| Routing Entropy  | 25% | MoE gate distribution      | Высокая энтропия    |
+| MoE Confidence   | 20% | Max gate weight            | Низкий confidence   |
+| Memory Mismatch  | 20% | Titans surprise gradient   | Большой mismatch    |
+| Semantic Entropy | 20% | SemanticEntropyProbe       | Высокая диверсность |
+| EigenScore       | 15% | SVD routing representation | Высокая дисперсия   |
+
+
+### 3.19 HallucinationFeedbackLoop
+
+**Файл:** `[src/core/hallucination_feedback.py](../src/core/hallucination_feedback.py)`
+
+**Назначение:** Risk-based self-correction. При высоком hallucination risk: reroute к safer expert, скорректировать confidence, trigger memory consolidation.
+
+**5 уровней ответа (FeedbackAction):**
+
+
+| Уровень               | Условие risk | Действие                            |
+| --------------------- | ------------ | ----------------------------------- |
+| NONE                  | < 0.3        | Нет коррекции                       |
+| ADJUST_CONFIDENCE     | 0.3 - 0.5    | Снижение output confidence          |
+| REROUTE               | 0.5 - 0.7    | Перенаправление к safer expert      |
+| TRIGGER_CONSOLIDATION | 0.7 - 0.85   | Принудительная memory consolidation |
+| FULL_CORRECTION       | >= 0.85      | Reroute + consolidate               |
+
+
+### 3.20 SemanticEntropyProbe
+
+**Файл:** `[src/core/semantic_entropy_probe.py](../src/core/semantic_entropy_probe.py)`
+
+**Назначение:** Linear probe для предсказания semantic entropy из hidden states (Kossen et al., ICLR 2024). 45x-450x быстрее полной multi-sample генерации.
+
+**Архитектура:** `Linear(hidden_dim, 1)` с zero initialization → `sigmoid` → entropy ∈ [0, 1]. Mean pooling по sequence dimension.
+
+### 3.21 TransferEngine
+
+**Файл:** `[src/core/transfer_engine.py](../src/core/transfer_engine.py)`
+
+**Назначение:** Инкапсуляция кроссдоменного переноса: MoE routing → sandwich transfer → decode.
+
+**Pipeline:**
+
+```
+u_mem → MoE → u_route → sandwich_transfer → g_target → decoder → output
+```
+
+Поддерживает gradient checkpointing через `enable_gradient_checkpointing()`.
+
+### 3.22 DomainEncoder
+
+**Файл:** `[src/core/domain_encoder.py](../src/core/domain_encoder.py)`
+
+**Назначение:** Инкапсуляция кодирования входа в доменный инвариант.
+
+**Pipeline:**
+
+```
+x → encoder → g_source → domain_rotor → invariant_extractor → u_inv → norm → u_inv_normalized
+```
+
+Поддерживает `add_domain()` для runtime-расширения.
+
+### 3.23 InvariantProcessor
+
+**Файл:** `[src/core/invariant_processor.py](../src/core/invariant_processor.py)`
+
+**Назначение:** Обработка инвариантов через MemoryInterface с поддержкой режимов none/retrieve/update.
+
+**Unified path:** все memory types проходят через `MemoryInterface.forward(x, update_memory)`.
+
+### 3.24 TransferState
+
+**Файл:** `[src/core/transfer_state.py](../src/core/transfer_state.py)`
+
+**Назначение:** Dataclass состояния кроссдоменного переноса. Вынесен в отдельный модуль для избежания циклических импортов.
+
+**Ключевые поля:** `g_source`, `u_inv`, `u_mem`, `u_route`, `g_target`, `output`, `memory_loss`, `router_state`, `memory_mode`.
+
+### 3.25 HDIMPipeline
 
 **Файл:** `[src/core/hdim_pipeline.py:128](../src/core/hdim_pipeline.py:128)`
 
@@ -482,12 +795,12 @@ class HDIMTrainer:
         device: str | torch.device = "cpu",
         # Loss weights
         lambda_iso: float = 0.1,
-        lambda_pair: float = 0.1,
+        lambda_pair: float = 0.40,     # Optimal: Run 18
         lambda_routing: float = 0.05,
         lambda_memory: float = 0.05,
-        lambda_z: float = 0.0,      # MoE anti-collapse
+        lambda_z: float = 0.0,         # MoE anti-collapse
         # InfoNCE
-        infonce_temperature: float = 0.15,
+        infonce_temperature: float = 0.10,  # Optimum Run 18
         focal_gamma: float = 1.0,
         ...
     )
@@ -496,18 +809,18 @@ class HDIMTrainer:
 ### 5.2 Losses — Полный каталог
 
 
-| Loss              | Вес            | Фаза     | Формула                         | Описание               |
-| ----------------- | -------------- | -------- | ------------------------------- | ---------------------- |
-| `loss_recon`      | 1.0            | Phase 1  | `MSE(output, target)`           | Реконструкция          |
-| `loss_iso`        | `λ_iso`        | Phase 1  | `MSE(training_inv, iso_target)` | Изоморфизм             |
-| `loss_pair`       | `λ_pair`       | Phase 3  | InfoNCE / Focal-InfoNCE         | Pair ranking           |
-| `loss_routing`    | `λ_routing`    | Phase 7  | `-entropy(routing_weights)`     | Routing entropy        |
-| `router_z_loss`   | `λ_z`          | Phase 9  | `(logsumexp(logits))²`          | MoE anti-collapse      |
-| `loss_memory`     | `λ_memory`     | Phase 6  | `MSE(retrieved, target)`        | Titans memory          |
-| `loss_sts`        | `λ_sts`        | Phase 8  | `1 - cos_sim(inv, iso_target)`  | STS regularization     |
-| `loss_angle`      | `λ_angle`      | Phase 11 | AnglE loss                      | Angular similarity     |
-| `loss_dcl`        | `λ_dcl`        | Phase 20 | DCL loss                        | Decoupled Contrastive  |
-| `loss_uniformity` | `λ_uniformity` | Phase 20 | Uniformity+Alignment            | Representation quality |
+| Loss              | Вес            | Оптимум        | Фаза     | Формула                         | Описание               |
+| ----------------- | -------------- | -------------- | -------- | ------------------------------- | ---------------------- |
+| `loss_recon`      | 1.0            | 1.0            | Phase 1  | `MSE(output, target)`           | Реконструкция          |
+| `loss_iso`        | `λ_iso`        | 0.1            | Phase 1  | `MSE(training_inv, iso_target)` | Изоморфизм             |
+| `loss_pair`       | `λ_pair`       | **0.40**       | Phase 3  | InfoNCE / Focal-InfoNCE         | Pair ranking           |
+| `loss_routing`    | `λ_routing`    | 0.05           | Phase 7  | `-entropy(routing_weights)`     | Routing entropy        |
+| `router_z_loss`   | `λ_z`          | >=0.01         | Phase 9  | `(logsumexp(logits))²`          | MoE anti-collapse      |
+| `loss_memory`     | `λ_memory`     | 0.05           | Phase 6  | `MSE(retrieved, target)`        | Titans memory          |
+| `loss_sts`        | `λ_sts`        | **0.0 (MAND)** | Phase 8  | `1 - cos_sim(inv, iso_target)`  | STS regularization     |
+| `loss_angle`      | `λ_angle`      | --             | Phase 11 | AnglE loss                      | Angular similarity     |
+| `loss_dcl`        | `λ_dcl`        | --             | Phase 20 | DCL loss                        | Decoupled Contrastive  |
+| `loss_uniformity` | `λ_uniformity` | --             | Phase 20 | Uniformity+Alignment            | Representation quality |
 
 
 **Total Loss:**
@@ -517,6 +830,12 @@ L_total = L_recon + λ_iso L_iso + λ_pair L_pair + λ_routing L_routing +
           λ_memory L_memory + λ_z L_z + λ_sts L_sts + λ_angle L_angle + 
           λ_dcl L_dcl + λ_uniformity L_uniformity
 ```
+
+**Критичные оптимальные значения:**
+
+- `lambda_pair = 0.40` — лучший результат Run 18; выше не тестировалось
+- `lambda_sts = 0.0` — ОБЯЗАТЕЛЬНО; любое значение > 0 подавляет pair_margin
+- `infonce_temperature = 0.10` — оптимум Run 18; 0.12 даёт -0.0108
 
 ### 5.3 Training Regimes
 
@@ -556,14 +875,31 @@ L_total = L_recon + λ_iso L_iso + λ_pair L_pair + λ_routing L_routing +
 
 ## 6. Scripts Layer
 
-### 6.1 Entrypoints
+### 6.1 Entrypoints (20 скриптов)
 
 
-| Entrypoint                                | Команда                                             | Назначение               |
-| ----------------------------------------- | --------------------------------------------------- | ------------------------ |
-| `[gpu_train.py](../scripts/gpu_train.py)` | `python scripts/gpu_train.py --use_pairs --amp`     | GPU training с AMP       |
-| `[train.py](../src/training/train.py)`    | `python -m src.training.train --config config.json` | CLI training             |
-| `[hdim_demo.py](../hdim_demo.py)`         | `python hdim_demo.py`                               | Демонстрации компонентов |
+| Скрипт                                                                    | Назначение                                                       |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `[gpu_train.py](../scripts/gpu_train.py)`                                 | Main GPU training: AMP, gradient checkpointing                   |
+| `[benchmark_comparison.py](../scripts/benchmark_comparison.py)`           | Сравнение архитектур: MoEKernel vs SoftMoERouter vs FFN vs SBERT |
+| `[moe_chat.py](../scripts/moe_chat.py)`                                   | Интерактивный чат с MoE domain experts                           |
+| `[autoresearch_loop.py](../scripts/autoresearch_loop.py)`                 | Итеративный architecture search                                  |
+| `[test_checkpoint_variants.py](../scripts/test_checkpoint_variants.py)`   | Тестирование checkpoint'ов через конфигурации                    |
+| `[auto_tune.py](../scripts/auto_tune.py)`                                 | Optuna hyperparameter search                                     |
+| `[interactive_kernel_chat.py](../scripts/interactive_kernel_chat.py)`     | Нейрогенеративный чат                                            |
+| `[benchmark_can_integration.py](../scripts/benchmark_can_integration.py)` | FFN vs CAN expert benchmarks                                     |
+| `[hdim_decoder.py](../scripts/hdim_decoder.py)`                           | HDIM-integrated decoder                                          |
+| `[benchmark_sota.py](../scripts/benchmark_sota.py)`                       | SOTA comparison на STS/MTEB                                      |
+| `[compare_memory_train.py](../scripts/compare_memory_train.py)`           | Сравнительное обучение: Titans vs HBMA vs CLS vs Hippocampus     |
+| `[run_moe_demo.py](../scripts/run_moe_demo.py)`                           | MoEKernel demo                                                   |
+| `[verify_moe_kernel_real.py](../scripts/verify_moe_kernel_real.py)`       | Полная цепочка верификации                                       |
+| `[perf_profile.py](../scripts/perf_profile.py)`                           | torch.profiler профилирование                                    |
+| `[gpu_memory_profile.py](../scripts/gpu_memory_profile.py)`               | GPU memory профилирование                                        |
+| `[test_all_modules.py](../scripts/test_all_modules.py)`                   | Комплексный тест post-Clifford-fix                               |
+| `[neural_decoder.py](../scripts/neural_decoder.py)`                       | NeuralDecoder: текст из embeddings                               |
+| `[run_with_llm_experts.py](../scripts/run_with_llm_experts.py)`           | HDIM router + HuggingFace LLMs                                   |
+| `[test_router.py](../scripts/test_router.py)`                             | Быстрый тест роутера                                             |
+| `[test_kernel_chat.py](../scripts/test_kernel_chat.py)`                   | Программный тест kernel chat                                     |
 
 
 ### 6.2 Ключевые опции gpu_train.py
@@ -576,9 +912,9 @@ L_total = L_recon + λ_iso L_iso + λ_pair L_pair + λ_routing L_routing +
 | `--hidden_dim`          | 128     | HDIM hidden dimension                       |
 | `--num_experts`         | 4       | Число MoE экспертов                         |
 | `--lambda_iso`          | 0.1     | Iso loss weight                             |
-| `--lambda_pair`         | 0.1     | Pair loss weight                            |
+| `--lambda_pair`         | 0.40    | Pair loss weight (оптимум Run 18)           |
 | `--lambda_z`            | 0.0     | Router Z-loss weight (>= 0.01 рекомендуемо) |
-| `--infonce_temperature` | 0.10    | Temperature для InfoNCE (оптимум Run 18)     |
+| `--infonce_temperature` | 0.10    | Temperature для InfoNCE (оптимум Run 18)    |
 | `--focal_gamma`         | 1.0     | Gamma для Focal-InfoNCE                     |
 | `--amp`                 | True    | Mixed precision                             |
 | `--soft_router`         | False   | Использовать SoftMoERouter                  |
@@ -650,6 +986,7 @@ L_total = L_recon + λ_iso L_iso + λ_pair L_pair + λ_routing L_routing +
 │           ▼                                                              │
 │  ┌───────────────────┐                                                   │
 │  │TitansMemoryModule │ ←── retrieve_and_update(key, u_inv)               │
+│  │  OR HBMAMemory    │                                                   │
 │  └────────┬──────────┘                                                   │
 │           │                                                              │
 │           ▼                                                              │
@@ -660,7 +997,10 @@ L_total = L_recon + λ_iso L_iso + λ_pair L_pair + λ_routing L_routing +
 │           │                                                              │
 │           ▼                                                              │
 │  ┌─────────────────┐                                                     │
-│  │ SoftMoERouter   │  ←── slot_inputs → experts → combine                │
+│  │ MoE Router      │  ←── slot_inputs → experts → combine                │
+│  │ (SoftMoE /      │      (SoftMoERouter, MoEKernel, or MaxScoreRouter)  │
+│  │  MoEKernel /    │                                                     │
+│  │  MaxScore)      │                                                     │
 │  └────────┬────────┘                                                     │
 │           │                                                              │
 │           ▼                                                              │
@@ -668,6 +1008,13 @@ L_total = L_recon + λ_iso L_iso + λ_pair L_pair + λ_routing L_routing +
 │  ┌─────────────────┐                                                     │
 │  │    u_route      │  ←── MoE-processed invariant                        │
 │  └────────┬────────┘                                                     │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌──────────────────┐                                                    │
+│  │ Hallucination    │  ←── optional: 5-signal risk detection             │
+│  │ Detector +       │      + feedback loop rerouting                      │
+│  │ FeedbackLoop     │                                                    │
+│  └────────┬──────────┘                                                   │
 │           │                                                              │
 │           ▼                                                              │
 │  ┌─────────────────┐                                                     │
@@ -783,17 +1130,17 @@ config = HDIMConfig(
 ### 9.2 ExperimentConfig
 
 
-| Параметр              | Default | Влияние                               |
-| --------------------- | ------- | ------------------------------------- |
-| `epochs`              | 3       | Число эпох обучения                   |
-| `batch_size`          | 16      | Размер батча (>= 32 для InfoNCE)      |
-| `lr`                  | 1e-3    | Learning rate                         |
-| `lambda_iso`          | 0.1     | Вес isomorphism loss                  |
-| `lambda_pair`         | 0.1     | Вес pair ranking loss                 |
-| `lambda_z`            | 0.0     | Вес MoE Z-loss (>= 0.01 рекомендуемо) |
+| Параметр              | Default | Влияние                                  |
+| --------------------- | ------- | ---------------------------------------- |
+| `epochs`              | 3       | Число эпох обучения                      |
+| `batch_size`          | 16      | Размер батча (>= 32 для InfoNCE)         |
+| `lr`                  | 1e-3    | Learning rate                            |
+| `lambda_iso`          | 0.1     | Вес isomorphism loss                     |
+| `lambda_pair`         | 0.40    | Вес pair ranking loss (оптимум Run 18)   |
+| `lambda_z`            | 0.0     | Вес MoE Z-loss (>= 0.01 рекомендуемо)    |
 | `infonce_temperature` | 0.10    | Temperature для InfoNCE (оптимум Run 18) |
-| `focal_gamma`         | 1.0     | Gamma для Focal-InfoNCE               |
-| `soft_router`         | False   | Использовать SoftMoERouter            |
+| `focal_gamma`         | 1.0     | Gamma для Focal-InfoNCE                  |
+| `soft_router`         | False   | Использовать SoftMoERouter               |
 
 
 ### 9.3 Factory Flags
@@ -812,24 +1159,111 @@ config = HDIMConfig(
 ### 10.1 Production-Ready
 
 
-| Компонент                | Файл                                                             | Статус     |
-| ------------------------ | ---------------------------------------------------------------- | ---------- |
-| `CliffordAlgebra`        | `[hypercomplex.py:20](../src/core/hypercomplex.py:20)`           | **Stable** |
-| `DomainRotationOperator` | `[domain_operators.py:19](../src/core/domain_operators.py:19)`   | **Stable** |
-| `InvariantExtractor`     | `[domain_operators.py:54](../src/core/domain_operators.py:54)`   | **Stable** |
-| `TitansMemoryModule`     | `[titans_memory.py:30](../src/core/titans_memory.py:30)`         | **Stable** |
-| `SoftMoERouter`          | `[soft_moe_router.py:43](../src/core/soft_moe_router.py:43)`     | **Stable** |
-| `HDIMEncoder/Decoder`    | `[hdim_pipeline.py:90](../src/core/hdim_pipeline.py:90)`         | **Stable** |
-| `HDIMPipeline`           | `[hdim_pipeline.py:128](../src/core/hdim_pipeline.py:128)`       | **Stable** |
-| `HDIMModel`              | `[hdim_model.py:117](../src/models/hdim_model.py:117)`           | **Stable** |
-| `TextHDIMModel`          | `[text_hdim_model.py:191](../src/models/text_hdim_model.py:191)` | **Stable** |
-| `SBERTEncoder`           | `[sbert_encoder.py:20](../src/models/sbert_encoder.py:20)`       | **Stable** |
-| `HDIMTrainer`            | `[trainer.py:19](../src/training/trainer.py:19)`                 | **Stable** |
+| Компонент                   | Файл                                                                 | Статус     |
+| --------------------------- | -------------------------------------------------------------------- | ---------- |
+| `CliffordAlgebra`           | `[hypercomplex.py:20](../src/core/hypercomplex.py:20)`               | **Stable** |
+| `DomainRotationOperator`    | `[domain_operators.py:19](../src/core/domain_operators.py:19)`       | **Stable** |
+| `InvariantExtractor`        | `[domain_operators.py:54](../src/core/domain_operators.py:54)`       | **Stable** |
+| `TitansMemoryModule`        | `[titans_memory.py:30](../src/core/titans_memory.py:30)`             | **Stable** |
+| `SoftMoERouter`             | `[soft_moe_router.py:43](../src/core/soft_moe_router.py:43)`         | **Stable** |
+| `MoEKernel`                 | `[moe_kernel.py](../src/core/moe_kernel.py)`                         | **Stable** |
+| `MoEKernelConfig`           | `[moe_kernel.py](../src/core/moe_kernel.py)`                         | **Stable** |
+| `MoEKernelState`            | `[moe_kernel.py](../src/core/moe_kernel.py)`                         | **Stable** |
+| `MoERouter` ABC             | `[moe_interface.py](../src/core/moe_interface.py)`                   | **Stable** |
+| `MoEKernelAdapter`          | `[moe_kernel_adapter.py](../src/core/moe_kernel_adapter.py)`         | **Stable** |
+| `MaxScoreRouter`            | `[maxscore_router.py](../src/core/maxscore_router.py)`               | **Stable** |
+| `HBMAMemory`                | `[hbma_memory.py](../src/core/hbma_memory.py)`                       | **Stable** |
+| `MemoryInterface` ABC       | `[memory_interface.py](../src/core/memory_interface.py)`             | **Stable** |
+| `MemoryPersistence`         | `[memory_persistence.py](../src/core/memory_persistence.py)`         | **Stable** |
+| `MSASparseIndex`            | `[msa_attention.py](../src/core/msa_attention.py)`                   | **Stable** |
+| `HallucinationDetector`     | `[hallucination_detector.py](../src/core/hallucination_detector.py)` | **Stable** |
+| `HallucinationFeedbackLoop` | `[hallucination_feedback.py](../src/core/hallucination_feedback.py)` | **Stable** |
+| `SemanticEntropyProbe`      | `[semantic_entropy_probe.py](../src/core/semantic_entropy_probe.py)` | **Stable** |
+| `OnlineLearner`             | `[online_learner.py](../src/core/online_learner.py)`                 | **Stable** |
+| `OnlineLoRA`                | `[online_lora.py](../src/core/online_lora.py)`                       | **Stable** |
+| `ContinualNorm`             | `[continual_norm.py](../src/core/continual_norm.py)`                 | **Stable** |
+| `MSAAttention`              | `[msa_attention.py](../src/core/msa_attention.py)`                   | **Stable** |
+| `TransferEngine`            | `[transfer_engine.py](../src/core/transfer_engine.py)`               | **Stable** |
+| `TransferState`             | `[transfer_state.py](../src/core/transfer_state.py)`                 | **Stable** |
+| `DomainEncoder`             | `[domain_encoder.py](../src/core/domain_encoder.py)`                 | **Stable** |
+| `InvariantProcessor`        | `[invariant_processor.py](../src/core/invariant_processor.py)`       | **Stable** |
+| `HDIMEncoder/Decoder`       | `[hdim_pipeline.py:90](../src/core/hdim_pipeline.py:90)`             | **Stable** |
+| `HDIMPipeline`              | `[hdim_pipeline.py:128](../src/core/hdim_pipeline.py:128)`           | **Stable** |
+| `HDIMModel`                 | `[hdim_model.py:117](../src/models/hdim_model.py:117)`               | **Stable** |
+| `TextHDIMModel`             | `[text_hdim_model.py:191](../src/models/text_hdim_model.py:191)`     | **Stable** |
+| `SBERTEncoder`              | `[sbert_encoder.py:20](../src/models/sbert_encoder.py:20)`           | **Stable** |
+| `HDIMTrainer`               | `[trainer.py:19](../src/training/trainer.py:19)`                     | **Stable** |
 
 
 ### 10.2 Удалено (Occam's razor)
 
-Компоненты удалены как неиспользуемый мёртвый код:
+
+| Компонент          | Файл (удалён)           | Причина удаления                  | Замена            |
+| ------------------ | ----------------------- | --------------------------------- | ----------------- |
+| `DomainExpertPool` | `domain_expert_pool.py` | Дублирование с MoEKernel          | `MoEKernel`       |
+| `SharedExpert`     | `domain_expert_pool.py` | Встроен в SoftMoERouter/MoEKernel | `SoftMoERouter`   |
+| `ExpertProjection` | `domain_expert_pool.py` | Не нужен с MoEKernel              | `MoEKernel`       |
+| `PHMLinear`        | `hypercomplex.py`       | Не использовался                  | Удалён без замены |
+
+
+---
+
+## 11. Hallucination & Safety Subsystem
+
+3-компонентный пайплайн для детекции и самокоррекции галлюцинаций:
+
+```
+┌──────────────────────┐     ┌──────────────────────────┐     ┌──────────────────────┐
+│ HallucinationDetector│     │ HallucinationFeedbackLoop│     │ SemanticEntropyProbe │
+│ (5-signal risk)      │────>│ (risk-based rerouting)   │────>│ (uncertainty quant.) │
+│                      │     │                          │     │                      │
+│ routing_entropy  25% │     │ FeedbackAction:          │     │ Linear probe         │
+│ moe_confidence   20% │     │ NONE / ADJUST_CONF /     │     │ hidden_dim → 1       │
+│ memory_mismatch  20% │     │ REROUTE / CONSOLIDATE /  │     │ sigmoid → [0, 1]     │
+│ semantic_entropy 20% │     │ FULL_CORRECTION          │     │                      │
+│ eigen_score      15% │     │                          │     │ Kossen ICLR 2024     │
+│                      │     │ Risk thresholds:         │     │ 45-450x faster than  │
+│ risk = weighted_sum  │     │ low=0.3 / med=0.5 /     │     │ full semantic entropy │
+│ risk ∈ [0, 1]        │     │ high=0.7 / crit=0.85    │     │                      │
+└──────────────────────┘     └──────────────────────────┘     └──────────────────────┘
+```
+
+**Интеграция в pipeline:**
+
+`SemanticEntropyProbe` является подмодулем `HallucinationDetector`. Результат `HallucinationDetector.compute_hallucination_risk()` подаётся в `HallucinationFeedbackLoop.check_and_respond()`, который возвращает `FeedbackResult` с действием, скорректированным confidence и выбранным экспертом.
+
+---
+
+## 12. Online Learning Subsystem
+
+3-компонентная подсистема для continual learning без catastrophic forgetting:
+
+```
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│   OnlineLearner   │     │    OnlineLoRA    │     │  ContinualNorm   │
+│ (global coord.)   │     │ (per-layer adapt)│     │ (streaming norm)  │
+│                   │     │                  │     │                  │
+│ ReplayBuffer      │     │ lora_A + lora_B  │     │ EMA running_mean │
+│ (prioritized,     │     │ + importance EMA │     │ EMA running_var  │
+│  surprise-based)  │     │ + EMA weights    │     │ No task reset    │
+│                   │     │                  │     │                  │
+│ GradientMode:     │     │ Supports:        │     │ IL-ETransformer  │
+│ DETACHED (safe)   │     │ nn.Linear        │     │ style:            │
+│ SELECTIVE (replay)│     │ nn.Conv2d        │     │ ContinualNorm     │
+│ FULL (experimental)│     │                  │     │ ContinualNormLayer│
+│                   │     │ Manager:         │     │                  │
+│ Surprise detect:  │     │ batch EMA update │     │ Use in:          │
+│ 1 - cos_sim(x,EMA)│     │ coordinated      │     │ streaming/online  │
+│                   │     │ consolidation    │     │ scenarios        │
+│ EMA target model  │     │                  │     │                  │
+│ (MoCo-style)      │     │ Wei et al.       │     │ Never call        │
+│                   │     │ WACV 2025        │     │ reset_running_    │
+│ Titans NeurIPS    │     │                  │     │ stats() in        │
+│ 2025 + MoCo       │     │                  │     │ continual setting │
+└──────────────────┘     └──────────────────┘     └──────────────────┘
+```
+
+**Интеграция:** `OnlineLearner` подключается в `HDIMModel._forward_core()` после `_apply_memory()`. `OnlineLoRA` оборачивает слои модели через `wrap_with_online_lora()`. `ContinualNorm` заменяет BatchNorm/LayerNorm в streaming сценариях.
 
 ---
 
@@ -845,22 +1279,26 @@ config = HDIMConfig(
 
 ### Session 14 (2026-03-26) — MoE + TitansMemory Smoke Test
 
-5-epoch smoke test с MoE + TitansMemory (ep5=1.1508 ≈ Run11 ep27 за 1/27 эпох):
+5-epoch smoke test с MoE + TitansMemory (ep5=1.1508 ~ Run11 ep27 за 1/27 эпох):
+
 - Нет NaN, нет OOM, GPU стабильна
 - Рекомендован полный прогон 30 эпох
 
 ### ТЕКУЩИЙ ОПТИМАЛЬНЫЙ CONFIG
 
-| Параметр | Значение | Примечание |
-|---|---|---|
-| `batch_size` | 24 | Оптимум для RTX 3070 8GB |
-| `lr` | 5e-4 | Выше вызывает нестабильность |
-| `sbert_lr` | 1e-5 | Осторожное размораживание SBERT |
-| `temperature` | **0.10** | Рекорд Run 18; 0.12 даёт -0.0108 |
-| `lambda_pair` | **0.40** | Выше 0.40 не тестировалось |
-| `lambda_sts` | **0.0** | Любое значение > 0 подавляет margin |
-| `patience` | 15 | Нужно для multi-peak паттерна |
-| `epochs` | 30 | Пик на ep13 с temp=0.10 |
+
+| Параметр              | Значение | Примечание                          |
+| --------------------- | -------- | ----------------------------------- |
+| `batch_size`          | 24       | Оптимум для RTX 3070 8GB            |
+| `lr`                  | 5e-4     | Выше вызывает нестабильность        |
+| `sbert_lr`            | 1e-5     | Осторожное размораживание SBERT     |
+| `temperature`         | **0.10** | Рекорд Run 18; 0.12 даёт -0.0108    |
+| `lambda_pair`         | **0.40** | Выше 0.40 не тестировалось          |
+| `lambda_sts`          | **0.0**  | Любое значение > 0 подавляет margin |
+| `infonce_temperature` | **0.10** | Оптимум Run 18                      |
+| `patience`            | 15       | Нужно для multi-peak паттерна       |
+| `epochs`              | 30       | Пик на ep13 с temp=0.10             |
+
 
 ---
 
@@ -881,15 +1319,17 @@ config = HDIMConfig(
 ## Антипаттерны
 
 
-| Паттерн                | Проблема          | Решение                     |
-| ---------------------- | ----------------- | --------------------------- |
-| `ModularMoERouter`     | Нестабилен        | `SoftMoERouter`             |
-| `reset_memory('zero')` | Уничтожает знания | `reset_memory('geometric')` |
-| `batch_size < 32`      | Мало негативов    | `batch_size >= 32`          |
-| `temperature < 0.07`   | Gradient instability | `temperature = 0.10` (оптимум) |
-| `lambda_z = 0`         | MoE collapse      | `lambda_z >= 0.01`          |
+| Паттерн                | Проблема              | Решение                          |
+| ---------------------- | --------------------- | -------------------------------- |
+| `ModularMoERouter`     | Нестабилен            | `SoftMoERouter`                  |
+| `reset_memory('zero')` | Уничтожает знания     | `reset_memory('geometric')`      |
+| `batch_size < 32`      | Мало негативов        | `batch_size >= 32`               |
+| `temperature < 0.07`   | Gradient instability  | `temperature = 0.10` (оптимум)   |
+| `lambda_z = 0`         | MoE collapse          | `lambda_z >= 0.01`               |
 | `lambda_sts > 0`       | Подавляет pair_margin | `lambda_sts = 0.0` (обязательно) |
-| Нет `reset_memory()`   | Memory drift      | epoch=1: hard, далее без сброса |
+| `lambda_pair = 0.1`    | Недооптимизирован     | `lambda_pair = 0.40` (Run 18)    |
+| Нет `reset_memory()`   | Memory drift          | epoch=1: hard, далее без сброса  |
+| `DomainExpertPool`     | Удалён                | `MoEKernel` с named experts      |
 
 
 ---
@@ -902,6 +1342,24 @@ config = HDIMConfig(
 - `[src/core/domain_operators.py](../src/core/domain_operators.py)` — Доменные операторы
 - `[src/core/titans_memory.py](../src/core/titans_memory.py)` — Titans memory
 - `[src/core/soft_moe_router.py](../src/core/soft_moe_router.py)` — Soft MoE router
+- `[src/core/moe_kernel.py](../src/core/moe_kernel.py)` — MoEKernel (named domain experts)
+- `[src/core/moe_interface.py](../src/core/moe_interface.py)` — MoERouter ABC
+- `[src/core/moe_kernel_adapter.py](../src/core/moe_kernel_adapter.py)` — MoEKernel → MoERouter
+- `[src/core/maxscore_router.py](../src/core/maxscore_router.py)` — MaxScore Router (ACL 2025)
+- `[src/core/hbma_memory.py](../src/core/hbma_memory.py)` — HBMA 4-system memory
+- `[src/core/memory_interface.py](../src/core/memory_interface.py)` — MemoryInterface ABC
+- `[src/core/memory_persistence.py](../src/core/memory_persistence.py)` — Memory save/load
+- `[src/core/msa_attention.py](../src/core/msa_attention.py)` — MSA sparse retrieval
+- `[src/core/hallucination_detector.py](../src/core/hallucination_detector.py)` — 5-signal hallucination detection
+- `[src/core/hallucination_feedback.py](../src/core/hallucination_feedback.py)` — Risk-based feedback loop
+- `[src/core/semantic_entropy_probe.py](../src/core/semantic_entropy_probe.py)` — Uncertainty probe
+- `[src/core/online_learner.py](../src/core/online_learner.py)` — Online continual learning
+- `[src/core/online_lora.py](../src/core/online_lora.py)` — Online LoRA adaptation
+- `[src/core/continual_norm.py](../src/core/continual_norm.py)` — Continual normalization
+- `[src/core/transfer_engine.py](../src/core/transfer_engine.py)` — Transfer engine
+- `[src/core/domain_encoder.py](../src/core/domain_encoder.py)` — Domain encoder
+- `[src/core/invariant_processor.py](../src/core/invariant_processor.py)` — Invariant processor
+- `[src/core/transfer_state.py](../src/core/transfer_state.py)` — Transfer state
 - `[src/core/hdim_pipeline.py](../src/core/hdim_pipeline.py)` — Главный pipeline
 - `[src/models/hdim_model.py](../src/models/hdim_model.py)` — HDIMModel, конфигурации
 - `[src/models/text_hdim_model.py](../src/models/text_hdim_model.py)` — TextHDIMModel
