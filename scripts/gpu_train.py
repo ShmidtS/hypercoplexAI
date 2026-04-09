@@ -909,7 +909,7 @@ def main() -> None:
     parser.add_argument("--can_experts", action="store_true", default=False,
                         help="Use CAN (Clifford Attention Network) experts instead of FFN")
     parser.add_argument("--memory_type", type=str, default="titans",
-                        choices=["titans", "hippocampus", "neocortex", "cls", "hbma"],
+                        choices=["titans", "hippocampus", "neocortex", "cls", "hbma", "msa"],
                         help="Memory module type (default: titans)")
     # Temperature scheduling
     parser.add_argument("--temp_schedule", type=str, default="none",

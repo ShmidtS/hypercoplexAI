@@ -1035,7 +1035,7 @@ class HDIMTrainer:
                 if self._augmenter is not None:
                     pair_encoding = self._augmenter(pair_encoding, pairs_only=False)
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
-                output, routing_weights, invariant, slot_outputs, aux_state = self.model.transfer_pairs(
+                output, routing_weights, invariant, aux_state = self.model.transfer_pairs(
                     encoding,
                     domain_id,
                     pair_domain_id,
@@ -1051,7 +1051,7 @@ class HDIMTrainer:
                 else:
                     recon_target = pair_encoding
             else:
-                output, routing_weights, invariant, _slot_outputs, aux_state = self._forward_batch(
+                output, routing_weights, invariant, aux_state = self._forward_batch(
                     encoding, domain_id, regime
                 )
                 recon_target = encoding
@@ -1204,7 +1204,7 @@ class HDIMTrainer:
             if torch.isnan(loss_total) or torch.isinf(loss_total):
                 # Force scale reduction for stability
                 new_scale = max(scaler.get_scale() * 0.5, 1.0)
-                scaler.set_scale(new_scale)
+                scaler._scale = torch.tensor(new_scale, device=scaler._scale.device, dtype=scaler._scale.dtype)
                 scaler.update()
                 self._last_grad_norm = float('inf')
                 self._step += 1
@@ -1224,7 +1224,7 @@ class HDIMTrainer:
                 # NaN grads found — skip step and reduce scale to prevent
                 # permanent scaler corruption from non-finite gradients.
                 new_scale = max(scaler.get_scale() * 0.5, 1.0)
-                scaler.set_scale(new_scale)
+                scaler._scale = torch.tensor(new_scale, device=scaler._scale.device, dtype=scaler._scale.dtype)
                 scaler.update()
             else:
                 scaler.step(self.optimizer)
