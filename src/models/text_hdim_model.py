@@ -329,7 +329,7 @@ class TextHDIMModel(nn.Module):
             return raw, None
 
         scales: dict[int, torch.Tensor] = {
-            dim: raw[..., :dim] for dim in matryoshka_dims
+            dim: raw[..., :dim].clone() for dim in matryoshka_dims
         }
         return raw, scales
 

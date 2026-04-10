@@ -57,6 +57,7 @@ class HDIMTrainer:
         aug_mixup_alpha: float = 0.0,
     ) -> None:
         self.model = model.to(device)
+        self._sbert_encoder = self._get_sbert_encoder()
         self.optimizer = optimizer
         self.device = torch.device(device)
         self.lambda_iso = lambda_iso
@@ -94,31 +95,42 @@ class HDIMTrainer:
         self.use_hard_negatives: bool = False
         self._last_cluster_temp: float | None = None
         self._step: int = 0
-        # Focal-InfoNCE gamma (Hou & Li, EMNLP 2023)
-        self._focal_gamma: float = focal_gamma  # 1.0 = standard InfoNCE, <1 = focal
-        # Temperature scheduling (now configurable)
+        self._focal_gamma: float = focal_gamma
         self._current_epoch: int = 0
-        self._temp_schedule: str = temp_schedule  # "none" | "warm_restart"
+        self._temp_schedule: str = temp_schedule
         self._tau_max: float = tau_max
         self._tau_min: float = tau_min
-        self._temp_schedule_T_0: int = temp_schedule_T_0  # matches scheduler T_0
-        # Learnable temperature (log-scale for numerical stability)
-        # B33 FIX: register as buffer on model so it survives checkpoint save/load
+        self._temp_schedule_T_0: int = temp_schedule_T_0
         import math
         if learnable_temperature:
             self._log_temp = nn.Parameter(
                 torch.tensor(math.log(infonce_temperature), device=torch.device(device))
             )
-            # Register on model so it appears in state_dict
             self.model.register_parameter('_log_temp', self._log_temp)
         else:
             self._log_temp = None
-        # Embedding augmenter (training only, no-op in eval)
         self._augmenter = EmbeddingAugmenter(
             noise_std=aug_noise_std,
             dropout_p=0.0,
             mixup_alpha=aug_mixup_alpha,
         ) if (aug_noise_std > 0 or aug_mixup_alpha > 0) else None
+
+    def _get_sbert_encoder(self):
+        """Get SBERT encoder stored outside nn.Module registry (via object.__setattr__)."""
+        if hasattr(self.model, 'text_encoder'):
+            try:
+                return object.__getattribute__(self.model.text_encoder, '_sbert')
+            except AttributeError:
+                pass
+        return None
+
+    def _all_trainable_params(self):
+        """All trainable params including SBERT (which bypasses nn.Module registration)."""
+        params = list(self.model.parameters())
+        if self._sbert_encoder is not None:
+            params.extend(p for p in self._sbert_encoder.parameters() if p.requires_grad)
+        return params
+
     def _resolve_training_regime(self, batch: Dict[str, Any]) -> TrainingRegime:
         is_pair_batch = self._has_pairs(batch)
         return TrainingRegime(
@@ -480,6 +492,7 @@ class HDIMTrainer:
         pair_relation_label: torch.Tensor,
         pair_weight: torch.Tensor,
         temperature: float = 0.07,
+        pair_group_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """InfoNCE loss (NT-Xent) for positive/negative pair discrimination.
 
@@ -493,6 +506,7 @@ class HDIMTrainer:
             pair_relation_label: (B,) 1.0=positive, 0.0=negative
             pair_weight: (B,) per-sample weights
             temperature: softmax temperature (меньше = резче границы)
+            pair_group_id: (B,) group/family IDs — same-group entries are false negatives
         Returns:
             scalar InfoNCE loss
         """
@@ -517,11 +531,16 @@ class HDIMTrainer:
         # Similarity matrix: (B, B) — keep in float32 to avoid fp16 overflow
         sim_matrix = src @ tgt.T / temperature
 
-        # Mask out other positive pairs from denominator (false negatives)
-        # For each positive i, other positives j should NOT be treated as negatives
-        if positive_mask.sum() > 1:
+        # Mask out false negatives from denominator
+        # 1) Same-family entries (same pair_group_id) — semantically similar but not true negatives
+        if pair_group_id is not None:
+            gid = pair_group_id.to(dev)
+            group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))  # (B, B)
+            eye_mask = torch.eye(B, dtype=torch.bool, device=dev)
+            sim_matrix = sim_matrix.masked_fill(group_match & ~eye_mask, float('-inf'))
+        # 2) Other positive pairs (label>0.5) — also false negatives
+        elif positive_mask.sum() > 1:
             pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)  # (B, B)
-            # Set logits of other positive pairs to -inf so they're excluded from softmax
             eye_mask = torch.eye(B, dtype=torch.bool, device=dev)
             sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~eye_mask, float('-inf'))
 
@@ -545,6 +564,7 @@ class HDIMTrainer:
         pair_weight: torch.Tensor,
         temperature: float = 0.07,
         gamma: float = 0.5,
+        pair_group_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Focal-InfoNCE loss (Hou & Li, EMNLP Findings 2023).
 
@@ -590,8 +610,12 @@ class HDIMTrainer:
         if gamma >= 0.99:
             # Standard InfoNCE path (no focal modulation)
             sim_matrix = src @ tgt.T / temperature
-            # Mask out other positive pairs from denominator (false negatives)
-            if positive_mask.sum() > 1:
+            # Mask out false negatives from denominator
+            if pair_group_id is not None:
+                gid = pair_group_id.to(dev)
+                group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))
+                sim_matrix = sim_matrix.masked_fill(group_match & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
+            elif positive_mask.sum() > 1:
                 pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
                 sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
             loss_per_sample = F.cross_entropy(
@@ -600,7 +624,11 @@ class HDIMTrainer:
         else:
             # Focal-InfoNCE: scale logits by gamma before CE
             sim_matrix = src @ tgt.T / temperature
-            if positive_mask.sum() > 1:
+            if pair_group_id is not None:
+                gid = pair_group_id.to(dev)
+                group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))
+                sim_matrix = sim_matrix.masked_fill(group_match & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
+            elif positive_mask.sum() > 1:
                 pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
                 sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
             focal_matrix = sim_matrix * gamma
@@ -808,7 +836,7 @@ class HDIMTrainer:
                 if use_focal:
                     infonce = self._compute_focal_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp, gamma=self._focal_gamma)
                 else:
-                    infonce = self._compute_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp)
+                    infonce = self._compute_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp, pair_group_id=None)
             else:
                 if use_focal:
                     infonce = self._compute_focal_infonce_loss(
@@ -821,6 +849,7 @@ class HDIMTrainer:
                         exported_invariant, pair_exported_target,
                         pair_relation_label, pair_weight,
                         temperature=temp,
+                        pair_group_id=pair_group_id,
                     )
             # AnglE loss поверх InfoNCE (если включён) — added directly to loss_total in _compute_batch_losses
             return infonce
@@ -1027,8 +1056,18 @@ class HDIMTrainer:
                 if self._augmenter is not None:
                     _tgt_enc = self._augmenter(_tgt_enc, pairs_only=False)
                 if _src_scales is not None and _tgt_scales is not None:
-                    batch["matryoshka_source"] = _src_scales
-                    batch["matryoshka_target"] = _tgt_scales
+                    # Compute matryoshka scales from exported_invariant (not SBERT space)
+                    _exported = aux_state.exported_invariant
+                    _exported_dim = _exported.shape[-1]
+                    _matryoshka_dims = [d for d in sorted(_src_scales.keys()) if d < _exported_dim]
+                    if _matryoshka_dims:
+                        batch["matryoshka_source"] = {d: _exported[..., :d].clone() for d in _matryoshka_dims}
+                        # For target, use pair_exported_target if available
+                        _pair_tgt = batch.get("pair_exported_target", _exported.detach())
+                        batch["matryoshka_target"] = {d: _pair_tgt[..., :d].clone() for d in _matryoshka_dims}
+                    else:
+                        batch["matryoshka_source"] = _src_scales
+                        batch["matryoshka_target"] = _tgt_scales
                     # Use max-dim dict for matryoshka_embeddings
                     batch["matryoshka_embeddings"] = _src_scales
                 if _prl is not None:
@@ -1099,11 +1138,17 @@ class HDIMTrainer:
         if self._has_pairs(batch) and pair_relation_label is not None:
             loss_diversity = self._compute_diversity_loss(aux_state.exported_invariant)
 
-        # Matryoshka multi-scale loss (if encoder returns dict of scales)
+        # Matryoshka multi-scale loss in exported_invariant space (not SBERT)
         loss_matryoshka = self._zero_loss(training_invariant)
-        # Check if batch has matryoshka embeddings
         matryoshka_embs = batch.get("matryoshka_embeddings")
         if matryoshka_embs is not None and isinstance(matryoshka_embs, dict):
+            _exported_src = aux_state.exported_invariant
+            _exported_dim = _exported_src.shape[-1]
+            _m_dims = [d for d in sorted(matryoshka_embs.keys()) if d < _exported_dim]
+            if _m_dims and pair_exported_target is not None:
+                batch["matryoshka_source"] = {d: _exported_src[..., :d].clone() for d in _m_dims}
+                batch["matryoshka_target"] = {d: pair_exported_target[..., :d].clone() for d in _m_dims}
+                matryoshka_embs = batch["matryoshka_source"]
             loss_matryoshka = self._compute_matryoshka_loss(matryoshka_embs, batch)
         
         # Phase 26: Expert orthogonalization loss
@@ -1226,11 +1271,11 @@ class HDIMTrainer:
             scaler.unscale_(self.optimizer)
             # Zero NaN/Inf gradients from uninitialized memory/MoE state
             has_nan_grad = False
-            for p in self.model.parameters():
+            for p in self._all_trainable_params():
                 if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
                     p.grad.zero_()
                     has_nan_grad = True
-            grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            grad_norm = nn.utils.clip_grad_norm_(self._all_trainable_params(), max_norm=1.0)
             self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
             if has_nan_grad:
                 # NaN grads found — skip step and reduce scale to prevent
@@ -1244,11 +1289,11 @@ class HDIMTrainer:
         else:
             loss_total.backward()
             has_nan_grad = False
-            for p in self.model.parameters():
+            for p in self._all_trainable_params():
                 if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
                     p.grad.zero_()
                     has_nan_grad = True
-            grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            grad_norm = nn.utils.clip_grad_norm_(self._all_trainable_params(), max_norm=1.0)
             self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
             if not has_nan_grad:
                 self.optimizer.step()

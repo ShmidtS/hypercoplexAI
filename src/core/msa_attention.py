@@ -734,8 +734,7 @@ class MSAMemory(MemoryInterface):
         if uniform < 1e-8:
             return torch.tensor(0.0, device=topk_indices.device, dtype=torch.float32)
         deviation = ((counts - uniform) ** 2).mean() / (uniform ** 2 + 1e-8)
-        normalized_loss = deviation / n
-        return normalized_loss
+        return deviation
 
     def _evict_to_overflow(self, slot_idx: int) -> None:
         """Evict prototype at slot_idx to overflow buffer."""
@@ -922,6 +921,20 @@ class MSAMemory(MemoryInterface):
                 total_ev = self.evidence[:n].sum().clamp(min=1e-8)
                 self.evidence[:n] = (self.evidence[:n] / total_ev) * n
                 self.confidence[:n] = self.confidence[:n].clamp(0.1, 1.0)
+
+    def stats(self) -> dict:
+        """Return memory statistics for monitoring."""
+        n = int(self.fill_count[0].item())
+        return {
+            "memory_type": "msa",
+            "filled_prototypes": n,
+            "total_prototypes": self.num_prototypes,
+            "overflow_size": self.overflow.size() if self.overflow.is_enabled() else 0,
+            "avg_confidence": self.confidence[:n].mean().item() if n > 0 else 0.0,
+            "avg_evidence": self.evidence[:n].mean().item() if n > 0 else 0.0,
+            "avg_age": self.age[:n].mean().item() if n > 0 else 0.0,
+            "diversity_loss": self._last_diversity_loss.item(),
+        }
 
     def memory_loss(self) -> torch.Tensor:
         """Current auxiliary memory loss (routing diversity)."""

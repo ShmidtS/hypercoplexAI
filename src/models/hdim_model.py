@@ -562,10 +562,8 @@ class HDIMModel(nn.Module):
         memory_loss = memory_state.loss.to(dtype=dtype)
         memory_updated = bool(memory_state.updated)
 
-        total_samples = max(batch_size, 1)
-        memory_loss = memory_loss / total_samples
-        router_loss = router_loss / total_samples
-        z_loss = z_loss / total_samples
+        # Note: memory_loss, router_loss, z_loss are already batch-meaned
+        # by their respective modules — do NOT divide by total_samples again
 
         # Phase 32: Hallucination detection
         hallucination_risk = 0.0

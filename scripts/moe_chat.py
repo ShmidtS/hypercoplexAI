@@ -195,6 +195,16 @@ def query_llm(user_text: str, expert_info: str, model: str = "") -> str | None:
 CHECKPOINT_CANDIDATES = [
     Path(__file__).resolve().parents[1]
     / "artifacts"
+    / "titans_opt5"
+    / "checkpoints"
+    / "best.pt",
+    Path(__file__).resolve().parents[1]
+    / "artifacts"
+    / "titans_opt4"
+    / "checkpoints"
+    / "best.pt",
+    Path(__file__).resolve().parents[1]
+    / "artifacts"
     / "titans_opt3"
     / "checkpoints"
     / "best.pt",
@@ -272,36 +282,7 @@ def build_model():
         )
 
     model.to(DEVICE)
-    # Fix runaway expert bias from run_018 (science bias was 5.22)
-    # and router_proj weight collapse (row norms range 0.2-1.0, rows collinear).
-    # Root cause: training co-adapted router_proj + _expert_bias; clamping or
-    # normalizing alone is insufficient because row directions remain collinear.
-    # Fix: zero bias + orthogonal reinit of router_proj (expert weights kept).
-    _moe = model.core_model.pipeline.moe
-    _kernel = getattr(_moe, "kernel", _moe)
-    # _expert_bias may be on MoEKernel directly or under .kernel (adapter pattern)
-    for _attr in ("_expert_bias",):
-        _target = None
-        if hasattr(_moe, _attr) and getattr(_moe, _attr) is not None:
-            _target = _moe
-        elif hasattr(_moe, "kernel") and hasattr(_moe.kernel, _attr) and getattr(_moe.kernel, _attr) is not None:
-            _target = _moe.kernel
-        if _target is not None:
-            bias_vals = getattr(_target, _attr).data
-            max_bias = bias_vals.abs().max().item()
-            if max_bias > 1.0:
-                print(f"[init] Resetting expert bias (max={max_bias:.2f} -> 0.0)")
-                bias_vals.zero_()
-    # Re-initialize router_proj with orthogonal rows (fixes co-adaptation collapse)
-    if hasattr(_kernel, "router_proj"):
-        _rp = _kernel.router_proj.weight.data
-        _row_norms = _rp.norm(dim=1)
-        _norm_ratio = _row_norms.max() / _row_norms.min().clamp(min=1e-8)
-        _cos = torch.nn.functional.cosine_similarity(_rp.unsqueeze(1), _rp.unsqueeze(0), dim=2)
-        _offdiag = _cos[_cos != 1.0].abs().max().item()
-        if _norm_ratio > 2.0 or _offdiag > 0.8:
-            print(f"[init] Re-initializing router_proj (norm ratio={_norm_ratio:.2f}, max cosine={_offdiag:.2f})")
-            torch.nn.init.orthogonal_(_kernel.router_proj.weight)
+    # Preserve trained weights — do NOT reset expert bias or router_proj at inference time
     model.eval()
     print("[init] Model ready.")
     print(f"[init] Experts: {DOMAIN_NAMES}")
@@ -319,7 +300,9 @@ def encode_text(model, text: str):
     text = str(text)
     with torch.no_grad():
         enc = model.encode_texts([text], device=DEVICE)
-        dom = torch.zeros(1, dtype=torch.long, device=DEVICE)
+        semantic_hints = semantic_domain_hints(text)
+        hint_domain = max(semantic_hints, key=semantic_hints.get) if semantic_hints else "math"
+        dom = torch.tensor([DOMAIN_IDX[hint_domain]], dtype=torch.long, device=DEVICE)
         out, _, _, _, aux_state = model(enc, dom, return_state=True, memory_mode="retrieve")
         expert_weights = aux_state.routing_weights[0].cpu()
         # Normalize routing scores to probabilities for display/dominant detection
