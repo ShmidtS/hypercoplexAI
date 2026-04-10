@@ -749,7 +749,7 @@ class HDIMModel(nn.Module):
         *,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
         """Run explicit paired transfer for mixed-domain batches."""
         source_domain_id = source_domain_id.to(
             device=source_encoding.device, dtype=torch.long

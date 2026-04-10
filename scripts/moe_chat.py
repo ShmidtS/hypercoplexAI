@@ -195,6 +195,11 @@ def query_llm(user_text: str, expert_info: str, model: str = "") -> str | None:
 CHECKPOINT_CANDIDATES = [
     Path(__file__).resolve().parents[1]
     / "artifacts"
+    / "titans_opt3"
+    / "checkpoints"
+    / "best.pt",
+    Path(__file__).resolve().parents[1]
+    / "artifacts"
     / "titans_30ep"
     / "checkpoints"
     / "best.pt",

@@ -978,7 +978,7 @@ class HDIMTrainer:
         encoding: torch.Tensor,
         domain_id: torch.Tensor,
         regime: TrainingRegime,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
         return self.model(
             encoding,
             domain_id,
@@ -1035,7 +1035,7 @@ class HDIMTrainer:
                 if self._augmenter is not None:
                     pair_encoding = self._augmenter(pair_encoding, pairs_only=False)
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
-                output, routing_weights, invariant, aux_state = self.model.transfer_pairs(
+                output, routing_weights, invariant, _slot_outputs, aux_state = self.model.transfer_pairs(
                     encoding,
                     domain_id,
                     pair_domain_id,
@@ -1051,7 +1051,7 @@ class HDIMTrainer:
                 else:
                     recon_target = pair_encoding
             else:
-                output, routing_weights, invariant, aux_state = self._forward_batch(
+                output, routing_weights, invariant, _slot_outputs, aux_state = self._forward_batch(
                     encoding, domain_id, regime
                 )
                 recon_target = encoding

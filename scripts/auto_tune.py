@@ -47,6 +47,15 @@ import sys
 import time
 from pathlib import Path
 
+# Load .env file (HF_TOKEN etc) before any imports that may use it
+_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+if _ENV_PATH.exists():
+    for _line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _key, _, _val = _line.partition("=")
+            os.environ.setdefault(_key.strip(), _val.strip())
+
 import optuna
 
 # AutoConfig for parameter derivation
@@ -59,8 +68,8 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
 TRAIN_SCRIPT = str(REPO_ROOT / "scripts" / "gpu_train.py")
-STUDY_DB = str(REPO_ROOT / "artifacts" / "optuna_study_v27.db")
-STUDY_NAME = "hdim_autotune_v27"
+STUDY_DB = str(REPO_ROOT / "artifacts" / "optuna_study_v28.db")
+STUDY_NAME = "hdim_autotune_v28"
 DATA_PATH = str(REPO_ROOT / "data" / "real_pairs_v10.json")
 
 # Phase presets
@@ -73,21 +82,27 @@ PHASE_PRESETS = {
 
 # Лучшие конфиги из истории для warm-start Optuna
 SOTA_SEEDS = [
-    # Phase 26c рекорд
+    # Phase 26c рекорд + MSA defaults
     {
         "lr": 3e-4, "batch_size": 48, "augment_factor": 5,
         "lambda_pair": 0.5, "lambda_sts": 0.3, "lambda_dcl": 0.2,
         "lambda_uniformity": 0.1, "lambda_iso": 0.1, "lambda_routing": 0.02,
         "lambda_memory": 0.01, "lambda_z": 0.01, "lambda_expert_ortho": 0.02,
         "focal_gamma": 1.0, "warmup_epochs": 20, "t_mult": 2,
+        "msa_num_prototypes": 256, "msa_top_k": 16,
+        "msa_temperature": 0.07, "msa_diversity_weight": 1.0,
+        "msa_ema_momentum": 0.995,
     },
-    # Phase 26b рекорд
+    # Phase 26b рекорд + MSA defaults
     {
         "lr": 3e-4, "batch_size": 48, "augment_factor": 5,
         "lambda_pair": 0.5, "lambda_sts": 0.15, "lambda_dcl": 0.2,
         "lambda_uniformity": 0.0, "lambda_iso": 0.1, "lambda_routing": 0.02,
         "lambda_memory": 0.01, "lambda_z": 0.01, "lambda_expert_ortho": 0.02,
         "focal_gamma": 1.0, "warmup_epochs": 20, "t_mult": 2,
+        "msa_num_prototypes": 256, "msa_top_k": 16,
+        "msa_temperature": 0.07, "msa_diversity_weight": 1.0,
+        "msa_ema_momentum": 0.995,
     },
 ]
 
@@ -121,6 +136,13 @@ def objective(trial: optuna.Trial, epochs: int = 30) -> float:
     # === Scheduler ===
     t_mult = trial.suggest_categorical("t_mult", [1, 2, 3])
     warmup_epochs = trial.suggest_int("warmup_epochs", 5, 25, step=5)
+
+    # === MSA-specific (conditional, only suggested when memory_type=msa) ===
+    msa_num_prototypes = trial.suggest_categorical("msa_num_prototypes", [128, 256, 512])
+    msa_top_k = trial.suggest_categorical("msa_top_k", [8, 16, 32])
+    msa_temperature = trial.suggest_float("msa_temperature", 0.03, 0.15, step=0.01)
+    msa_diversity_weight = trial.suggest_float("msa_diversity_weight", 0.1, 2.0, step=0.1)
+    msa_ema_momentum = trial.suggest_float("msa_ema_momentum", 0.99, 0.999, step=0.001)
 
     # === Output ===
     out_dir = REPO_ROOT / "artifacts" / f"optuna_{trial.number:04d}"
@@ -167,6 +189,12 @@ def objective(trial: optuna.Trial, epochs: int = 30) -> float:
         "--results_json",     str(out_dir / "results.json"),
         "--device",           "auto",
         "--amp",
+        "--memory_type",      "msa",
+        "--msa_num_prototypes", str(msa_num_prototypes),
+        "--msa_top_k",        str(msa_top_k),
+        "--msa_temperature",  str(msa_temperature),
+        "--msa_diversity_weight", str(msa_diversity_weight),
+        "--msa_ema_momentum", str(msa_ema_momentum),
     ]
 
     start = time.time()
@@ -217,7 +245,9 @@ def objective(trial: optuna.Trial, epochs: int = 30) -> float:
         f"ep={best_epoch} t={elapsed:.0f}s "
         f"lr={lr:.5f} bs={batch_size} aug={augment_factor} "
         f"sts={lambda_sts:.2f} dcl={lambda_dcl:.2f} uni={lambda_uniformity:.3f} "
-        f"ortho={lambda_expert_ortho:.3f}"
+        f"ortho={lambda_expert_ortho:.3f} "
+        f"msa_proto={msa_num_prototypes} msa_topk={msa_top_k} "
+        f"msa_temp={msa_temperature:.2f} msa_div={msa_diversity_weight:.1f}"
     )
     # Возвращаем best_score (пик за все эпохи), а не финальный
     return best_score
@@ -232,7 +262,7 @@ def enqueue_sota_seeds(study: optuna.Study, max_seeds: int = 2) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HDIM Auto-Tuner v27 (Optuna, Phase 26)")
+    parser = argparse.ArgumentParser(description="HDIM Auto-Tuner v28 (Optuna, Phase 28 MSA)")
     parser.add_argument("--n_trials",  type=int, default=20, help="Количество trials")
     parser.add_argument("--epochs",    type=int, default=30, help="Эпох на один trial")
     parser.add_argument("--resume",    action="store_true",  help="Продолжить существующее исследование")
@@ -283,7 +313,8 @@ def main():
     print(f"AutoConfig: hidden_dim from encoder, num_experts from expert_names")
     print(f"Fixed: soft_router, pretrained_encoder,")
     print(f"       shared_expert, aux_loss_free, expert_ortho, learnable_temperature")
-    print(f"SOTA baseline: Phase 26c score=1.1542 @ ep15")
+    print(f"       memory_type=msa (with MSA-specific hyperparameter search)")
+    print(f"SOTA baseline: Phase 26c score=1.1542 @ ep15 (titans), MSA quick=1.097 @ ep3")
     print()
 
     study.optimize(
@@ -305,15 +336,15 @@ def main():
 
 
     # Save best config as .bat
-    best_bat = REPO_ROOT / "scripts" / "best_autotune.bat"
+    best_bat = REPO_ROOT / "scripts" / "best_autotune_v28.bat"
     p = best.params
     data_bat = str(REPO_ROOT / "data" / "real_pairs_v10.json").replace("/", "\\")
 
     bat_lines = [
         "@echo off",
-        f"REM Auto-tuned config v27 (Optuna, score={best.value:.4f})",
+        f"REM Auto-tuned config v28 (Optuna, score={best.value:.4f})",
         "REM Generated by scripts/auto_tune.py",
-        "REM Phase 26: shared_expert + aux_loss_free + expert_ortho + learnable_temp",
+        "REM Phase 28: MSA memory + shared_expert + aux_loss_free + expert_ortho + learnable_temp",
         "",
         "cd /d E:\\hypercoplexAI",
         "call .venv\\Scripts\\activate.bat",
@@ -354,7 +385,13 @@ def main():
         "    --output_dir artifacts\\best_autotune ^",
         "    --results_json artifacts\\best_autotune\\results.json ^",
         "    --device auto ^",
-        "    --amp",
+        "    --amp ^",
+        "    --memory_type msa ^",
+        f"    --msa_num_prototypes {p['msa_num_prototypes']} ^",
+        f"    --msa_top_k {p['msa_top_k']} ^",
+        f"    --msa_temperature {p['msa_temperature']:.2f} ^",
+        f"    --msa_diversity_weight {p['msa_diversity_weight']:.1f} ^",
+        f"    --msa_ema_momentum {p['msa_ema_momentum']:.3f}",
         "",
         "pause",
     ]
@@ -369,7 +406,7 @@ def main():
             entry.update(t.user_attrs)
             all_results.append(entry)
 
-    results_file = REPO_ROOT / "artifacts" / "optuna_results_v27.json"
+    results_file = REPO_ROOT / "artifacts" / "optuna_results_v28.json"
     results_file.write_text(json.dumps(all_results, indent=2), encoding="utf-8")
     print(f"All results saved to: {results_file}")
 
