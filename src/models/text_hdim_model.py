@@ -311,7 +311,27 @@ class TextHDIMModel(nn.Module):
             device = next(self.core_model.parameters()).device
 
         raw = self.text_encoder(texts, device=device, dtype=dtype)
-        return raw, None
+
+        # Determine matryoshka dimensions: prefer encoder config, else standard defaults
+        matryoshka_dims = getattr(self.text_encoder, "matryoshka_dims", None)
+        if matryoshka_dims is None:
+            proj = getattr(self.text_encoder, "projection", None)
+            if proj is not None and hasattr(proj, "output_dims"):
+                matryoshka_dims = proj.output_dims
+            else:
+                matryoshka_dims = [128, 256, 512]
+
+        # Only keep dims smaller than the full embedding dimension
+        embedding_dim = raw.shape[-1]
+        matryoshka_dims = [d for d in matryoshka_dims if d < embedding_dim]
+
+        if not matryoshka_dims:
+            return raw, None
+
+        scales: dict[int, torch.Tensor] = {
+            dim: raw[..., :dim] for dim in matryoshka_dims
+        }
+        return raw, scales
 
     def forward_texts(
         self,

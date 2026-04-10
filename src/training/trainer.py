@@ -506,25 +506,34 @@ class HDIMTrainer:
         if torch.isnan(target_inv).any() or torch.isinf(target_inv).any():
             return self._zero_loss(source_inv)
 
-        positive_mask = pair_relation_label > 0.5
+        dev = source_inv.device
+        positive_mask = pair_relation_label.to(dev) > 0.5
         if not positive_mask.any():
             return self._zero_loss(source_inv)
 
-        src = F.normalize(source_inv, dim=-1)  # (B, D)
-        tgt = F.normalize(target_inv, dim=-1)  # (B, D)
+        src = F.normalize(source_inv.float(), dim=-1)  # (B, D) — float32 for AMP safety
+        tgt = F.normalize(target_inv.float(), dim=-1)  # (B, D)
 
-        # Similarity matrix: (B, B)
+        # Similarity matrix: (B, B) — keep in float32 to avoid fp16 overflow
         sim_matrix = src @ tgt.T / temperature
+
+        # Mask out other positive pairs from denominator (false negatives)
+        # For each positive i, other positives j should NOT be treated as negatives
+        if positive_mask.sum() > 1:
+            pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)  # (B, B)
+            # Set logits of other positive pairs to -inf so they're excluded from softmax
+            eye_mask = torch.eye(B, dtype=torch.bool, device=dev)
+            sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~eye_mask, float('-inf'))
 
         # InfoNCE: for each positive pair (i,i), treat all other j≠i as negatives
         # Только для положительных пар считаем loss
         pos_indices = positive_mask.nonzero(as_tuple=True)[0]
 
         # Labels: diagonal = self-match for positives
-        labels = torch.arange(B, device=self.device)
+        labels = torch.arange(B, device=dev)
         loss_per_sample = F.cross_entropy(sim_matrix[pos_indices], labels[pos_indices], reduction='none')
 
-        weights = pair_weight[pos_indices]
+        weights = pair_weight.to(dev)[pos_indices]
         return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
@@ -567,35 +576,39 @@ class HDIMTrainer:
         if torch.isnan(target_inv).any() or torch.isinf(target_inv).any():
             return self._zero_loss(source_inv)
 
-        positive_mask = pair_relation_label > 0.5
+        dev = source_inv.device
+        positive_mask = pair_relation_label.to(dev) > 0.5
         if not positive_mask.any():
             return self._zero_loss(source_inv)
 
-        src = F.normalize(source_inv, dim=-1)
-        tgt = F.normalize(target_inv, dim=-1)
+        src = F.normalize(source_inv.float(), dim=-1)  # float32 for AMP safety
+        tgt = F.normalize(target_inv.float(), dim=-1)
 
         pos_indices = positive_mask.nonzero(as_tuple=True)[0]
-        labels = torch.arange(B, device=self.device)
+        labels = torch.arange(B, device=dev)
 
         if gamma >= 0.99:
             # Standard InfoNCE path (no focal modulation)
             sim_matrix = src @ tgt.T / temperature
+            # Mask out other positive pairs from denominator (false negatives)
+            if positive_mask.sum() > 1:
+                pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
+                sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
             loss_per_sample = F.cross_entropy(
                 sim_matrix[pos_indices], labels[pos_indices], reduction='none'
             )
         else:
             # Focal-InfoNCE: scale logits by gamma before CE
-            # This compresses the softmax denominator toward uniform,
-            # downweighting easy negatives that already have low probability.
             sim_matrix = src @ tgt.T / temperature
-            # Focal scaling: lower gamma → more aggressive downweighting
-            # Equivalent to: (exp(s/τ))^γ / Σ_j (exp(s_j/τ))^γ
+            if positive_mask.sum() > 1:
+                pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
+                sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
             focal_matrix = sim_matrix * gamma
             loss_per_sample = F.cross_entropy(
                 focal_matrix[pos_indices], labels[pos_indices], reduction='none'
             )
 
-        weights = pair_weight[pos_indices]
+        weights = pair_weight.to(dev)[pos_indices]
         return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
@@ -1063,17 +1076,16 @@ class HDIMTrainer:
         pair_relation_label = batch.get("pair_relation_label")
         pair_weight = batch.get("pair_weight")
         loss_memory = aux_state.memory_loss
-        # STS regularization: поддерживаем косинусное сходство позитивных пар
-        # iso_target содержит training_invariant пары — используем как proxy
+        # STS regularization: косинусное сходство позитивных пар в exported_invariant space
         loss_sts = self._zero_loss(training_invariant)
         if self.lambda_sts > 0 and self._has_pairs(batch):
             _prl = batch.get("pair_relation_label")
-            if _prl is not None:
+            if _prl is not None and pair_exported_target is not None:
                 _pos_mask = (_prl.to(self.device) > 0.5)
                 if _pos_mask.any():
-                    # training_invariant и iso_target — одинаковая размерность
-                    src_norm = F.normalize(training_invariant[_pos_mask], dim=-1)
-                    tgt_norm = F.normalize(iso_target[_pos_mask], dim=-1)
+                    # exported_invariant space matches STS evaluation metric
+                    src_norm = F.normalize(aux_state.exported_invariant[_pos_mask], dim=-1)
+                    tgt_norm = F.normalize(pair_exported_target[_pos_mask], dim=-1)
                     cos_sim = (src_norm * tgt_norm).sum(dim=-1)
                     loss_sts = (1.0 - cos_sim).mean()
 

@@ -861,13 +861,13 @@ def main() -> None:
     parser.add_argument("--freeze_sbert", action="store_true",
                         help="Freeze bottom 50%% of SBERT encoder (standalone freezing without build_sbert)")
     # Loss
-    parser.add_argument("--lambda_sts", type=float, default=0.0,
-                        help="STS regularization weight (cosine similarity preservation, default 0=off)")
+    parser.add_argument("--lambda_sts", type=float, default=0.3,
+                        help="STS regularization weight (cosine similarity preservation, default 0.3)")
     parser.add_argument("--use_infonce", action="store_true", default=True,
                         help="Use InfoNCE loss instead of ranking margin (default: True)")
     parser.add_argument("--no_infonce", dest="use_infonce", action="store_false")
-    parser.add_argument("--infonce_temperature", type=float, default=0.15,
-                        help="InfoNCE temperature (default: 0.15)")
+    parser.add_argument("--infonce_temperature", type=float, default=0.07,
+                        help="InfoNCE temperature (default: 0.07)")
     # Real data
     parser.add_argument("--real_pairs", type=str, default=None,
                         help="Path to real_pairs.json for training on real cross-domain pairs")
