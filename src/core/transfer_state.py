@@ -78,4 +78,5 @@ class TransferState:
             "memory_augmented_invariant": self.memory_augmented_invariant,
             "exported_invariant": self.exported_invariant,
             "invariant": self.invariant,
+            "transfer_truth": self.transfer_truth,
         }

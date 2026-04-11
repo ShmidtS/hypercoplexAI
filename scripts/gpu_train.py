@@ -297,9 +297,13 @@ def _build_scheduler(optimizer, args, total_steps: int):
     lr = args.lr
     epochs = args.epochs
 
+    # Returns (scheduler, needs_score, per_batch)
+    # per_batch=True: scheduler.step() after each batch (OneCycleLR, CosineWarmRestarts)
+    # per_batch=False: scheduler.step() after each epoch (CosineDecay, Plateau)
     if stype == "cosine_restarts":
         # T_0 in STEPS — Phase 8e record: T_0=20 epochs * steps_per_epoch
         # Cycles: 20ep -> 40ep -> 80ep. Best score on cycle 3 (ep45-60).
+        # MUST step per-batch because T_0 is in steps, not epochs.
         steps_per_epoch = max(1, total_steps // max(1, epochs))
         T_0_epochs = max(getattr(args, "warmup_epochs", 20), 15)
         T_0 = T_0_epochs * steps_per_epoch
@@ -308,13 +312,13 @@ def _build_scheduler(optimizer, args, total_steps: int):
             T_0=T_0,
             T_mult=getattr(args, "t_mult", 2),
             eta_min=lr * 1e-3,
-        ), False  # (scheduler, needs_score)
+        ), False, True  # per_batch=True
     elif stype == "cosine_decay":
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=epochs,
             eta_min=lr * 1e-3,
-        ), False
+        ), False, False  # T_max in epochs, step per-epoch
     elif stype == "plateau":
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -322,7 +326,7 @@ def _build_scheduler(optimizer, args, total_steps: int):
             factor=0.5,
             patience=10,
             min_lr=lr * 1e-3,
-        ), True  # needs_score=True: вызывать step(score)
+        ), True, False  # needs_score=True, step per-epoch
     elif stype == "onecycle":
         return torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -330,7 +334,7 @@ def _build_scheduler(optimizer, args, total_steps: int):
             total_steps=total_steps,
             pct_start=0.1,
             anneal_strategy="cos",
-        ), False
+        ), False, True  # per_batch=True (OneCycleLR requires per-batch stepping)
     else:
         raise ValueError(f"Unknown scheduler_type: {stype}")
 
@@ -436,11 +440,9 @@ def run_gpu_training(
     )
 
     use_amp = (device.type == "cuda") and args.amp
-    scaler = GradScaler("cuda") if use_amp else None
+    scaler = GradScaler(device.type) if use_amp else None
     if use_amp:
         print("Using Automatic Mixed Precision (AMP)")
-
-    total_steps = args.epochs * max(1, getattr(args, 'num_samples', 500) // args.batch_size)
 
     trainer = HDIMTrainer(
         model, optimizer,
@@ -517,8 +519,7 @@ def run_gpu_training(
         temp_lr_mult = getattr(args, 'temperature_lr_mult', 0.1)
         optimizer.add_param_group({'params': [trainer._log_temp], 'lr': args.lr * temp_lr_mult})
         print(f"Learnable temperature enabled (init={trainer._log_temp.exp().item():.4f})")
-    # Build scheduler AFTER all param groups are added (including learnable_temperature)
-    scheduler, scheduler_needs_score = _build_scheduler(optimizer, args, total_steps)
+    # total_steps will be computed AFTER dataset loading (see below)
     real_pairs_path = getattr(args, 'real_pairs', None)
     if real_pairs_path:
         from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
@@ -554,6 +555,12 @@ def run_gpu_training(
             [metrics_n, len(metrics_dataset) - metrics_n],
             generator=torch.Generator().manual_seed(args.seed + 99),
         )
+
+    # Compute total_steps from actual dataset size (not from num_samples default)
+    steps_per_epoch = max(1, len(train_ds) // args.batch_size)
+    total_steps = args.epochs * steps_per_epoch
+    print(f"Scheduler: total_steps={total_steps} (from {len(train_ds)} train samples, bs={args.batch_size})")
+    scheduler, scheduler_needs_score, scheduler_per_batch = _build_scheduler(optimizer, args, total_steps)
 
     # HDIM_NUM_WORKERS=0 отключает workers (используется auto_tune для экономии RAM)
     import os as _os
@@ -652,6 +659,18 @@ def run_gpu_training(
                 consecutive_nan = 0
                 epoch_loss += loss.item()
                 n_batches += 1
+                # Per-batch scheduler stepping (OneCycleLR, CosineWarmRestarts)
+                if scheduler_per_batch and not scheduler_needs_score:
+                    prev_lr = optimizer.param_groups[0]["lr"]
+                    scheduler.step()
+                    try:
+                        current_lr = scheduler.get_last_lr()[0]
+                    except Exception:
+                        current_lr = optimizer.param_groups[0]["lr"]
+                    # Detect LR restart (CosineWarmRestarts): stabilize memory
+                    if current_lr > prev_lr * 1.5 and hasattr(model, 'reset_memory'):
+                        model.reset_memory(strategy='stabilize')
+                        print(f"  [LR restart] Memory stabilized. LR: {prev_lr:.6f} -> {current_lr:.6f}")
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     torch.cuda.empty_cache()
@@ -673,25 +692,30 @@ def run_gpu_training(
             if breakdown_str:
                 print(f"  Loss breakdown: {breakdown_str}")
 
-        if scheduler_needs_score:
-            # ReduceLROnPlateau: нужен score (лучше вызывать после eval)
-            _sched_score = compute_primary_score(quality_metrics) if quality_metrics.get("pair_margin", 0) > 0 else 0.0
-            scheduler.step(_sched_score)
-            current_lr = optimizer.param_groups[0]["lr"]
+        # Per-epoch scheduler stepping (CosineDecay, ReduceLROnPlateau)
+        if not scheduler_per_batch:
+            if scheduler_needs_score:
+                # ReduceLROnPlateau: нужен score (лучше вызывать после eval)
+                _sched_score = compute_primary_score(quality_metrics) if quality_metrics.get("pair_margin", 0) > 0 else 0.0
+                scheduler.step(_sched_score)
+                current_lr = optimizer.param_groups[0]["lr"]
+            else:
+                prev_lr = optimizer.param_groups[0]["lr"]
+                scheduler.step()
+                try:
+                    current_lr = scheduler.get_last_lr()[0]
+                except Exception:
+                    current_lr = optimizer.param_groups[0]["lr"]
+                # A2 FIX (upgraded): detect LR restart (CosineWarmRestarts)
+                if current_lr > prev_lr * 1.5 and hasattr(model, 'reset_memory'):
+                    model.reset_memory(strategy='stabilize')
+                    print(f"[LR restart ep{epoch}] Memory stabilized. LR: {prev_lr:.6f} -> {current_lr:.6f}")
         else:
-            prev_lr = optimizer.param_groups[0]["lr"]
-            scheduler.step()
+            # Per-batch scheduler: read current LR from scheduler
             try:
                 current_lr = scheduler.get_last_lr()[0]
             except Exception:
                 current_lr = optimizer.param_groups[0]["lr"]
-            # A2 FIX (upgraded): detect LR restart (CosineWarmRestarts)
-            # Use 'stabilize' instead of hard reset — preserves memory patterns,
-            # only normalizes momentum to prevent exploding gradients after LR spike.
-            # Hard reset would cause score drop at each restart cycle.
-            if current_lr > prev_lr * 1.5 and hasattr(model, 'reset_memory'):
-                model.reset_memory(strategy='stabilize')
-                print(f"[LR restart ep{epoch}] Memory stabilized. LR: {prev_lr:.6f} -> {current_lr:.6f}")
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val_metrics = trainer.validate(val_loader)
@@ -788,7 +812,7 @@ def main() -> None:
                         help="T_0 for cosine_restarts in epochs (default: 20, Phase8e record)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--amp", action="store_true", default=False)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing to reduce activation memory")
@@ -809,7 +833,7 @@ def main() -> None:
                         help="Clifford algebra nilpotent bases (default=0)")
     # Loss weights
     parser.add_argument("--lambda_iso", type=float, default=0.1)
-    parser.add_argument("--lambda_pair", type=float, default=0.1)
+    parser.add_argument("--lambda_pair", type=float, default=0.4)
     parser.add_argument("--lambda_routing", type=float, default=0.05)
     parser.add_argument("--lambda_z", type=float, default=0.0,
                         help="Router z-loss weight (ST-MoE stability, default=0=disabled)")
@@ -818,10 +842,10 @@ def main() -> None:
     parser.add_argument("--lambda_uniformity", type=float, default=0.0,
                         help="Uniformity+Alignment loss weight (Wang & Isola 2020, try 0.1-0.3)")
     parser.add_argument("--lambda_memory", type=float, default=0.01)
-    parser.add_argument("--lambda_diversity_var", type=float, default=0.01,
-                        help="Diversity variance weight (anti-collapse)")
-    parser.add_argument("--lambda_diversity_ortho", type=float, default=0.005,
-                        help="Diversity orthogonality weight (anti-collapse)")
+    parser.add_argument("--lambda_diversity_var", type=float, default=0.0,
+                        help="Diversity variance weight (anti-collapse, 0.0=disabled)")
+    parser.add_argument("--lambda_diversity_ortho", type=float, default=0.0,
+                        help="Diversity orthogonality weight (anti-collapse, 0.0=disabled)")
     parser.add_argument("--lambda_matryoshka", type=float, default=0.1,
                         help="Matryoshka multi-scale loss weight")
     parser.add_argument("--ranking_margin", type=float, default=0.3)
@@ -861,8 +885,8 @@ def main() -> None:
     parser.add_argument("--freeze_sbert", action="store_true",
                         help="Freeze bottom 50%% of SBERT encoder (standalone freezing without build_sbert)")
     # Loss
-    parser.add_argument("--lambda_sts", type=float, default=0.3,
-                        help="STS regularization weight (cosine similarity preservation, default 0.3)")
+    parser.add_argument("--lambda_sts", type=float, default=0.0,
+                        help="STS regularization weight (0.0 by default, try 0.3-0.5 with STS data)")
     parser.add_argument("--use_infonce", action="store_true", default=True,
                         help="Use InfoNCE loss instead of ranking margin (default: True)")
     parser.add_argument("--no_infonce", dest="use_infonce", action="store_false")

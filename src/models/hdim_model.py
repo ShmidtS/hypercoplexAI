@@ -48,6 +48,8 @@ class HDIMAuxState:
     hallucination_risk: float = 0.0
     memory_surprise: float | None = None
     feedback_action: str | None = None  # Phase 33: Hallucination feedback action
+    online_loss: torch.Tensor = torch.tensor(0.0)  # Phase 31: Online learning loss
+    online_updated: bool = False  # Phase 31: Whether online update fired
 
     def to_dict(self) -> Dict[str, Union[torch.Tensor, bool, str, float, None]]:
         return {
@@ -69,6 +71,8 @@ class HDIMAuxState:
             "update_memory": self.update_memory,
             "hallucination_risk": self.hallucination_risk,
             "memory_surprise": self.memory_surprise,
+            "online_loss": self.online_loss,
+            "online_updated": self.online_updated,
         }
 
 
@@ -295,6 +299,8 @@ class HDIMModel(nn.Module):
         hallucination_risk: float = 0.0,
         memory_surprise: float | None = None,
         feedback_action: str | None = None,
+        online_loss: torch.Tensor | None = None,
+        online_updated: bool = False,
     ) -> HDIMAuxState:
         return HDIMAuxState(
             memory_loss=memory_loss,
@@ -316,6 +322,8 @@ class HDIMModel(nn.Module):
             hallucination_risk=hallucination_risk,
             memory_surprise=memory_surprise,
             feedback_action=feedback_action,
+            online_loss=online_loss if online_loss is not None else torch.tensor(0.0),
+            online_updated=online_updated,
         )
 
     def _build_aux_state_from_transfer_state(
@@ -439,6 +447,7 @@ class HDIMModel(nn.Module):
         torch.Tensor, torch.Tensor, torch.Tensor,
         bool, Optional[torch.Tensor], float,
         Optional[float], Optional[str],
+        torch.Tensor, bool,
     ]:
         """Shared core for forward and transfer_pairs.
 
@@ -614,6 +623,7 @@ class HDIMModel(nn.Module):
         train_scores_snapshot, expert_usage, routing_entropy,
         memory_loss, router_loss, z_loss, memory_updated, slot_outputs_tensor,
         hallucination_risk, memory_surprise_val, feedback_action,
+        online_loss, online_updated,
         )
 
     def forward(
@@ -647,6 +657,7 @@ class HDIMModel(nn.Module):
             train_scores_snapshot, expert_usage, _routing_entropy,
         memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
         _hallucination_risk, _memory_surprise, _feedback_action,
+        _online_loss, _online_updated,
         ) = self._forward_core(
             x, R_inv_per_sample, R_per_sample, R_per_sample, R_inv_per_sample,
             group_masks, runtime,
@@ -673,6 +684,8 @@ class HDIMModel(nn.Module):
                 hallucination_risk=_hallucination_risk,
                 memory_surprise=_memory_surprise,
                 feedback_action=_feedback_action,
+                online_loss=_online_loss,
+                online_updated=_online_updated,
             )
             return output, routing_weights, invariant, _slot_outputs, aux_state
         return output, routing_weights, invariant, _slot_outputs, None
@@ -779,6 +792,7 @@ class HDIMModel(nn.Module):
             train_scores_snapshot, expert_usage, _routing_entropy,
         memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
         _hallucination_risk, _memory_surprise, _feedback_action,
+        _online_loss, _online_updated,
         ) = self._forward_core(
             source_encoding,
             R_src_inv_per_sample, R_src_per_sample,
@@ -808,6 +822,8 @@ class HDIMModel(nn.Module):
             hallucination_risk=_hallucination_risk,
             memory_surprise=_memory_surprise,
             feedback_action=_feedback_action,
+            online_loss=_online_loss,
+            online_updated=_online_updated,
         )
         return output, routing_weights, invariant, _slot_outputs, aux_state
 

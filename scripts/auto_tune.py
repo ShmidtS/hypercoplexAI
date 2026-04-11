@@ -114,7 +114,7 @@ def objective(trial: optuna.Trial, epochs: int = 30) -> float:
     lr = trial.suggest_float("lr", 5e-5, 8e-4, log=True)
 
     # === Batch size ===
-    batch_size = trial.suggest_categorical("batch_size", [24, 32, 48, 64])
+    batch_size = trial.suggest_categorical("batch_size", [16, 24, 32])
 
     # === Augment factor (v10 1036 пар — не нужно много) ===
     augment_factor = trial.suggest_int("augment_factor", 2, 10)

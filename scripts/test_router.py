@@ -17,7 +17,7 @@ config = HDIMConfig(
 )
 
 model = HDIMModel(config)
-_patch_moe_kernel(model, expert_names=["math", "language", "code", "science"])
+_patch_moe_kernel(model.core_model, expert_names=["math", "language", "code", "science"])
 model.eval()
 
 print('Router Architecture:')

@@ -231,7 +231,7 @@ def build_model():
     checkpoint_path = next((path for path in CHECKPOINT_CANDIDATES if path.exists()), None)
 
     if checkpoint_path is not None:
-        ckpt = torch.load(str(checkpoint_path), map_location=DEVICE, weights_only=True)
+        ckpt = torch.load(str(checkpoint_path), map_location=DEVICE, weights_only=False)
         sd = ckpt.get("model_state_dict", ckpt)
         proj_bias = sd.get("text_encoder.projection.4.bias")
         hidden_dim = proj_bias.shape[0] if proj_bias is not None else 256
@@ -308,8 +308,7 @@ def encode_text(model, text: str):
         # Normalize routing scores to probabilities for display/dominant detection
         weights_sum = expert_weights.sum().clamp(min=1e-8)
         expert_probs = expert_weights / weights_sum
-        # Blend with semantic keyword hints
-        semantic_hints = semantic_domain_hints(text)
+        # Blend with semantic keyword hints (reuse semantic_hints from line 303)
         blended: dict[str, float] = {}
         for name in DOMAIN_NAMES:
             model_w = expert_probs[DOMAIN_IDX[name]].item()

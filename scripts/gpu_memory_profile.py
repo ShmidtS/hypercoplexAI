@@ -44,7 +44,7 @@ def profile_gpu_memory():
 
     # Stage 2: Import SBERT
     from sentence_transformers import SentenceTransformer
-    sbert = SentenceTransformer('all-MiniLM-L6-v2')
+    sbert = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
     sbert.to(device)
     after_sbert = torch.cuda.memory_allocated() / 1024**3
     print(f"[2] After SBERT load: {after_sbert:.3f} GB (+{after_sbert - baseline:.3f})")

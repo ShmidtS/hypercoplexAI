@@ -39,6 +39,7 @@ class HDIMTrainer:
         lambda_supcon: float = 0.0,
         lambda_z: float = 0.01,  # MoE z-loss (prevents router collapse)
         lambda_expert_ortho: float = 0.01,  # expert orthogonalization (Phase 26)
+        lambda_online: float = 0.01,  # online self-evolution loss (Phase 31)
         learnable_temperature: bool = False,
         lambda_dcl: float = 0.0,
         lambda_uniformity: float = 0.0,
@@ -73,6 +74,7 @@ class HDIMTrainer:
         self.lambda_supcon = lambda_supcon
         self.lambda_z = lambda_z
         self.lambda_expert_ortho = lambda_expert_ortho
+        self.lambda_online = lambda_online
         self.lambda_dcl = lambda_dcl
         self.lambda_uniformity = lambda_uniformity
         self.lambda_diversity_var = lambda_diversity_var
@@ -291,7 +293,7 @@ class HDIMTrainer:
             return self._zero_loss(exported_invariant)
 
         # Normalize for consistent scale
-        x = F.normalize(exported_invariant, dim=-1)  # (B, D)
+        x = F.normalize(exported_invariant.float(), dim=-1)  # fp32 for AMP safety
 
         # 1. Variance penalty: encourage vectors to spread out on the hypersphere
         mean_vec = x.mean(dim=0, keepdim=True)  # (1, D)
@@ -438,8 +440,8 @@ class HDIMTrainer:
         if B < 2:
             return self._zero_loss(source_inv)
 
-        src = F.normalize(source_inv, dim=-1)
-        tgt = F.normalize(target_inv, dim=-1)
+        src = F.normalize(source_inv.float(), dim=-1)  # fp32 for AMP safety
+        tgt = F.normalize(target_inv.float(), dim=-1)
         cos_sim = (src * tgt).sum(dim=-1).clamp(-1 + 1e-6, 1 - 1e-6)  # [B]
 
         # Угол в [0, 1]: 0=идентичные, 1=ортогональные
@@ -465,8 +467,8 @@ class HDIMTrainer:
         -1 means no hard negative found.
         """
         B = source_inv.shape[0]
-        src = F.normalize(source_inv.detach(), dim=-1)
-        tgt = F.normalize(target_inv.detach(), dim=-1)
+        src = F.normalize(source_inv.detach().float(), dim=-1)  # fp32 for AMP safety
+        tgt = F.normalize(target_inv.detach().float(), dim=-1)
         sim = src @ tgt.T  # (B, B)
 
         # Mask diagonal and true positives
@@ -528,8 +530,8 @@ class HDIMTrainer:
         src = F.normalize(source_inv.float(), dim=-1)  # (B, D) — float32 for AMP safety
         tgt = F.normalize(target_inv.float(), dim=-1)  # (B, D)
 
-        # Similarity matrix: (B, B) — keep in float32 to avoid fp16 overflow
-        sim_matrix = src @ tgt.T / temperature
+        # Similarity matrix: (B, B) — force float32 to avoid fp16 overflow in masked_fill/logsumexp
+        sim_matrix = (src @ tgt.T / temperature).float()
 
         # Mask out false negatives from denominator
         # 1) Same-family entries (same pair_group_id) — semantically similar but not true negatives
@@ -537,12 +539,12 @@ class HDIMTrainer:
             gid = pair_group_id.to(dev)
             group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))  # (B, B)
             eye_mask = torch.eye(B, dtype=torch.bool, device=dev)
-            sim_matrix = sim_matrix.masked_fill(group_match & ~eye_mask, float('-inf'))
+            sim_matrix = sim_matrix.masked_fill(group_match & ~eye_mask, -torch.finfo(torch.float32).max)
         # 2) Other positive pairs (label>0.5) — also false negatives
         elif positive_mask.sum() > 1:
             pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)  # (B, B)
             eye_mask = torch.eye(B, dtype=torch.bool, device=dev)
-            sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~eye_mask, float('-inf'))
+            sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~eye_mask, -torch.finfo(torch.float32).max)
 
         # InfoNCE: for each positive pair (i,i), treat all other j≠i as negatives
         # Только для положительных пар считаем loss
@@ -609,28 +611,28 @@ class HDIMTrainer:
 
         if gamma >= 0.99:
             # Standard InfoNCE path (no focal modulation)
-            sim_matrix = src @ tgt.T / temperature
+            sim_matrix = (src @ tgt.T / temperature).float()
             # Mask out false negatives from denominator
             if pair_group_id is not None:
                 gid = pair_group_id.to(dev)
                 group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))
-                sim_matrix = sim_matrix.masked_fill(group_match & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
+                sim_matrix = sim_matrix.masked_fill(group_match & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
             elif positive_mask.sum() > 1:
                 pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
-                sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
+                sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
             loss_per_sample = F.cross_entropy(
                 sim_matrix[pos_indices], labels[pos_indices], reduction='none'
             )
         else:
             # Focal-InfoNCE: scale logits by gamma before CE
-            sim_matrix = src @ tgt.T / temperature
+            sim_matrix = (src @ tgt.T / temperature).float()
             if pair_group_id is not None:
                 gid = pair_group_id.to(dev)
                 group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))
-                sim_matrix = sim_matrix.masked_fill(group_match & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
+                sim_matrix = sim_matrix.masked_fill(group_match & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
             elif positive_mask.sum() > 1:
                 pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
-                sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), float('-inf'))
+                sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
             focal_matrix = sim_matrix * gamma
             loss_per_sample = F.cross_entropy(
                 focal_matrix[pos_indices], labels[pos_indices], reduction='none'
@@ -667,17 +669,16 @@ class HDIMTrainer:
         if not positive_mask.any():
             return self._zero_loss(source_inv)
 
-        src = F.normalize(source_inv, dim=-1)   # (B, D)
-        tgt = F.normalize(target_inv, dim=-1)   # (B, D)
+        src = F.normalize(source_inv.float(), dim=-1)   # (B, D) — fp32 to avoid AMP fp16 precision loss
+        tgt = F.normalize(target_inv.float(), dim=-1)   # (B, D)
 
-        sim_matrix = src @ tgt.T / temperature  # (B, B)
+        sim_matrix = (src @ tgt.T / temperature).float()  # force fp32 for AMP safety
 
         pos_indices = positive_mask.nonzero(as_tuple=True)[0]
         diag_mask = torch.eye(B, dtype=torch.bool, device=self.device)
 
         # Vectorized: mask diagonal to -inf for all rows at once
-        # Use float32 to avoid fp16 overflow with large negative values under AMP
-        masked_sim = sim_matrix.float()
+        masked_sim = sim_matrix.clone()
         masked_sim.masked_fill_(diag_mask, -torch.finfo(torch.float32).max)
         log_denom = torch.logsumexp(masked_sim, dim=1)  # (B,)
         s_pos = sim_matrix.diag()  # (B,)
@@ -713,8 +714,8 @@ class HDIMTrainer:
             return self._zero_loss(source_inv)
 
         positive_mask = pair_relation_label > 0.5
-        src = F.normalize(source_inv, dim=-1)  # (B, D)
-        tgt = F.normalize(target_inv, dim=-1)  # (B, D)
+        src = F.normalize(source_inv.float(), dim=-1)  # (B, D)
+        tgt = F.normalize(target_inv.float(), dim=-1)  # (B, D)
 
         # Alignment: только для positives
         if positive_mask.any():
@@ -732,7 +733,7 @@ class HDIMTrainer:
         mask = ~torch.eye(2 * B, dtype=torch.bool, device=self.device)
         sq_dists_off = sq_dists[mask].view(2 * B, 2 * B - 1)
         # Numerically stable log-mean-exp to avoid Inf overflow
-        neg_sq = -t_uniform * sq_dists_off
+        neg_sq = (-t_uniform * sq_dists_off).float()  # fp32 для logsumexp стабильности
         loss_uniform = torch.logsumexp(neg_sq, dim=-1).mean() - math.log(neg_sq.shape[-1])
 
         return lambda_align * loss_align + lambda_uniform * loss_uniform
@@ -763,9 +764,9 @@ class HDIMTrainer:
             return self._zero_loss(source_inv)
 
         temp = self._effective_temperature()
-        src = F.normalize(source_inv, dim=-1)   # (B, D)
-        tgt = F.normalize(target_inv, dim=-1)   # (B, D)
-        sim_matrix = src @ tgt.T / temp          # (B, B)
+        src = F.normalize(source_inv.float(), dim=-1)   # (B, D) — fp32 to avoid AMP fp16 precision loss
+        tgt = F.normalize(target_inv.float(), dim=-1)   # (B, D)
+        sim_matrix = (src @ tgt.T / temp).float()  # force fp32 for AMP safety
 
         # Маска позитивов: same group AND positive label
         group_match = (pair_group_id.unsqueeze(0) == pair_group_id.unsqueeze(1))  # (B, B)
@@ -778,7 +779,7 @@ class HDIMTrainer:
         eye = torch.eye(B, dtype=torch.bool, device=self.device)
         denom_mask = ~eye  # (B, B)
 
-        log_denom = torch.logsumexp(sim_matrix.float().masked_fill(eye, -torch.finfo(torch.float32).max), dim=-1)  # float32 for fp16 overflow safety
+        log_denom = torch.logsumexp(sim_matrix.masked_fill(eye, -torch.finfo(torch.float32).max), dim=-1)
 
         # Vectorized: for each sample, average over positive similarities
         num_pos = pos_mask.sum(dim=1).clamp(min=1)  # (B,) — at least 1 to avoid div by 0
@@ -865,8 +866,8 @@ class HDIMTrainer:
         if not positive_mask.any() or exported_invariant.shape[0] < 2:
             return self._zero_loss(exported_invariant)
 
-        source_normalized = F.normalize(exported_invariant, dim=-1)
-        target_normalized = F.normalize(pair_exported_target, dim=-1)
+        source_normalized = F.normalize(exported_invariant.float(), dim=-1)  # fp32 for AMP safety
+        target_normalized = F.normalize(pair_exported_target.float(), dim=-1)
         similarities = source_normalized @ target_normalized.transpose(0, 1)
         anchor_indices = torch.arange(exported_invariant.shape[0], device=self.device)
         negative_indices = self._compute_negative_pair_indices(
@@ -947,14 +948,15 @@ class HDIMTrainer:
                 
             src_emb = matryoshka_source[dim]
             tgt_emb = matryoshka_target[dim]
-            
-            # Use InfoNCE at each scale
+
+            # Use InfoNCE at each scale with pair_group_id for SupCon
             scale_loss = self._compute_infonce_loss(
                 src_emb,
                 tgt_emb,
                 pair_relation_label,
                 pair_weight,
                 temperature=self._effective_temperature(),
+                pair_group_id=batch.get("pair_group_id"),
             )
             total_loss = total_loss + scale_loss
             n_scales += 1
@@ -1123,8 +1125,8 @@ class HDIMTrainer:
                 _pos_mask = (_prl.to(self.device) > 0.5)
                 if _pos_mask.any():
                     # exported_invariant space matches STS evaluation metric
-                    src_norm = F.normalize(aux_state.exported_invariant[_pos_mask], dim=-1)
-                    tgt_norm = F.normalize(pair_exported_target[_pos_mask], dim=-1)
+                    src_norm = F.normalize(aux_state.exported_invariant[_pos_mask].float(), dim=-1)  # fp32 for AMP safety
+                    tgt_norm = F.normalize(pair_exported_target[_pos_mask].float(), dim=-1)
                     cos_sim = (src_norm * tgt_norm).sum(dim=-1)
                     loss_sts = (1.0 - cos_sim).mean()
 
@@ -1167,6 +1169,7 @@ class HDIMTrainer:
             + (self.lambda_diversity_var + self.lambda_diversity_ortho) * loss_diversity  # disabled when 0
             + self.lambda_matryoshka * loss_matryoshka
             + self.lambda_expert_ortho * loss_expert_ortho
+            + self.lambda_online * aux_state.online_loss
         )
 
         # Pairwise auxiliary losses (added directly with their own lambdas)
@@ -1199,6 +1202,17 @@ class HDIMTrainer:
                     _prl_typed,
                 )
                 loss_total = loss_total + self.lambda_uniformity * loss_uniformity
+        # NaN protection: clamp any component that blew up
+        if torch.isnan(loss_total) or torch.isinf(loss_total):
+            _components = {
+                "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
+                "loss_routing": loss_routing, "loss_memory": loss_memory, "loss_sts": loss_sts,
+                "loss_z": loss_z, "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
+                "loss_expert_ortho": loss_expert_ortho, "online_loss": aux_state.online_loss,
+            }
+            _nan_names = [k for k, v in _components.items() if torch.isnan(v) or torch.isinf(v)]
+            print(f"  [NaN guard] NaN/Inf in loss components: {_nan_names}")
+            loss_total = torch.tensor(0.0, device=loss_total.device, requires_grad=True)
         batch_losses = {
             "loss_total": loss_total,
             "loss_recon": loss_recon,
@@ -1209,6 +1223,7 @@ class HDIMTrainer:
             "loss_diversity": loss_diversity,
             "loss_matryoshka": loss_matryoshka,
             "loss_expert_ortho": loss_expert_ortho,
+            "loss_online": aux_state.online_loss,
             "routing_weights": routing_weights,
             "invariant": invariant,
             "raw_invariant": aux_state.raw_invariant,

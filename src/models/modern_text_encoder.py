@@ -351,7 +351,7 @@ class ModernBertEncoder(nn.Module):
             result = self.projection(pooled, target_dim=target_dim)
             # Return output_dim tensor by default; dict only when target_dim="all"
             if isinstance(result, dict) and target_dim is None:
-                result = result[self.output_dim]
+                result = result[self.projection.max_dim][..., :self.output_dim]
         else:
             result = self.projection(pooled)
 

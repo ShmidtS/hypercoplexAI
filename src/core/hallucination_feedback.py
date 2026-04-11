@@ -399,6 +399,9 @@ class HallucinationFeedbackLoop(nn.Module):
         # Determine action based on risk level
         action, risk_level = self.threshold_checker.check(risk_score)
 
+        current_expert = routing_info.get("current_expert", self.expert_names[0])
+        expert_weights = routing_info.get("expert_weights")
+
         if self._use_proportional:
             evidence_count = routing_info.get("evidence_count", 0)
             prop = self.proportional_response(risk_score, evidence_count)
@@ -408,9 +411,6 @@ class HallucinationFeedbackLoop(nn.Module):
                     blend = prop["reroute_strength"]
                     expert_weights = blend * expert_weights + (1 - blend) * torch.ones_like(expert_weights) / len(self.expert_names)
                     routing_info["expert_weights"] = expert_weights
-
-        current_expert = routing_info.get("current_expert", self.expert_names[0])
-        expert_weights = routing_info.get("expert_weights")
 
         # Determine selected expert
         selected_expert = current_expert

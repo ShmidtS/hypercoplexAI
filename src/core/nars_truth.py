@@ -9,6 +9,7 @@ Borrowed from OpenNARS-for-Applications (Truth.h, Truth.c).
 
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import ClassVar
 import math
 
 
@@ -23,9 +24,9 @@ class NarsTruth:
     freq: float = 0.5
     conf: float = 0.0
 
-    EVIDENTIAL_HORIZON: float = 1.0
-    MAX_CONFIDENCE: float = 0.99
-    RELIANCE: float = 0.9  # weight of new evidence in revision
+    EVIDENTIAL_HORIZON: ClassVar[float] = 1.0
+    MAX_CONFIDENCE: ClassVar[float] = 0.99
+    RELIANCE: ClassVar[float] = 0.9  # weight of new evidence in revision
 
     def __post_init__(self):
         self.freq = max(0.0, min(1.0, self.freq))
