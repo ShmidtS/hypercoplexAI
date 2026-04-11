@@ -34,6 +34,7 @@ class HallucinationDetectionResult:
     semantic_entropy: float  # Diversity of semantic generations
     hallucination_risk: float  # Combined score [0, 1]
     is_potential_hallucination: bool  # Thresholded decision
+    evidence_count: int = 0  # How many of 5 signals exceed their thresholds
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +46,7 @@ class HallucinationDetectionResult:
             "semantic_entropy": self.semantic_entropy,
             "hallucination_risk": self.hallucination_risk,
             "is_potential_hallucination": self.is_potential_hallucination,
+            "evidence_count": self.evidence_count,
         }
 
 
@@ -225,6 +227,14 @@ class HallucinationDetector(nn.Module):
         semantic_v = semantic_entropy.mean().item()
         eigen_v = eigen_score.mean().item() if routing_repr is not None else 0.0
 
+        # Count how many of 5 signals exceed their thresholds
+        routing_exceeded = entropy_val > self.entropy_threshold
+        moe_exceeded = confidence_val < self.confidence_threshold
+        memory_exceeded = mismatch_v > self.mismatch_threshold
+        eigen_exceeded = eigen_v > 1.0
+        entropy_exceeded = semantic_v > 0.5
+        evidence_count = sum(1 for exceeded in [routing_exceeded, moe_exceeded, memory_exceeded, eigen_exceeded, entropy_exceeded] if exceeded)
+
         return HallucinationDetectionResult(
             routing_entropy=round(entropy_val, 6),
             moe_confidence=round(confidence_val, 6),
@@ -234,6 +244,7 @@ class HallucinationDetector(nn.Module):
             semantic_entropy=round(semantic_v, 6),
             hallucination_risk=round(risk_val, 6),
             is_potential_hallucination=risk_val > self.risk_threshold,
+            evidence_count=evidence_count,
         )
 
     def from_router_state(
@@ -264,13 +275,19 @@ class HallucinationDetector(nn.Module):
         gate_weights = router_state.get("gate_weights", router_state.get("scores", None))
         topk_gate = router_state.get("topk_gate_weights", None)
 
-        # MoE confidence from top-k gate weights
+        # MoE confidence from top-k gate weights, weighted by expert accuracy
+        expert_accuracy = router_state.get("expert_accuracy", None)
         if topk_gate is not None:
             moe_confidence = topk_gate.max(dim=-1).values
         elif gate_weights is not None:
             moe_confidence = gate_weights.max(dim=-1).values
         else:
             moe_confidence = torch.tensor(0.0, device=routing_entropy.device, dtype=routing_entropy.dtype)
+        # Weight confidence by expert reliability if available (L1.3)
+        if expert_accuracy is not None and gate_weights is not None:
+            top_expert = gate_weights.argmax(dim=-1)
+            reliability = expert_accuracy[top_expert]
+            moe_confidence = moe_confidence * reliability
 
         return self.compute_hallucination_risk(
             routing_entropy=routing_entropy,

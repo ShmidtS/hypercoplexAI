@@ -63,6 +63,7 @@ class MoEKernelConfig:
     expert_homogeneity_check: bool = True  # Batched execution via torch.bmm (requires homogeneous DomainExpert)
     use_bias_balancing: bool = True # Alias for use_aux_loss_free (DeepSeek-V3 style)
     bias_update_frequency: int = 100 # Steps between bias updates (0 = update every forward)
+    dispatch_budget_threshold: float = 0.0  # 0 = disabled
 
     def __post_init__(self):
         # Защита от вырожденного temperature (z_loss теряет эффект при temp < 0.1)
@@ -102,6 +103,7 @@ class MoEKernelState:
     combine_weights: torch.Tensor  # (B, num_slots)
     expert_names: List[str]
     top_expert_idx: torch.Tensor  # (B, top_k) — top-k expert indices per sample
+    expert_reliability: torch.Tensor  # (num_experts,) — per-expert accuracy (EMA)
     slot_outputs: Optional[torch.Tensor] = None # (num_slots, D) — реальные выходы экспертов
 
     def total_loss(self) -> torch.Tensor:
@@ -395,6 +397,11 @@ class MoEKernel(nn.Module):
             "train_scores",
             torch.ones(config.num_experts) / config.num_experts,  # type: ignore[operator]
         )
+        # --- Per-expert accuracy tracking (EMA, нейтральный старт 0.5) ---
+        self.register_buffer(
+            "expert_accuracy",
+            torch.ones(config.num_experts) * 0.5,  # type: ignore[operator]
+        )
         # --- Target uniform load ---
         self.register_buffer(
             "_target_load",
@@ -402,6 +409,7 @@ class MoEKernel(nn.Module):
         )
 
         self.temperature = config.temperature
+        self.dispatch_budget_threshold = config.dispatch_budget_threshold
         self.z_loss_weight = config.z_loss_weight
         self.ortho_loss_weight = config.ortho_loss_weight
         self.use_expert_ortho = config.use_expert_ortho
@@ -459,6 +467,11 @@ class MoEKernel(nn.Module):
             dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype) / self.num_slots
         else:
             dispatch = F.softmax(logits, dim=0)  # нормализация по токенам
+        # Budget threshold: zero out small dispatch weights, then renormalize
+        if self.dispatch_budget_threshold > 0.0:
+            mask = (dispatch >= self.dispatch_budget_threshold).float()
+            dispatch = dispatch * mask
+            dispatch = dispatch / (dispatch.sum(dim=0, keepdim=True) + 1e-8)
         combine = F.softmax(logits, dim=-1)  # нормализация по слотам
 
         return dispatch, combine, z_loss
@@ -792,11 +805,16 @@ class MoEKernel(nn.Module):
         _top_k = min(2, self.num_experts)
         top_expert_idx = expert_weights_per_token.topk(_top_k, dim=-1).indices  # (T, top_k)
 
-        # 8. EMA train_scores + bias update (только во время обучения)
+        # 8. EMA train_scores + bias update + expert_accuracy update (только во время обучения)
         if self.training:
             with torch.no_grad():
                 self.train_scores.mul_(0.9).add_(expert_usage, alpha=0.1)
                 self._update_biases(expert_usage)
+                # Per-expert accuracy: EMA с dispatch_weights как прокси для "правильности"
+                # dispatch_weights per-expert: reshape (T, E, slots_per_expert), mean over slots
+                dispatch_per_expert = dispatch.reshape(T, self.num_experts, self.slots_per_expert).mean(-1)  # (T, E)
+                dispatch_mean = dispatch_per_expert.mean(0)  # (E,)
+                self.expert_accuracy.mul_(0.9).add_(dispatch_mean, alpha=0.1)
 
         state = MoEKernelState(
             output=output.reshape(orig_shape),
@@ -810,6 +828,7 @@ class MoEKernel(nn.Module):
             combine_weights=combine.reshape(*orig_shape[:-1], self.num_slots),
             expert_names=self.expert_names,
             top_expert_idx=top_expert_idx.reshape(*orig_shape[:-1], _top_k),
+            expert_reliability=self.expert_accuracy.clone(),
  slot_outputs=slot_outputs,
         )
         return output.reshape(orig_shape), state

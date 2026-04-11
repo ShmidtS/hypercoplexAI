@@ -372,6 +372,7 @@ class TestResultToDict:
             "semantic_entropy",
             "hallucination_risk",
             "is_potential_hallucination",
+            "evidence_count",
         }
 
 

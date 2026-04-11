@@ -3,10 +3,15 @@
 Вынесен в отдельный модуль для избежания циклических импортов.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from .nars_truth import NarsTruth
 
 
 @dataclass
@@ -28,6 +33,7 @@ class TransferState:
     memory_mode: str
     update_memory: bool
     input_is_invariant: bool
+    transfer_truth: Optional[NarsTruth] = None
 
     @property
     def routing_weights(self) -> torch.Tensor:

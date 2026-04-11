@@ -62,6 +62,7 @@ class TitansMemoryModule(nn.Module):
 
         # Momentum state S (не параметр, а буфер)
         self.register_buffer('momentum_S', torch.zeros(val_dim, key_dim))
+        self.register_buffer('evidence_strength', torch.zeros(key_dim))
 
         # Гейты α (forget), η (momentum), θ (lr) — two-layer projection
         self.gate_proj = nn.Sequential(
@@ -189,6 +190,9 @@ class TitansMemoryModule(nn.Module):
         if momentum_norm > self.memory_max_norm:
             new_momentum = new_momentum * (self.memory_max_norm / (momentum_norm + 1e-8))
         self.momentum_S.copy_(new_momentum.to(self.momentum_S.dtype))
+        # Evidence-strength EMA: tracks gradient signal with bounded growth
+        ema_beta = 0.99
+        self.evidence_strength.mul_(ema_beta).add_(eta.detach().abs().mean() * (1 - ema_beta))
         # Phase 22: gradient-based surprise + adaptive forgetting
         effective_alpha = alpha
         if self.use_gradient_surprise:
@@ -196,6 +200,9 @@ class TitansMemoryModule(nn.Module):
             self._last_surprise = surprise.item()
             if self.use_adaptive_forgetting:
                 effective_alpha = self._adaptive_alpha(surprise, alpha)
+        # Evidence-strength scaling: high evidence → smaller alpha → less forgetting
+        evidence_factor = 1.0 / (1.0 + self.evidence_strength.mean())
+        effective_alpha = effective_alpha * evidence_factor
         new_weight = (1 - effective_alpha) * mem_w.detach() + new_momentum
         # Max-norm constraint: prevent memory weight from exploding
         weight_norm = new_weight.norm()
@@ -259,6 +266,7 @@ class TitansMemoryModule(nn.Module):
             if strategy == 'hard':
                 self.memory.weight.zero_()
                 self.momentum_S.zero_()
+                self.evidence_strength.zero_()
             elif strategy == 'geometric':
                 # Экспоненциальное затухание — сохраняет паттерны, убирает шум
                 # decay_factor ≈ 0.607 при decay_window=50 (медленное забывание)

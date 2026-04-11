@@ -26,6 +26,7 @@ import torch.nn.functional as F
 # Phase 2 MSA: Sparse retrieval for SemanticMemory
 # Phase 3 MSA: Overflow buffer for EpisodicMemory
 from src.core.msa_attention import MSASparseIndex, MSAOverflowBuffer, MSAConfig
+from src.core.nars_truth import NarsTruth
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +273,8 @@ class EpisodicMemory(nn.Module):
         forgetting_rate: float = 0.05,
         surprise_threshold: float = 0.4,
         dropout: float = 0.1,
+        # NARS integration gate for per-slot durability (C2.1)
+        use_per_slot_durability: bool = False,
  # Phase 3 MSA: Overflow feature flag
  use_overflow: bool = True,
  overflow_num_prototypes: int = 1024,
@@ -284,6 +287,7 @@ class EpisodicMemory(nn.Module):
         self.forgetting_rate   = forgetting_rate
         self.surprise_threshold = surprise_threshold
         self.use_overflow = use_overflow
+        self.use_per_slot_durability = use_per_slot_durability
 
         self.key_proj  = nn.Linear(hidden_dim, key_dim, bias=False)
         self.val_proj  = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -301,6 +305,7 @@ class EpisodicMemory(nn.Module):
         self.register_buffer("mem_age",     torch.zeros(num_slots))
         self.register_buffer("mem_conf",    torch.full((num_slots,), 0.5))
         self.register_buffer("mem_imp",     torch.full((num_slots,), 0.5))
+        self.register_buffer("mem_durability", torch.full((num_slots,), forgetting_rate))
         self.register_buffer("slot_order",  torch.arange(num_slots))
         self.register_buffer("step",        torch.zeros(1, dtype=torch.long))
         self._salience = SalienceScorer()
@@ -335,7 +340,8 @@ class EpisodicMemory(nn.Module):
         wr = torch.sigmoid(self.write_rate).item()
         # Forgetting: exponential decay of values
         self.mem_age += 1
-        decay = torch.exp(-self.forgetting_rate * self.mem_age)
+        decay_rate = self.mem_durability if self.use_per_slot_durability else self.forgetting_rate
+        decay = torch.exp(-decay_rate * self.mem_age)
         self.mem_vals.mul_(decay.unsqueeze(-1))
         # Confidence decay
         self.mem_conf.mul_(0.99)
@@ -357,6 +363,7 @@ class EpisodicMemory(nn.Module):
         self.mem_age[lru_slot]  = 0
         self.mem_conf[lru_slot] = float(surprise[best_idx].item())
         self.mem_imp[lru_slot]  = importance
+        self.mem_durability[lru_slot] = max(0.01, self.mem_durability[lru_slot].item() * 0.8) if self.use_per_slot_durability else self.forgetting_rate
         # Temporal ordering: record step
         self.slot_order[lru_slot] = self.step[0]
         self.step[0] += 1
@@ -403,6 +410,11 @@ class EpisodicMemory(nn.Module):
 
         if self.training:
             self._write(query_k.detach(), query_v.detach(), surprise.detach())
+            with torch.no_grad():
+                matched_slot = attn.detach().argmax(dim=-1)
+                for s in matched_slot.tolist():
+                    if self.use_per_slot_durability:
+                        self.mem_durability[s] = min(0.2, self.mem_durability[s].item() + 0.005)
 
         return out
 
@@ -410,6 +422,7 @@ class EpisodicMemory(nn.Module):
         nn.init.normal_(self.mem_keys, std=0.02)
         self.mem_vals.zero_()
         self.mem_age.zero_()
+        self.mem_durability.fill_(self.forgetting_rate)
         self.mem_conf.fill_(0.5)
         self.mem_imp.fill_(0.5)
         self.slot_order.copy_(torch.arange(self.num_slots))
@@ -448,6 +461,9 @@ class SemanticMemory(nn.Module):
         # Phase 2 MSA: Sparse retrieval (ENABLED BY DEFAULT)
         use_msa: bool = True,
         msa_config: Optional[MSAConfig] = None,
+        # NARS integration gates (disabled by default for backward compat)
+        use_nars_salience: bool = False,
+        use_nars_revision: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim           = hidden_dim
@@ -474,7 +490,13 @@ class SemanticMemory(nn.Module):
         self.register_buffer("proto_evidence",torch.ones(num_prototypes))            # evidence count
         self.register_buffer("proto_age",     torch.zeros(num_prototypes))           # steps since update
         self._salience = SalienceScorer()
+        # S3.2: Activation spreading (NARS-inspired — disabled by default)
+        self.use_activation_spreading = False
+        self.spreading_decay = 0.3
+
         # Phase 2 MSA: Sparse index (enabled by default)
+        self.use_nars_salience = use_nars_salience
+        self.use_nars_revision = use_nars_revision
         self.use_msa = use_msa
         if use_msa:
             cfg = msa_config or MSAConfig()
@@ -526,14 +548,51 @@ class SemanticMemory(nn.Module):
             curr_sim = F.cosine_similarity(centroid.unsqueeze(0),
                                            self.prototypes[p].unsqueeze(0)).item()
             if curr_sim < self.contradiction_thresh:
-                self.proto_conf[p] = max(0.1, self.proto_conf[p] - 0.1)
+                if self.use_nars_revision:
+                    existing = NarsTruth(freq=self.proto_conf[p].item(), conf=NarsTruth.w2c(self.proto_evidence[p].item()))
+                    negative = NarsTruth(freq=0.0, conf=0.5)
+                    revised = NarsTruth.revision(existing, negative)
+                    self.proto_conf[p] = revised.freq
+                    self.proto_evidence[p] = NarsTruth.c2w(revised.conf)
+                else:
+                    self.proto_conf[p] = max(0.0, self.proto_conf[p].item() - 0.1)
             else:
-                self.proto_conf[p]     = min(0.95, self.proto_conf[p] + 0.02)
-                self.proto_evidence[p] = self.proto_evidence[p] + 1
+                if self.use_nars_revision:
+                    existing = NarsTruth(freq=self.proto_conf[p].item(), conf=NarsTruth.w2c(self.proto_evidence[p].item()))
+                    observation = NarsTruth(freq=curr_sim, conf=NarsTruth.RELIANCE)
+                    revised = NarsTruth.revision(existing, observation)
+                    self.proto_conf[p] = revised.freq
+                    self.proto_evidence[p] = NarsTruth.c2w(revised.conf)
+                else:
+                    self.proto_conf[p] = min(1.0, self.proto_conf[p].item() + 0.05)
                 self.proto_age[p]      = 0
 
                 updated = self.ema_momentum * self.prototypes[p] + (1 - self.ema_momentum) * centroid
                 self.prototypes[p] = F.normalize(updated, dim=-1)
+
+    def _activation_spreading(self, attn: torch.Tensor, p_norm: torch.Tensor) -> torch.Tensor:
+        """S3.2: NARS-inspired activation spreading.
+
+        After retrieval, high-attention prototypes spread activation
+        to their neighbors via prototype-prototype cosine similarity,
+        similar to NARS InvertedAtomIndex activating related concepts.
+
+        Args:
+            attn: [B, P] attention weights from primary retrieval
+            p_norm: [P, D] normalized prototypes
+
+        Returns:
+            spread_attn: [B, P] attention with spreading applied
+        """
+        # Prototype-prototype similarity graph [P, P]
+        proto_sim = p_norm @ p_norm.T
+        # Mask self-connections
+        proto_sim = proto_sim * (1 - torch.eye(self.num_prototypes, device=proto_sim.device))
+        # Spread: attn @ proto_sim gives how much each prototype is activated by neighbors
+        spread = attn @ proto_sim  # [B, P]
+        # Combine with decay factor
+        spread_attn = attn + self.spreading_decay * spread
+        return spread_attn
 
     def _dense_retrieval(self, h_norm, p_snap, p_norm, conf_snap, age_snap, ev_snap, type_weights, x):
         """Dense retrieval via cosine similarity (fallback for MSA)."""
@@ -541,9 +600,14 @@ class SemanticMemory(nn.Module):
         type_idx = torch.arange(self.num_prototypes, device=x.device)
         type_assign = type_idx // self.protos_per_type
         type_mask = type_weights[:, type_assign]
-        weighted_sim = raw_sim * type_mask * conf_snap.unsqueeze(0)
-        sal = self._salience.score(weighted_sim, age_snap, ev_snap, conf_snap, type_weight=0.9)
+        nars_conf = ev_snap / (ev_snap + 1.0)
+        weighted_sim = raw_sim * type_mask * nars_conf.unsqueeze(0)
+        sal = self._salience.score(weighted_sim, age_snap, ev_snap, nars_conf, type_weight=0.9)
         attn = F.softmax(sal / self.temperature, dim=-1)
+        # S3.2: Activation spreading (disabled by default)
+        if self.use_activation_spreading:
+            attn = self._activation_spreading(attn, p_norm)
+            attn = F.softmax(attn, dim=-1)  # re-normalize after spreading
         return attn @ p_snap
 
     def diversity_loss(self) -> torch.Tensor:
@@ -575,11 +639,19 @@ class SemanticMemory(nn.Module):
         type_idx = torch.arange(self.num_prototypes, device=x.device)
         type_assign = type_idx // self.protos_per_type               # [P] -> type 0-3
         type_mask   = type_weights[:, type_assign]                   # [B, P]
-        weighted_sim = raw_sim * type_mask * conf_snap.unsqueeze(0)  # [B, P]
-
+        # Confidence weighting: NARS w2c or legacy proto_conf
+        if self.use_nars_salience:
+            conf_weight = ev_snap / (ev_snap + 1.0)
+        else:
+            conf_weight = conf_snap
+        weighted_sim = raw_sim * type_mask * conf_weight.unsqueeze(0)   # [B, P]
         sal  = self._salience.score(weighted_sim, age_snap, ev_snap,
-                                    conf_snap, type_weight=0.9)
+                                    conf_weight, type_weight=0.9)
         attn = F.softmax(sal / self.temperature, dim=-1)             # [B, P]
+        # S3.2: Activation spreading (disabled by default)
+        if self.use_activation_spreading:
+            attn = self._activation_spreading(attn, p_norm)
+            attn = F.softmax(attn, dim=-1)
         retrieved = attn @ p_snap                                    # [B, D]
 
         combined = torch.cat([x, retrieved], dim=-1)                 # [B, 2D]

@@ -53,6 +53,7 @@ from .msa_attention import MSAMemory
 
 # Continual normalization
 from .continual_norm import ContinualNorm
+from .nars_truth import NarsTruth
 
 # Clifford interaction layers
 from .clifford_interaction import CliffordInteractionLayer, CliffordFFN
@@ -88,4 +89,6 @@ __all__ = [
     'ContinualNorm',
     # Clifford interaction layers
     'CliffordInteractionLayer', 'CliffordFFN',
+    # NARS truth
+    'NarsTruth',
 ]

@@ -24,6 +24,7 @@ from torch.utils.checkpoint import checkpoint
 from .hypercomplex import CliffordAlgebra
 from .domain_operators import DomainRotationOperator, sandwich_transfer
 from .transfer_state import TransferState
+from .nars_truth import NarsTruth
 
 
 class TransferEngine(nn.Module):
@@ -129,14 +130,47 @@ class TransferEngine(nn.Module):
             invariant_override=u_route,
         )
 
+        # Compute alignment confidence from rotor normalization quality
+        if hasattr(source_rotor, '_normalized_R') and hasattr(target_rotor, '_normalized_R'):
+            source_norm = source_rotor._normalized_R().norm()
+            target_norm = target_rotor._normalized_R().norm()
+            alignment = (source_norm * target_norm).clamp(0.0, 1.0).item()
+        else:
+            alignment = 1.0
+
         # Decode to output
         output = self.decoder(g_target)
 
         router_state = dict(router_state)
         router_state["u_route"] = u_route
         router_state["g_target"] = g_target
+        router_state["alignment"] = alignment
 
         return output, router_state
+
+    def reverse_transfer(
+        self,
+        u_target: torch.Tensor,
+        source_rotor: DomainRotationOperator,
+        target_rotor: DomainRotationOperator,
+    ) -> tuple[torch.Tensor, "NarsTruth"]:
+        """Abductive inference: project from target back to source domain.
+
+        NARS backward inference: from conclusion to premises.
+        Uses inverse sandwich: sandwich(target_rotor^{-1}, u_target, unit=True)
+        then project through source_rotor^{-1}.
+        """
+        inv_rotor = target_rotor.get_inverse()
+        u_source_estimated = self.algebra.sandwich(inv_rotor, u_target, unit=True)
+
+        # Compute alignment from inverse rotor quality
+        if hasattr(self.algebra, '_normalized_R'):
+            rotor_norm = self.algebra._normalized_R(inv_rotor).norm()
+            alignment = (1.0 / (1.0 + rotor_norm)).clamp(0.0, 1.0).item()
+        else:
+            alignment = 0.5
+
+        return u_source_estimated, NarsTruth(freq=1.0, conf=alignment)
 
     def forward(
         self,

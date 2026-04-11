@@ -36,6 +36,7 @@ class FeedbackAction(Enum):
     ADJUST_CONFIDENCE = "adjust_confidence"  # Risk moderate, lower output confidence
     REROUTE = "reroute"  # Risk high, re-route to safer expert
     TRIGGER_CONSOLIDATION = "trigger_consolidation"  # Risk critical, force memory consolidation
+    PARTIAL_CORRECTION = "partial_correction"  # Proportional correction, blend reroute weights
     FULL_CORRECTION = "full_correction"  # Risk extreme, reroute + consolidate
 
 
@@ -204,7 +205,7 @@ class ReRoutingStrategy:
                 device=expert_weights.device,
             )
             biased_weights = expert_weights * safety_bias
-            biased_weights = biased_weights / biased_weights.sum()
+            biased_weights = biased_weights / (biased_weights.sum() + 1e-8)
             idx = torch.argmax(biased_weights).item()
             return self.expert_names[idx]
 
@@ -342,10 +343,12 @@ class HallucinationFeedbackLoop(nn.Module):
         consolidation_threshold: float = 0.7,
         confidence_adjustment_threshold: float = 0.3,
         enabled: bool = True,
+        use_proportional: bool = False,
     ):
         super().__init__()
         self.expert_names = expert_names
         self.enabled = enabled
+        self._use_proportional = use_proportional
 
         # Per-expert hallucination rates as buffer (survives serialization)
         self.register_buffer(
@@ -395,6 +398,16 @@ class HallucinationFeedbackLoop(nn.Module):
 
         # Determine action based on risk level
         action, risk_level = self.threshold_checker.check(risk_score)
+
+        if self._use_proportional:
+            evidence_count = routing_info.get("evidence_count", 0)
+            prop = self.proportional_response(risk_score, evidence_count)
+            # Blend reroute weights proportionally with expert_weights
+            if prop["reroute_strength"] > 0.3 and action in (FeedbackAction.PARTIAL_CORRECTION, FeedbackAction.FULL_CORRECTION):
+                if expert_weights is not None:
+                    blend = prop["reroute_strength"]
+                    expert_weights = blend * expert_weights + (1 - blend) * torch.ones_like(expert_weights) / len(self.expert_names)
+                    routing_info["expert_weights"] = expert_weights
 
         current_expert = routing_info.get("current_expert", self.expert_names[0])
         expert_weights = routing_info.get("expert_weights")
@@ -475,6 +488,24 @@ class HallucinationFeedbackLoop(nn.Module):
             Adjusted confidence.
         """
         return self.confidence_adjuster.adjust(base_confidence, risk_score)
+
+    def proportional_response(self, risk: float, evidence_count: int) -> dict:
+        """Proportional resource allocation instead of discrete thresholds.
+
+        Borrowed from NARS budget mechanism: continuous allocation proportional
+        to priority/expectation. No cliff effects at thresholds.
+        """
+        reroute_strength = torch.sigmoid(torch.tensor(risk - 0.5)).item()
+        consolidation_urgency = torch.sigmoid(torch.tensor(risk - 0.7)).item()
+        confidence_adjustment = -0.1 * risk
+        # More evidence = more decisive action needed
+        if evidence_count >= 4:
+            consolidation_urgency = min(1.0, consolidation_urgency * 1.5)
+        return {
+            "reroute_strength": reroute_strength,
+            "consolidation_urgency": consolidation_urgency,
+            "confidence_adjustment": confidence_adjustment,
+        }
 
     def has_pending_consolidation(self) -> bool:
         """Check if memory consolidation is pending."""

@@ -26,6 +26,7 @@ from .domain_encoder import DomainEncoder
 from .invariant_processor import InvariantProcessor, InvariantMemoryState
 from .transfer_engine import TransferEngine
 from .transfer_state import TransferState
+from .nars_truth import NarsTruth
 
 
 class HDIMEncoder(nn.Module):
@@ -224,6 +225,9 @@ class HDIMPipeline(nn.Module):
             input_is_invariant=input_is_invariant,
         )
 
+        alignment = router_state.get("alignment", 1.0)
+        transfer_truth = NarsTruth(freq=1.0, conf=alignment)
+
         transfer_state = TransferState(
             g_source=g_source,
             u_inv=u_inv,
@@ -241,6 +245,7 @@ class HDIMPipeline(nn.Module):
             memory_mode=memory_mode,
             update_memory=update_memory,
             input_is_invariant=input_is_invariant,
+            transfer_truth=transfer_truth,
         )
         return output, transfer_state.to_dict()
 
@@ -253,6 +258,15 @@ class HDIMPipeline(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Алиас для transfer()."""
         return self.transfer(x, source_domain, target_domain, **kwargs)
+
+    def reverse_infer(self, u_target, source_domain, target_domain):
+        """Counterfactual: what source would produce this target?"""
+        source_rotor = self.domain_rotors[source_domain]
+        target_rotor = self.domain_rotors[target_domain]
+        u_source_est, truth = self.transfer_engine.reverse_transfer(
+            u_target, source_rotor, target_rotor
+        )
+        return u_source_est, truth
 
     def add_domain(self, domain_name: str) -> None:
         """Добавляет новый домен в pipeline в runtime.
