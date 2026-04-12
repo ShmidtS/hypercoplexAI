@@ -301,6 +301,7 @@ def main() -> None:
 
     val_metrics: dict | None = None
     for epoch in range(args.epochs):
+        trainer.set_epoch(epoch + 1)
         total_loss = 0.0
         for batch in train_loader:
             loss = trainer.train_step(batch)

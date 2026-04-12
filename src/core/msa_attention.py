@@ -145,6 +145,48 @@ class MSASparseIndex(nn.Module):
 
         return scores
 
+    def _compute_dense_attention(
+        self,
+        qr: torch.Tensor,
+        kr: torch.Tensor,
+        prototypes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dense attention via SDPA (Flash Attention when available).
+
+        Equivalent to: softmax(mean_head(cos(QR_norm, KR_norm)) / temperature) @ prototypes
+        Reformulated as single-head SDPA:
+            Q = concat of per-head-normalized QR  [B, 1, D]
+            K = concat of per-head-normalized KR  [B, P, D]
+            V = prototypes                        [B, P, D]
+            scale = 1 / (H * temperature)
+
+        Returns:
+            retrieved: [B, D]
+            indices: [B, P] all prototype indices
+            weights: [B, P] softmax weights
+        """
+        B = qr.shape[0]
+        P = kr.shape[0]
+        H = self.num_heads
+        d = self.head_dim
+
+        qr_normed = F.normalize(qr.view(B, H, d), dim=-1).reshape(B, 1, self.dim)
+        kr_normed = F.normalize(kr.view(P, H, d), dim=-1).reshape(P, self.dim)
+        kr_normed = kr_normed.unsqueeze(0).expand(B, -1, -1).contiguous()
+        v = prototypes.unsqueeze(0).expand(B, -1, -1).contiguous()
+
+        scale = 1.0 / (H * self.temperature)
+
+        output = F.scaled_dot_product_attention(qr_normed, kr_normed, v, scale=scale)
+
+        retrieved = self.out_proj(output.squeeze(1))
+
+        indices = torch.arange(P, device=qr.device).unsqueeze(0).expand(B, -1)
+        scores = torch.matmul(qr_normed, kr_normed.transpose(-2, -1)) * scale
+        weights = F.softmax(scores.float(), dim=-1).to(qr.dtype).squeeze(1)
+
+        return retrieved, indices, weights
+
     def top_k_selection(
         self,
         scores: torch.Tensor,  # [B, P]
@@ -167,7 +209,7 @@ class MSASparseIndex(nn.Module):
         topk_scores, topk_indices = scores.topk(self.top_k, dim=-1)
 
         # Softmax weights for blending
-        topk_weights = F.softmax(topk_scores, dim=-1)
+        topk_weights = F.softmax(topk_scores.float(), dim=-1).to(topk_scores.dtype)
 
         # Gather retrieved prototypes: [B, K, D]
         # Expand indices for gather: [B, K, D]
@@ -256,13 +298,17 @@ class MSASparseIndex(nn.Module):
         qr = self.W_QR(h)  # [B, D]
         kr = self.W_KR(prototypes)  # [P, D]
 
-        # Compute routing scores
-        scores = self.compute_routing_scores(qr, kr)
+        P = prototypes.shape[0]
+        effective_top_k = min(self.top_k, P)
 
-        # Top-k selection with clamping for compressed prototypes
-        effective_top_k = min(self.top_k, prototypes.shape[0])
+        if effective_top_k >= P:
+            # Dense path: use SDPA (Flash Attention / Memory-Efficient / Math)
+            return self._compute_dense_attention(qr, kr, prototypes)
+
+        # Sparse path: top-k selection (manual fallback for custom masks)
+        scores = self.compute_routing_scores(qr, kr)
         topk_scores, topk_indices = scores.topk(effective_top_k, dim=-1)
-        topk_weights = F.softmax(topk_scores, dim=-1)
+        topk_weights = F.softmax(topk_scores.float(), dim=-1).to(topk_scores.dtype)
         # Gather retrieved prototypes: [B, K, D]
         expanded_idx = topk_indices.unsqueeze(-1).expand(-1, -1, self.dim)
         topk_protos = torch.gather(

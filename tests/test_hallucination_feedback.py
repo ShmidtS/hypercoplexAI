@@ -429,7 +429,7 @@ class TestHDIMIntegration:
         domain_id = torch.tensor([0, 1])
 
         with torch.no_grad():
-            output, rw, inv, so, aux = model.forward(x, domain_id, return_state=True)
+            aux = model.forward(x, domain_id, return_state=True).aux_state
 
         assert hasattr(aux, 'feedback_action')
         # feedback_action may be None if risk is low
@@ -450,7 +450,7 @@ class TestHDIMIntegration:
         domain_id = torch.tensor([0, 1])
 
         with torch.no_grad():
-            output, rw, inv, so, aux = model.forward(x, domain_id, return_state=True)
+            aux = model.forward(x, domain_id, return_state=True).aux_state
 
         # Should have hallucination_risk computed
         assert hasattr(aux, 'hallucination_risk')

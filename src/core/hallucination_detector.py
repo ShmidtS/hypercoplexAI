@@ -133,20 +133,14 @@ class HallucinationDetector(nn.Module):
         if routing_repr.dim() == 1:
             routing_repr = routing_repr.unsqueeze(0)
 
-        batch_size = routing_repr.shape[0]
+        # Batched eigen score via torch.linalg.svdvals (single GPU kernel)
+        if routing_repr.dim() == 2:
+            routing_repr = routing_repr.unsqueeze(1)  # (B, 1, D) for batched svdvals
+        S = torch.linalg.svdvals(routing_repr)         # (B, min(M, N))
+        k = min(top_k, S.shape[-1])
+        eigen_scores = 1.0 / (S[:, :k].sum(dim=-1) + 1e-8)  # (B,)
 
-        # Per-sample eigen score computation
-        scores = []
-        for i in range(batch_size):
-            sample = routing_repr[i : i + 1]  # (1, clifford_dim)
-            # Center single sample (degenerate: centering a single vector gives 0,
-            # so use the vector itself as the representation)
-            _, S, _ = torch.linalg.svd(sample, full_matrices=False)
-            k = min(top_k, S.shape[0])
-            eigen_score_i = 1.0 / (S[:k].sum() + 1e-8)
-            scores.append(eigen_score_i)
-
-        return torch.stack(scores)  # (batch,)
+        return eigen_scores
 
     def compute_hallucination_risk(
         self,
@@ -182,12 +176,6 @@ class HallucinationDetector(nn.Module):
             if memory_mismatch is not None
             else torch.zeros_like(routing_entropy)
         )
-        loss_val = (
-            memory_loss
-            if memory_loss is not None
-            else torch.zeros_like(routing_entropy)
-        )
-
         # Normalize mismatch to [0, 1] via sigmoid
         norm_mismatch = torch.sigmoid(mismatch_val - 2.0)
 
@@ -218,30 +206,33 @@ class HallucinationDetector(nn.Module):
         # Ensure risk is in [0, 1]
         risk_clamped = torch.clamp(risk, 0.0, 1.0)
 
-        # Per-batch result, return mean for batch-level
-        risk_val = risk_clamped.mean().item()
-        entropy_val = routing_entropy.mean().item()
-        confidence_val = moe_confidence.mean().item()
-        mismatch_v = memory_mismatch.mean().item() if memory_mismatch is not None else 0.0
-        loss_v = memory_loss.mean().item() if memory_loss is not None else 0.0
-        semantic_v = semantic_entropy.mean().item()
-        eigen_v = eigen_score.mean().item() if routing_repr is not None else 0.0
+        # Per-batch result — tensor comparisons for evidence_count (no .item() in hot path)
+        risk_mean = risk_clamped.mean()
+        entropy_mean = routing_entropy.mean()
+        confidence_mean = moe_confidence.mean()
+        mismatch_mean = memory_mismatch.mean() if memory_mismatch is not None else torch.zeros_like(risk_mean)
+        loss_mean = memory_loss.mean() if memory_loss is not None else torch.zeros_like(risk_mean)
+        semantic_mean = semantic_entropy.mean()
+        eigen_mean = eigen_score.mean() if routing_repr is not None else torch.zeros_like(risk_mean)
 
-        # Count how many of 5 signals exceed their thresholds
-        routing_exceeded = entropy_val > self.entropy_threshold
-        moe_exceeded = confidence_val < self.confidence_threshold
-        memory_exceeded = mismatch_v > self.mismatch_threshold
-        eigen_exceeded = eigen_v > 1.0
-        entropy_exceeded = semantic_v > 0.5
-        evidence_count = sum(1 for exceeded in [routing_exceeded, moe_exceeded, memory_exceeded, eigen_exceeded, entropy_exceeded] if exceeded)
+        # Tensor-based threshold checks — no GPU sync
+        evidence_count = int((
+            (entropy_mean > self.entropy_threshold)
+            + (confidence_mean < self.confidence_threshold)
+            + (mismatch_mean > self.mismatch_threshold)
+            + (eigen_mean > 1.0)
+            + (semantic_mean > 0.5)
+        ).sum().item())
 
+        # Final .item() only at dataclass boundary (outside forward pass hot path)
+        risk_val = risk_mean.item()
         return HallucinationDetectionResult(
-            routing_entropy=round(entropy_val, 6),
-            moe_confidence=round(confidence_val, 6),
-            memory_mismatch=round(mismatch_v, 6),
-            memory_loss=round(loss_v, 6),
-            eigen_score=round(eigen_v, 6),
-            semantic_entropy=round(semantic_v, 6),
+            routing_entropy=round(entropy_mean.item(), 6),
+            moe_confidence=round(confidence_mean.item(), 6),
+            memory_mismatch=round(mismatch_mean.item(), 6),
+            memory_loss=round(loss_mean.item(), 6),
+            eigen_score=round(eigen_mean.item(), 6),
+            semantic_entropy=round(semantic_mean.item(), 6),
             hallucination_risk=round(risk_val, 6),
             is_potential_hallucination=risk_val > self.risk_threshold,
             evidence_count=evidence_count,

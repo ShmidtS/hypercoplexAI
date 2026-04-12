@@ -268,9 +268,11 @@ def test_full_hdim_forward():
 
     # Test without AMP
     with torch.no_grad():
-        output, routing_weights, invariant, _, aux = model(
+        res = model(
             x, domain_id=domain_id, return_state=True, update_memory=True, memory_mode="update"
         )
+        output = res.output
+        aux = res.aux_state
 
         # Check all key tensors
         diag = check_tensor(output, "model_output_no_amp")
@@ -285,16 +287,18 @@ def test_full_hdim_forward():
         print_diagnostics(diag)
         results.append(diag)
 
-        diag = check_tensor(routing_weights, "routing_weights_no_amp")
+        diag = check_tensor(res.routing_weights, "routing_weights_no_amp")
         print_diagnostics(diag)
         results.append(diag)
 
     # Test with AMP
     model.zero_grad()
     with torch.autocast('cuda', dtype=torch.float16):
-        output_amp, routing_weights_amp, invariant_amp, _, aux_amp = model(
+        res_amp = model(
             x, domain_id=domain_id, return_state=True, update_memory=True, memory_mode="update"
         )
+        output_amp = res_amp.output
+        aux_amp = res_amp.aux_state
 
     with torch.no_grad():
         diag = check_tensor(output_amp, "model_output_amp")
@@ -309,7 +313,7 @@ def test_full_hdim_forward():
         print_diagnostics(diag)
         results.append(diag)
 
-        diag = check_tensor(routing_weights_amp, "routing_weights_amp")
+        diag = check_tensor(res_amp.routing_weights, "routing_weights_amp")
         print_diagnostics(diag)
         results.append(diag)
 
@@ -348,7 +352,9 @@ def test_extreme_values():
 
     with torch.no_grad():
         with torch.autocast('cuda', dtype=torch.float16):
-            output, routing_weights, invariant, _, aux = model(x_large, domain_id=domain_id, return_state=True)
+            res = model(x_large, domain_id=domain_id, return_state=True)
+            output = res.output
+            aux = res.aux_state
 
         diag = check_tensor(output, "output_large_inputs")
         print_diagnostics(diag)
@@ -363,7 +369,9 @@ def test_extreme_values():
 
     with torch.no_grad():
         with torch.autocast('cuda', dtype=torch.float16):
-            output, routing_weights, invariant, _, aux = model(x_small, domain_id=domain_id, return_state=True)
+            res = model(x_small, domain_id=domain_id, return_state=True)
+            output = res.output
+            aux = res.aux_state
 
         diag = check_tensor(output, "output_small_inputs")
         print_diagnostics(diag)
@@ -380,7 +388,9 @@ def test_extreme_values():
 
     with torch.no_grad():
         with torch.autocast('cuda', dtype=torch.float16):
-            output, routing_weights, invariant, _, aux = model(x_mixed, domain_id=domain_id, return_state=True)
+            res = model(x_mixed, domain_id=domain_id, return_state=True)
+            output = res.output
+            aux = res.aux_state
 
         diag = check_tensor(output, "output_mixed_scale")
         print_diagnostics(diag)

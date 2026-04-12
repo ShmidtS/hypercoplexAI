@@ -201,8 +201,8 @@ def compute_pair_margin(
 
             # Get invariants
             dom = torch.zeros(enc_a.shape[0], dtype=torch.long, device=dev)
-            _, _, inv_a, _ = model(enc_a, dom, return_state=True, memory_mode="none")
-            _, _, inv_b, _ = model(enc_b, dom, return_state=True, memory_mode="none")
+            inv_a = model(enc_a, dom, return_state=True, memory_mode="none").invariant
+            inv_b = model(enc_b, dom, return_state=True, memory_mode="none").invariant
 
             all_inv_a.append(inv_a.cpu())
             all_inv_b.append(inv_b.cpu())
@@ -276,7 +276,8 @@ def measure_training_time(
         enc = model.encode_texts(batch, device=dev)
         dom = torch.zeros(enc.shape[0], dtype=torch.long, device=dev)
         optimizer.zero_grad()
-        out, _, inv, aux = model(enc, dom, return_state=True, memory_mode="none")
+        res = model(enc, dom, return_state=True, memory_mode="none")
+        out, inv, aux = res.output, res.invariant, res.aux_state
         loss = F.mse_loss(inv, torch.zeros_like(inv))
         if hasattr(aux, "router_loss"):
             loss = loss + 0.01 * aux.router_loss
@@ -295,7 +296,8 @@ def measure_training_time(
         enc = model.encode_texts(batch, device=dev)
         dom = torch.zeros(enc.shape[0], dtype=torch.long, device=dev)
         optimizer.zero_grad()
-        out, _, inv, aux = model(enc, dom, return_state=True, memory_mode="none")
+        res = model(enc, dom, return_state=True, memory_mode="none")
+        out, inv, aux = res.output, res.invariant, res.aux_state
         loss = F.mse_loss(inv, torch.zeros_like(inv))
         if hasattr(aux, "router_loss"):
             loss = loss + 0.01 * aux.router_loss

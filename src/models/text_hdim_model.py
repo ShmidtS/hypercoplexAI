@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.hdim_model import HDIMAuxState, HDIMModel, HDIMTextConfig
+from src.models.results import ForwardResult
 
 
 @dataclass(frozen=True)
@@ -342,7 +343,7 @@ class TextHDIMModel(nn.Module):
         update_memory: bool = True,
         memory_mode: str = "update",
         return_encoding: bool = False,
-    ):
+    ) -> ForwardResult:
         encodings = self.encode_texts(texts, device=domain_id.device)
         result = HDIMModel.forward(
             self.core_model,
@@ -353,8 +354,7 @@ class TextHDIMModel(nn.Module):
             memory_mode=memory_mode,
         )
         if return_encoding:
-            output, routing_weights, invariant, slot_outputs, aux_state = result
-            return (output, routing_weights, invariant, slot_outputs, aux_state, encodings)
+            result.encodings = encodings
         return result
 
     def transfer_texts(
@@ -385,7 +385,7 @@ class TextHDIMModel(nn.Module):
         *,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
+    ) -> ForwardResult:
         encodings = self.encode_texts(source_texts, device=source_domain_id.device)
         return HDIMModel.transfer_pairs(
             self.core_model,
@@ -417,20 +417,22 @@ class TextHDIMModel(nn.Module):
         source_domain_id: torch.Tensor,
         target_domain_id: torch.Tensor,
     ) -> TextPairScoreResult:
-        _, _, _, _, src_state = self.transfer_text_pairs(
+        src_result = self.transfer_text_pairs(
             source_texts,
             source_domain_id,
             target_domain_id,
             update_memory=False,
             memory_mode="retrieve",
         )
-        _, _, _, _, tgt_state = self.forward_texts(
+        tgt_result = self.forward_texts(
             target_texts,
             target_domain_id,
             return_state=True,
             update_memory=False,
             memory_mode="retrieve",
         )
+        src_state = src_result.aux_state
+        tgt_state = tgt_result.aux_state
         scores = F.cosine_similarity(
             src_state.exported_invariant,
             tgt_state.exported_invariant,

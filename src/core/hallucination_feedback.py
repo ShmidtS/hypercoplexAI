@@ -303,11 +303,10 @@ class ConfidenceAdjuster:
             return base_confidence
 
         # Sigmoid decay: confidence reduction increases with risk above threshold
-        import math
         excess_risk = risk_score - self.adjustment_threshold
-        reduction = 1.0 / (1.0 + math.exp(-self.sigmoid_alpha * (excess_risk - 0.2)))
+        reduction = torch.sigmoid(torch.tensor(self.sigmoid_alpha * (excess_risk - 0.2)))
 
-        adjusted = base_confidence * (1.0 - reduction)
+        adjusted = base_confidence * (1.0 - reduction.item())
         return max(adjusted, self.min_confidence)
 
 
@@ -406,7 +405,7 @@ class HallucinationFeedbackLoop(nn.Module):
             evidence_count = routing_info.get("evidence_count", 0)
             prop = self.proportional_response(risk_score, evidence_count)
             # Blend reroute weights proportionally with expert_weights
-            if prop["reroute_strength"] > 0.3 and action in (FeedbackAction.PARTIAL_CORRECTION, FeedbackAction.FULL_CORRECTION):
+            if prop["reroute_strength"].item() > 0.3 and action in (FeedbackAction.PARTIAL_CORRECTION, FeedbackAction.FULL_CORRECTION):
                 if expert_weights is not None:
                     blend = prop["reroute_strength"]
                     expert_weights = blend * expert_weights + (1 - blend) * torch.ones_like(expert_weights) / len(self.expert_names)
@@ -495,12 +494,12 @@ class HallucinationFeedbackLoop(nn.Module):
         Borrowed from NARS budget mechanism: continuous allocation proportional
         to priority/expectation. No cliff effects at thresholds.
         """
-        reroute_strength = torch.sigmoid(torch.tensor(risk - 0.5)).item()
-        consolidation_urgency = torch.sigmoid(torch.tensor(risk - 0.7)).item()
+        reroute_strength = torch.sigmoid(torch.tensor(risk - 0.5))
+        consolidation_urgency = torch.sigmoid(torch.tensor(risk - 0.7))
         confidence_adjustment = -0.1 * risk
         # More evidence = more decisive action needed
         if evidence_count >= 4:
-            consolidation_urgency = min(1.0, consolidation_urgency * 1.5)
+            consolidation_urgency = (consolidation_urgency * 1.5).clamp(max=1.0)
         return {
             "reroute_strength": reroute_strength,
             "consolidation_urgency": consolidation_urgency,
@@ -533,8 +532,7 @@ class HallucinationFeedbackLoop(nn.Module):
         # Also update the buffer for serialization
         if expert in self.expert_names:
             idx = self.expert_names.index(expert)
-            current = self.expert_hallucination_rates[idx].item()
-            self.expert_hallucination_rates[idx] = 0.9 * current + 0.1 * float(hallucination_occurred)
+            self.expert_hallucination_rates[idx] = 0.9 * self.expert_hallucination_rates[idx] + 0.1 * float(hallucination_occurred)
 
     def step(self) -> None:
         """Increment internal step counter."""

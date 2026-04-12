@@ -1,11 +1,12 @@
 """
 HDIM — MoE Kernel: полноценное ядро Mixture-of-Experts роутера.
 
-Реализует архитектуру с доменно-специализированными лёгкими экспертами:
- - MathExpert: алгебраические и численные паттерны
- - LanguageExpert: лингвистические и семантические паттерны
- - CodeExpert: структурные и логические паттерны программирования
- - ScienceExpert: физические и инженерные паттерны
+Реализует архитектуру с доменно-специализированными лёгкими экспертами
+на базе единого параметризованного DomainExpert:
+ - math: bottleneck архитектура, GELU активация
+ - language: pre-norm + GELU активация
+ - code: SiLU активация
+ - science: Tanh активация
 
 Архитектура:
  Input → DomainRouter (soft dispatch) → [Expert_0..Expert_K] → combine → Output
@@ -122,12 +123,23 @@ class MoEKernelState:
 
 class DomainExpert(nn.Module):
     """
-    Лёгкий FFN-эксперт с активацией GELU и Dropout.
-    Архитектура: Linear(D→H) → GELU → Dropout → Linear(H→D)
+    Лёгкий FFN-эксперт с конфигурируемой активацией и архитектурой.
+
+    Поддерживает варианты через config dict:
+      - activation: "gelu"|"silu"|"tanh"|"relu" (default: "gelu")
+      - architecture: "standard"|"bottleneck" (default: "standard")
+      - pre_norm: bool (default: False) — LayerNorm перед FFN
 
     При use_can=True использует CliffordInteractionLayer вместо FFN
     для геометрических взаимодействий над 16D мультивекторами.
     """
+
+    ACTIVATION_MAP = {
+        "gelu": nn.GELU,
+        "silu": nn.SiLU,
+        "tanh": nn.Tanh,
+        "relu": nn.ReLU,
+    }
 
     def __init__(
         self,
@@ -136,31 +148,49 @@ class DomainExpert(nn.Module):
         dropout: float = 0.1,
         name: str = "expert",
         use_can: bool = False,
+        config: Optional[Dict] = None,
     ):
         super().__init__()
         self.name = name
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.use_can = use_can
+        self._config = config or {}
+        self.architecture = self._config.get("architecture", "standard")
+        self._pre_norm = self._config.get("pre_norm", False)
 
         if use_can:
-            # CAN-style геометрический слой для 16D мультивекторов
             from src.core.clifford_interaction import CliffordInteractionLayer
             self.interaction = CliffordInteractionLayer(dim=input_dim, dropout=dropout)
         else:
-            # Стандартный FFN
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, input_dim),
-            )
+            if self._pre_norm:
+                self.pre_norm = nn.LayerNorm(input_dim)
+
+            act_name = self._config.get("activation", "gelu")
+            act_cls = self.ACTIVATION_MAP.get(act_name, nn.GELU)
+
+            if self.architecture == "bottleneck":
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim * 2),
+                    act_cls(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, input_dim),
+                )
+            else:
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    act_cls(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, input_dim),
+                )
         self._init_weights()
 
     def _init_weights(self):
         """Инициализация весов для FFN-слоёв (не применяется к CAN)."""
         if self.use_can:
-            return  # CliffordInteractionLayer имеет свою инициализацию
+            return
         for module in self.net.modules():
             if isinstance(module, nn.Linear):
                 nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
@@ -172,110 +202,58 @@ class DomainExpert(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_can:
             return self.interaction(x)
+        if self._pre_norm:
+            x = self.pre_norm(x)
         return self.net(x)
 
 
-class MathExpert(DomainExpert):
-    """
-    Эксперт для математических и алгебраических паттернов.
-    Использует двухуровневый bottleneck: input→hidden*2→hidden→input.
-    """
-    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
-        super().__init__(input_dim, hidden_dim, dropout, name="math")
-        # Переопределяем net с расширенной промежуточной размерностью
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, input_dim),
-        )
-        self._init_weights()
-
-
-class LanguageExpert(DomainExpert):
-    """
-    Эксперт для лингвистических и семантических паттернов.
-    Использует нормализацию для устойчивости к разным шкалам текста.
-    """
-    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
-        super().__init__(input_dim, hidden_dim, dropout, name="language")
-        self.pre_norm = nn.LayerNorm(input_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(self.pre_norm(x))
-
-
-class CodeExpert(DomainExpert):
-    """
-    Эксперт для структурных паттернов кода и логики.
-    Использует SiLU (Swish) вместо GELU для более жёстких нелинейностей.
-    """
-    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
-        super().__init__(input_dim, hidden_dim, dropout, name="code")
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, input_dim),
-        )
-        self._init_weights()
-
-
-class ScienceExpert(DomainExpert):
-    """
-    Эксперт для физических и инженерных паттернов.
-    Использует Tanh для ограниченного диапазона активаций (физические величины).
-    """
-    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
-        super().__init__(input_dim, hidden_dim, dropout, name="science")
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, input_dim),
-        )
-        self._init_weights()
-
-
-# Реестр фабричных функций для создания экспертов по имени домена
-# Встроенные эксперты: math, language, code, science
-# Кастомные эксперты могут быть добавлены через register_expert()
-EXPERT_REGISTRY: Dict[str, type] = {
-    "math": MathExpert,
-    "language": LanguageExpert,
-    "code": CodeExpert,
-    "science": ScienceExpert,
+EXPERT_CONFIGS: Dict[str, Dict] = {
+    "math": {"activation": "gelu", "architecture": "bottleneck"},
+    "language": {"activation": "gelu", "pre_norm": True},
+    "code": {"activation": "silu"},
+    "science": {"activation": "tanh"},
 }
 
 
-def register_expert(name: str, expert_cls: type) -> None:
+# Реестр фабричных функций для создания экспертов по имени домена
+# Встроенные эксперты: math, language, code, science (all DomainExpert with config)
+# Кастомные эксперты могут быть добавлены через register_expert()
+EXPERT_REGISTRY: Dict[str, type] = {
+    "math": DomainExpert,
+    "language": DomainExpert,
+    "code": DomainExpert,
+    "science": DomainExpert,
+}
+
+
+def _populate_registry_aliases() -> None:
+    """Replace DomainExpert entries with specialized subclasses after they are defined."""
+    EXPERT_REGISTRY["math"] = MathExpert
+    EXPERT_REGISTRY["language"] = LanguageExpert
+    EXPERT_REGISTRY["code"] = CodeExpert
+    EXPERT_REGISTRY["science"] = ScienceExpert
+
+
+def register_expert(name: str, expert_cls: type, config: Optional[Dict] = None) -> None:
     """Регистрирует новый тип эксперта в глобальном реестре.
 
     Args:
         name: Имя домена (например, "medical", "legal", "history")
         expert_cls: Класс эксперта (должен наследовать DomainExpert)
+        config: Опциональная конфигурация для DomainExpert
 
     Raises:
         TypeError: Если expert_cls не наследует DomainExpert
 
     Example:
         >>> from src.core.moe_kernel import DomainExpert, register_expert
-        >>> class MedicalExpert(DomainExpert):
-        ...     def __init__(self, input_dim, hidden_dim, dropout=0.1):
-        ...         super().__init__(input_dim, hidden_dim, dropout, name="medical")
-        ...         self.net = nn.Sequential(
-        ...             nn.Linear(input_dim, hidden_dim),
-        ...             nn.Tanh(),
-        ...             nn.Dropout(dropout),
-        ...             nn.Linear(hidden_dim, input_dim),
-        ...         )
-        >>> register_expert("medical", MedicalExpert)
+        >>> register_expert("medical", DomainExpert, config={"activation": "tanh"})
     """
     if not issubclass(expert_cls, DomainExpert):
         raise TypeError(f"{expert_cls.__name__} must inherit from DomainExpert")
     EXPERT_REGISTRY[name] = expert_cls
+    if config is not None:
+        EXPERT_CONFIGS[name] = config
 
 
 def get_registered_expert_names() -> List[str]:
@@ -311,14 +289,45 @@ def create_expert(
         DomainExpert с FFN или CAN-слоем
     """
     cls = EXPERT_REGISTRY.get(name, DomainExpert)
-    if cls is DomainExpert:
-        return DomainExpert(input_dim, hidden_dim, dropout, name=name, use_can=use_can)
-    # Для специализированных экспертов (MathExpert, etc.) CAN не поддерживается
-    # без явного переопределения __init__
+    config = EXPERT_CONFIGS.get(name, {})
     if use_can:
-        # Создаём базовый DomainExpert с CAN для неизвестных доменов
         return DomainExpert(input_dim, hidden_dim, dropout, name=name, use_can=use_can)
-    return cls(input_dim, hidden_dim, dropout)
+    # Built-in subclasses (MathExpert, etc.) hardcode name/config in __init__
+    if cls is not DomainExpert:
+        return cls(input_dim, hidden_dim, dropout)
+    return DomainExpert(input_dim, hidden_dim, dropout, name=name, config=config)
+
+
+# ============================================================
+# Backward-compatible aliases — thin subclasses with config
+# ============================================================
+
+class MathExpert(DomainExpert):
+    """Эксперт для математических и алгебраических паттернов (bottleneck + GELU)."""
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__(input_dim, hidden_dim, dropout, name="math", config=EXPERT_CONFIGS["math"])
+
+
+class LanguageExpert(DomainExpert):
+    """Эксперт для лингвистических и семантических паттернов (pre-norm + GELU)."""
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__(input_dim, hidden_dim, dropout, name="language", config=EXPERT_CONFIGS["language"])
+
+
+class CodeExpert(DomainExpert):
+    """Эксперт для структурных паттернов кода и логики (SiLU)."""
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__(input_dim, hidden_dim, dropout, name="code", config=EXPERT_CONFIGS["code"])
+
+
+class ScienceExpert(DomainExpert):
+    """Эксперт для физических и инженерных паттернов (Tanh)."""
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__(input_dim, hidden_dim, dropout, name="science", config=EXPERT_CONFIGS["science"])
+
+
+# Populate registry with specialized subclasses now that they're defined
+_populate_registry_aliases()
 
 
 # ============================================================
@@ -447,7 +456,7 @@ class MoEKernel(nn.Module):
             combine : (T, num_slots) — нормализация по dim=-1 (слоты → токены)
             z_loss : скаляр
         """
-        logits = self.router_proj(x) / self.temperature  # (T, num_slots)
+        logits = self.router_proj(x) / max(self.temperature, 1e-8)  # (T, num_slots)
 
         # Auxiliary-Loss-Free: добавить per-expert bias
         if self._expert_bias is not None:
@@ -456,7 +465,7 @@ class MoEKernel(nn.Module):
 
         # Z-loss (ST-MoE): штраф за большие логиты
         if self.z_loss_weight > 0:
-            lse = torch.logsumexp(logits, dim=-1)  # (T,)
+            lse = torch.logsumexp(logits.float(), dim=-1)  # (T,)
             z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
         else:
             z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
@@ -466,13 +475,13 @@ class MoEKernel(nn.Module):
             # Граничный случай: единственный токен → равномерный dispatch
             dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype) / self.num_slots
         else:
-            dispatch = F.softmax(logits, dim=0)  # нормализация по токенам
+            dispatch = F.softmax(logits.float(), dim=0).to(logits.dtype)  # нормализация по токенам
         # Budget threshold: zero out small dispatch weights, then renormalize
         if self.dispatch_budget_threshold > 0.0:
             mask = (dispatch >= self.dispatch_budget_threshold).float()
             dispatch = dispatch * mask
             dispatch = dispatch / (dispatch.sum(dim=0, keepdim=True) + 1e-8)
-        combine = F.softmax(logits, dim=-1)  # нормализация по слотам
+        combine = F.softmax(logits.float(), dim=-1).to(logits.dtype)  # нормализация по слотам
 
         return dispatch, combine, z_loss
 
@@ -537,18 +546,24 @@ class MoEKernel(nn.Module):
             h = GELU(bmm(W1_stack, x))  # (E, slots, H)
             y = bmm(W2_stack, h)        # (E, slots, D)
         """
-        # Check if all experts are homogeneous DomainExpert (not specialized subclasses)
+        # Check if all experts are homogeneous DomainExpert with same architecture
         for expert in self.experts:
-            if type(expert) is not DomainExpert:
+            if not isinstance(expert, DomainExpert) or expert.use_can:
                 raise RuntimeError(
                     f"_run_experts_batched requires homogeneous DomainExpert instances, "
                     f"got {type(expert).__name__}. Use _run_experts() for heterogeneous experts."
+                )
+        first = self.experts[0]
+        for expert in self.experts[1:]:
+            if expert.architecture != first.architecture:
+                raise RuntimeError(
+                    "_run_experts_batched requires homogeneous architecture, "
+                    "got mixed architectures. Use _run_experts() for heterogeneous experts."
                 )
 
         E = self.num_experts
         S = self.slots_per_expert
         D = self.input_dim
-        H = self.config.expert_hidden_dim
 
         # Find first and last Linear layers by type (not fragile index)
         def _first_linear(seq: nn.Sequential) -> nn.Linear:
@@ -576,8 +591,10 @@ class MoEKernel(nn.Module):
         # First linear: (E, S, D) @ (E, D, H)^T + (E, H) -> (E, S, H)
         h = torch.bmm(x, W1_stack.transpose(1, 2)) + b1_stack.unsqueeze(1)  # (E, S, H)
 
-        # GELU activation
-        h = F.gelu(h)
+        # Activation from expert config
+        act_name = self.experts[0]._config.get("activation", "gelu")
+        _fn_map = {"gelu": F.gelu, "silu": F.silu, "tanh": torch.tanh, "relu": F.relu}
+        h = _fn_map.get(act_name, F.gelu)(h)
 
         # Dropout (only during training)
         if self.training:
@@ -600,15 +617,24 @@ class MoEKernel(nn.Module):
         Check if batched expert execution is applicable.
 
         Returns True if all experts are homogeneous DomainExpert instances
-        with the same hidden dimension (no specialized subclasses).
+        with standard (2-layer FFN) architecture and same activation.
+        Bottleneck architecture is not supported by _run_experts_batched.
         """
         if self.config.use_can_experts:
-            # CAN experts use CliffordInteractionLayer, not FFN
             return False
 
         for expert in self.experts:
-            # Only plain DomainExpert is supported (not MathExpert, LanguageExpert, etc.)
-            if type(expert) is not DomainExpert:
+            if not isinstance(expert, DomainExpert) or expert.use_can:
+                return False
+
+        # All must share the same architecture and activation
+        first = self.experts[0]
+        if first.architecture != "standard":
+            return False
+        for expert in self.experts[1:]:
+            if expert.architecture != first.architecture:
+                return False
+            if expert._config.get("activation", "gelu") != first._config.get("activation", "gelu"):
                 return False
 
         return True
@@ -706,7 +732,7 @@ class MoEKernel(nn.Module):
 
         Собирает первый Linear слой каждого эксперта.
         Усекает все веса до минимальной плоской размерности для совместимости
-        с экспертами разного размера (MathExpert шире остальных).
+        с экспертами разного размера (bottleneck архитектура шире standard).
         """
         raw_weights = []
         for expert in self.experts:

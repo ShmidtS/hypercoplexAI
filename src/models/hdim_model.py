@@ -15,6 +15,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from src.core.hdim_pipeline import HDIMPipeline
+from src.models.results import CoreResult, ForwardResult
 
 
 @dataclass(frozen=True)
@@ -439,16 +440,7 @@ class HDIMModel(nn.Module):
         R_transfer_inv: torch.Tensor,
         group_masks: List[torch.Tensor],
         runtime: HDIMRuntimeConfig,
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor, torch.Tensor,
-        bool, Optional[torch.Tensor], float,
-        Optional[float], Optional[str],
-        torch.Tensor, bool,
-    ]:
+    ) -> CoreResult:
         """Shared core for forward and transfer_pairs.
 
         Runs encode, invariant extraction, memory, MoE routing, transfer, decode.
@@ -617,13 +609,27 @@ class HDIMModel(nn.Module):
         # Concatenate slot_outputs if available
         slot_outputs_tensor = torch.cat(all_slot_outputs, dim=0) if all_slot_outputs else None
 
-        return (
-        output, routing_weights, raw_invariant, memory_augmented_invariant,
-        exported_invariant, topk_idx, topk_gate_weights,
-        train_scores_snapshot, expert_usage, routing_entropy,
-        memory_loss, router_loss, z_loss, memory_updated, slot_outputs_tensor,
-        hallucination_risk, memory_surprise_val, feedback_action,
-        online_loss, online_updated,
+        return CoreResult(
+            output=output,
+            routing_weights=routing_weights,
+            raw_invariant=raw_invariant,
+            memory_augmented_invariant=memory_augmented_invariant,
+            exported_invariant=exported_invariant,
+            topk_idx=topk_idx,
+            topk_gate_weights=topk_gate_weights,
+            train_scores_snapshot=train_scores_snapshot,
+            expert_usage=expert_usage,
+            routing_entropy=routing_entropy,
+            memory_loss=memory_loss,
+            router_loss=router_loss,
+            z_loss=z_loss,
+            memory_updated=memory_updated,
+            slot_outputs=slot_outputs_tensor,
+            hallucination_risk=hallucination_risk,
+            memory_surprise=memory_surprise_val,
+            feedback_action=feedback_action,
+            online_loss=online_loss,
+            online_updated=online_updated,
         )
 
     def forward(
@@ -634,9 +640,7 @@ class HDIMModel(nn.Module):
         return_state: bool = False,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> (
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[HDIMAuxState]]
-    ):
+    ) -> ForwardResult:
         """Run the HDIM forward pass for same-domain reconstruction batches."""
         x = self.dropout(x)
         domain_id = domain_id.to(device=x.device, dtype=torch.long)
@@ -651,44 +655,43 @@ class HDIMModel(nn.Module):
 
         group_masks = [domain_id == idx for idx in domain_id.unique(sorted=True)]
 
-        (
-            output, routing_weights, raw_invariant, memory_augmented_invariant,
-            exported_invariant, topk_idx, topk_gate_weights,
-            train_scores_snapshot, expert_usage, _routing_entropy,
-        memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
-        _hallucination_risk, _memory_surprise, _feedback_action,
-        _online_loss, _online_updated,
-        ) = self._forward_core(
+        core = self._forward_core(
             x, R_inv_per_sample, R_per_sample, R_per_sample, R_inv_per_sample,
             group_masks, runtime,
         )
 
-        invariant = self.training_inv_head(exported_invariant).to(dtype=x.dtype)
+        invariant = self.training_inv_head(core.exported_invariant).to(dtype=x.dtype)
 
+        aux_state = None
         if return_state:
             aux_state = self._build_aux_state(
-                raw_invariant=raw_invariant,
-                memory_augmented_invariant=memory_augmented_invariant,
-                exported_invariant=exported_invariant,
-                routing_weights=routing_weights,
-                topk_idx=topk_idx,
-                topk_gate_weights=topk_gate_weights,
-                train_scores_snapshot=train_scores_snapshot,
-                expert_usage=expert_usage,
-                routing_entropy=_routing_entropy,
-                memory_loss=memory_loss,
-                router_loss=router_loss,
-                z_loss=z_loss,
-                memory_updated=memory_updated,
+                raw_invariant=core.raw_invariant,
+                memory_augmented_invariant=core.memory_augmented_invariant,
+                exported_invariant=core.exported_invariant,
+                routing_weights=core.routing_weights,
+                topk_idx=core.topk_idx,
+                topk_gate_weights=core.topk_gate_weights,
+                train_scores_snapshot=core.train_scores_snapshot,
+                expert_usage=core.expert_usage,
+                routing_entropy=core.routing_entropy,
+                memory_loss=core.memory_loss,
+                router_loss=core.router_loss,
+                z_loss=core.z_loss,
+                memory_updated=core.memory_updated,
                 runtime=runtime,
-                hallucination_risk=_hallucination_risk,
-                memory_surprise=_memory_surprise,
-                feedback_action=_feedback_action,
-                online_loss=_online_loss,
-                online_updated=_online_updated,
+                hallucination_risk=core.hallucination_risk,
+                memory_surprise=core.memory_surprise,
+                feedback_action=core.feedback_action,
+                online_loss=core.online_loss,
+                online_updated=core.online_updated,
             )
-            return output, routing_weights, invariant, _slot_outputs, aux_state
-        return output, routing_weights, invariant, _slot_outputs, None
+        return ForwardResult(
+            output=core.output,
+            routing_weights=core.routing_weights,
+            invariant=invariant,
+            slot_outputs=core.slot_outputs,
+            aux_state=aux_state,
+        )
 
     def transfer(
         self,
@@ -760,7 +763,7 @@ class HDIMModel(nn.Module):
         *,
         update_memory: bool = True,
         memory_mode: str = "update",
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
+    ) -> ForwardResult:
         """Run explicit paired transfer for mixed-domain batches."""
         source_domain_id = source_domain_id.to(
             device=source_encoding.device, dtype=torch.long
@@ -786,46 +789,45 @@ class HDIMModel(nn.Module):
             for p in unique_pairs
         ]
 
-        (
-            output, routing_weights, raw_invariant, memory_augmented_invariant,
-            exported_invariant, topk_idx, topk_gate_weights,
-            train_scores_snapshot, expert_usage, _routing_entropy,
-        memory_loss, router_loss, z_loss, memory_updated, _slot_outputs,
-        _hallucination_risk, _memory_surprise, _feedback_action,
-        _online_loss, _online_updated,
-        ) = self._forward_core(
+        core = self._forward_core(
             source_encoding,
             R_src_inv_per_sample, R_src_per_sample,
             R_tgt_per_sample, R_tgt_inv_per_sample,
             group_masks, runtime,
         )
 
-        invariant = self.training_inv_head(exported_invariant).to(
+        invariant = self.training_inv_head(core.exported_invariant).to(
             dtype=source_encoding.dtype
         )
 
         aux_state = self._build_aux_state(
-            raw_invariant=raw_invariant,
-            memory_augmented_invariant=memory_augmented_invariant,
-            exported_invariant=exported_invariant,
-            routing_weights=routing_weights,
-            topk_idx=topk_idx,
-            topk_gate_weights=topk_gate_weights,
-            train_scores_snapshot=train_scores_snapshot,
-            expert_usage=expert_usage,
-            routing_entropy=_routing_entropy,
-            memory_loss=memory_loss,
-            router_loss=router_loss,
-            z_loss=z_loss,
-            memory_updated=memory_updated,
+            raw_invariant=core.raw_invariant,
+            memory_augmented_invariant=core.memory_augmented_invariant,
+            exported_invariant=core.exported_invariant,
+            routing_weights=core.routing_weights,
+            topk_idx=core.topk_idx,
+            topk_gate_weights=core.topk_gate_weights,
+            train_scores_snapshot=core.train_scores_snapshot,
+            expert_usage=core.expert_usage,
+            routing_entropy=core.routing_entropy,
+            memory_loss=core.memory_loss,
+            router_loss=core.router_loss,
+            z_loss=core.z_loss,
+            memory_updated=core.memory_updated,
             runtime=runtime,
-            hallucination_risk=_hallucination_risk,
-            memory_surprise=_memory_surprise,
-            feedback_action=_feedback_action,
-            online_loss=_online_loss,
-            online_updated=_online_updated,
+            hallucination_risk=core.hallucination_risk,
+            memory_surprise=core.memory_surprise,
+            feedback_action=core.feedback_action,
+            online_loss=core.online_loss,
+            online_updated=core.online_updated,
         )
-        return output, routing_weights, invariant, _slot_outputs, aux_state
+        return ForwardResult(
+            output=core.output,
+            routing_weights=core.routing_weights,
+            invariant=invariant,
+            slot_outputs=core.slot_outputs,
+            aux_state=aux_state,
+        )
 
     # Phase 22 feature flags
 

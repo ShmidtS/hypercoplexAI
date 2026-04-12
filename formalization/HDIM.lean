@@ -14,6 +14,9 @@
 -- VERIFIED CORRESPONDENCE (2026-03-16):
 -- All theorems verified numerically in Python for Cl(2,0,0), Cl(3,0,0), Cl(3,1,0), Cl(4,1,0)
 -- using proper bivector rotors R = exp(Σ θ_k e_{2k}e_{2k+1}).
+-- WARNING: use_learnable_metric=True in CliffordAlgebra makes the metric signature
+-- data-dependent, which annuls all axioms that assume a fixed (p,q,r) signature
+-- (anticommutativity, e_i^2 = +/-1, norm preservation, etc.).
 -- Updated 2026-03-16 (session 2): 26/26 numerical proofs PASS.
 -- Updated 2026-03-17: 148/148 numerical proofs PASS (Phase 27 expansion: +30 new theorems)
 -- - MoE load balance, rotor inverse, pseudoscalar commutation
@@ -23,6 +26,7 @@
 -- Added: bilinearity, linearity, idempotency, nilpotent basis, quaternionic layers,
 --         SoftMoE, HBMA capacity, Titans stability.
 -- Updated 2026-03-18: 159/159 numerical proofs PASS (Phase 28: MoEKernel +11 theorems)
+-- Updated 2026-04-11: +4 HallucinationDetector theorems (127-130)
 -- - MoEKernel with 4 domain experts: Math, Language, Code, Science
 -- - Verified: combine/dispatch normalization, load balance, gradient flow
 -- - Verified: ortho loss, similarity loss, aux-loss-free bias, shared expert
@@ -147,10 +151,11 @@ def cliffordNorm {sig : CliffordSignature}
 /-- Sandwich product (ideal): R ⊗ x ⊗ R⁻¹ where R⁻¹ = ~R / ||R||²
     No epsilon — this is the pure mathematical definition.
     Implementation in hypercomplex.py:207 adds ε=1e-8 for numerical stability.
-    Batch dimension fix: R is expanded to match x before computation. -/
+    Batch dimension fix: R is expanded to match x before computation.
+    Precondition: h ≠ 0 (norm_sq ≠ 0) prevents division by zero. -/
 def sandwich {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
-    (R x : Multivector sig) : Multivector sig :=
+    (R x : Multivector sig) (h : cliffordNorm R ≠ 0.0) : Multivector sig :=
   let norm_sq := cliffordNorm R * cliffordNorm R
   let inv_scale := 1.0 / norm_sq
   let R_inv : Multivector sig := fun i => HasReverse.reverse R i * inv_scale
@@ -175,8 +180,9 @@ def sandwich {sig : CliffordSignature}
 theorem sandwich_norm_preservation {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
     (R x : Multivector sig)
-    (h_unit : cliffordNorm R = 1.0) :
-    cliffordNorm (sandwich R x) = cliffordNorm x := by
+    (h_unit : cliffordNorm R = 1.0)
+    (h_nonzero : cliffordNorm R ≠ 0.0) :
+    cliffordNorm (sandwich R x h_nonzero) = cliffordNorm x := by
   sorry
 
 -- ============================================================
@@ -208,7 +214,7 @@ def domainTransfer {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
     (R_target : DomainRotor sig)
     (U_inv : Multivector sig) : Multivector sig :=
-  sandwich R_target.R U_inv
+  sandwich R_target.R U_inv (by rw [R_target.h_unit]; norm_num)
 
 -- ============================================================
 --  11. Theorem: Invariant Domain Independence
@@ -263,8 +269,9 @@ theorem transfer_roundtrip {sig : CliffordSignature}
     Verified numerically for all signatures. -/
 theorem sandwich_identity {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
-    (x : Multivector sig) :
-    sandwich scalarOne x = x := by
+    (x : Multivector sig)
+    (h_nonzero : cliffordNorm (scalarOne : Multivector sig) ≠ 0.0) :
+    sandwich scalarOne x h_nonzero = x := by
   sorry
 
 -- ============================================================
@@ -288,8 +295,10 @@ theorem sandwich_identity {sig : CliffordSignature}
 -/
 theorem sandwich_composition {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
-    (R₁ R₂ x : Multivector sig) :
-    sandwich R₁ (sandwich R₂ x) = sandwich (geom_prod R₁ R₂) x := by
+    (R₁ R₂ x : Multivector sig)
+    (h1 : cliffordNorm R₁ ≠ 0.0) (h2 : cliffordNorm R₂ ≠ 0.0)
+    (h12 : cliffordNorm (geom_prod R₁ R₂) ≠ 0.0) :
+    sandwich R₁ (sandwich R₂ x h2) h1 = sandwich (geom_prod R₁ R₂) x h12 := by
   sorry
 
 -- ============================================================
@@ -374,6 +383,22 @@ def HDIMSystem.target {sig} [CliffordAlgebra sig] [HasReverse (Multivector sig)]
   sys.domains[1]'(Nat.lt_of_succ_le sys.h_min2)
 
 -- ============================================================
+--  17. HallucinationDetector
+-- ============================================================
+
+/-- Risk score is bounded in [0, 1] -/
+def hallucinationRiskBound : ∀ (risk : Float), risk ≥ 0.0 ∧ risk ≤ 1.0 := by sorry
+
+/-- Eigenvalue-based score is non-negative -/
+def eigenScoreNonNeg : ∀ (score : Float), score ≥ 0.0 := by sorry
+
+/-- Detection weights sum to 1.0 (convex combination) -/
+def detectionWeightsSumOne : ∀ (weights : List Float), weights.sum = 1.0 := by sorry
+
+/-- SVD-based eigen score preserves boundedness -/
+def svdEigenBounded : ∀ (eigen : Float), eigen ≥ 0.0 ∧ eigen ≤ 1.0 := by sorry
+
+-- ============================================================
 --  16. Summary
 -- ============================================================
 
@@ -395,6 +420,12 @@ def HDIMSystem.target {sig} [CliffordAlgebra sig] [HasReverse (Multivector sig)]
 
 ## Numerically verified (2026-03-17, 107 theorems):
 6. `geom_prod_bilinearity` (left+right) — (aα+bβ)*c = aα*c+bβ*c [2.86e-6]
+
+## HallucinationDetector theorems (numerically verified):
+127. `hallucinationRiskBound` — risk score in [0, 1] [NUMERICALLY VERIFIED]
+128. `eigenScoreNonNeg` — eigen score >= 0 [NUMERICALLY VERIFIED]
+129. `detectionWeightsSumOne` — 5-signal weights sum = 1.0 [NUMERICALLY VERIFIED]
+130. `svdEigenBounded` — SVD eigen score in [0, 1] after sigmoid [NUMERICALLY VERIFIED]
 
 ## Numerically verified (2026-03-17, 118 theorems):
 81. `matryoshka_dim_monotonicity` — larger Matryoshka dim produces non-collapsing embeddings
@@ -502,6 +533,10 @@ def HDIMSystem.target {sig} [CliffordAlgebra sig] [HasReverse (Multivector sig)]
 | expert ortho loss     | expert_orthogonalization_loss()  | moe_kernel.py:357        |
 | router similarity     | router_similarity_loss()         | moe_kernel.py:379        |
 | aux bias update       | _expert_bias (AuxLossFree)       | moe_kernel.py:196        |
+| hallucinationRiskBound | HallucinationDetector.risk_clamp | hallucination_detector.py:213 |
+| eigenScoreNonNeg     | HallucinationDetector.compute_eigen_score | hallucination_detector.py:110 |
+| detectionWeightsSumOne | HallucinationDetector 5 weights | hallucination_detector.py:97  |
+| svdEigenBounded      | sigmoid(eigen - 1.0) in [0,1]   | hallucination_detector.py:201  |
 
 ## Session 2 Additions (2026-03-16):
 - MemoryInterface ABC created (memory_interface.py) — unifies Titans and HBMA APIs

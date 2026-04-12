@@ -72,7 +72,9 @@ def ask_hdim(query: str) -> dict:
         x = torch.randn(1, 64)
         domain_id = torch.tensor([0])
         with torch.no_grad():
-            _, weights, _, _, aux = model(x, domain_id, return_state=True)
+            res = model(x, domain_id, return_state=True)
+            weights = res.routing_weights
+            aux = res.aux_state
         expert_names = config.expert_names or ['math', 'language', 'code', 'science']
         expert_name = expert_names[aux.topk_idx[0, 0].item()] if aux.topk_idx[0, 0].item() < len(expert_names) else 'language'
 

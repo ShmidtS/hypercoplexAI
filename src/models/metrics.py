@@ -85,13 +85,15 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
         return {"sts_exported": dummy, "sts_training": dummy, "pair_margin": dummy, "routing": dummy}
 
     if pair_enc is None or pair_domain_ids is None:
-        _, routing, _, _, state = model(
+        fwd = model(
             enc,
             domain_id=domain_ids,
             return_state=True,
             update_memory=False,
             memory_mode="retrieve",
         )
+        routing = fwd.routing_weights
+        state = fwd.aux_state
         src_norm = F.normalize(state.exported_invariant, dim=-1)
         tgt_norm = F.normalize(state.memory_augmented_invariant, dim=-1)
         sts_exported = (src_norm * tgt_norm).sum(dim=-1)
@@ -107,20 +109,22 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
             "routing": routing,
         }
 
-    _, routing, _, _, src_state = model.transfer_pairs(
+    tp = model.transfer_pairs(
         enc,
         domain_ids,
         pair_domain_ids,
         update_memory=False,
         memory_mode="retrieve",
     )
-    _, _, _, _, tgt_state = model(
+    routing = tp.routing_weights
+    src_state = tp.aux_state
+    tgt_state = model(
         pair_enc,
         domain_id=pair_domain_ids,
         return_state=True,
         update_memory=False,
         memory_mode="retrieve",
-    )
+    ).aux_state
     negative_pair_indices = _compute_negative_pair_indices(batch)
 
     src_norm = F.normalize(src_state.exported_invariant, dim=-1)
@@ -137,13 +141,14 @@ def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
     else:
         mismatched_pair_enc = pair_enc[negative_pair_indices]
         mismatched_pair_domain_ids = pair_domain_ids[negative_pair_indices]
-        _, _, _, _, mismatched_state = model(
+        mismatched_result = model(
             mismatched_pair_enc,
             domain_id=mismatched_pair_domain_ids,
             return_state=True,
             update_memory=False,
             memory_mode="retrieve",
         )
+        mismatched_state = mismatched_result.aux_state
         mismatched_scores = F.cosine_similarity(
             src_state.exported_invariant,
             mismatched_state.exported_invariant,
@@ -212,12 +217,12 @@ def compute_all_metrics(
             # Собираем данные для глобального pair_margin
             enc_m, pair_enc_m, d_ids, pd_ids = _get_encodings(model, batch, device)
             if enc_m is not None and pair_enc_m is not None and pd_ids is not None:
-                _, _, _, _, src_state = model.transfer_pairs(
+                src_state = model.transfer_pairs(
                     enc_m, d_ids, pd_ids, update_memory=False, memory_mode="retrieve"
-                )
-                _, _, _, _, tgt_state = model(
+                ).aux_state
+                tgt_state = model(
                     pair_enc_m, domain_id=pd_ids, return_state=True, update_memory=False, memory_mode="retrieve"
-                )
+                ).aux_state
                 all_src_inv.append(src_state.exported_invariant.cpu())
                 all_tgt_inv.append(tgt_state.exported_invariant.cpu())
                 if "pair_group_id" in batch:

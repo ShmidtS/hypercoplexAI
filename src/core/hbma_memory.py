@@ -134,10 +134,10 @@ class SalienceScorer(nn.Module):
         decay_half_life: float = 200.0,
     ) -> torch.Tensor:              # [B, S]
         # recency: exponential decay by age
-        recency = torch.exp(-age / decay_half_life).unsqueeze(0)          # [1,S]
+        recency = torch.exp((-age / decay_half_life).clamp(max=80)).unsqueeze(0)          # [1,S]
         # frequency: log-normalised
         freq_norm = (torch.log(frequency + 1.0) /
-                     (torch.log(frequency.max() + 2.0) + 1e-8)).unsqueeze(0)  # [1,S]
+                     (torch.log(frequency.max() + 2.0).clamp(min=1e-8) + 1e-8)).unsqueeze(0)  # [1,S]
         imp = importance.unsqueeze(0)                                     # [1,S]
         tw  = torch.full_like(recency, type_weight)
 
@@ -222,10 +222,10 @@ class WorkingMemory(nn.Module):
 
         # Attention
         scale = math.sqrt(self.hidden_dim)
-        sim   = (F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).T) / scale  # [B, N]
+        sim   = (F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).T) / max(scale, 1e-8)  # [B, N]
         sal   = self._salience.score(sim, age_snap, freq_snap, imp_snap,
                                      type_weight=1.0)
-        attn  = F.softmax(sal, dim=-1)               # [B, N]
+        attn  = F.softmax(sal.float(), dim=-1).to(sal.dtype)               # [B, N]
         retrieved = attn @ v                         # [B, D]
 
         combined = torch.cat([x, retrieved], dim=-1)
@@ -337,17 +337,17 @@ class EpisodicMemory(nn.Module):
         write_mask = surprise > self.surprise_threshold
         if not write_mask.any():
             return
-        wr = torch.sigmoid(self.write_rate).item()
+        wr = torch.sigmoid(self.write_rate)
         # Forgetting: exponential decay of values
         self.mem_age += 1
         decay_rate = self.mem_durability if self.use_per_slot_durability else self.forgetting_rate
-        decay = torch.exp(-decay_rate * self.mem_age)
+        decay = torch.exp((-decay_rate * self.mem_age).clamp(max=80))
         self.mem_vals.mul_(decay.unsqueeze(-1))
         # Confidence decay
         self.mem_conf.mul_(0.99)
 
-        # LRU write target
-        lru_slot = self.mem_age.argmax().item()
+        # LRU write target — tensor index (avoids .item() sync)
+        lru_slot = self.mem_age.argmax()
         # Phase 3 MSA: Store evicted slot in overflow buffer
         if self.overflow is not None and self.overflow.is_enabled():
             # Store the evicted slot before overwriting
@@ -356,16 +356,16 @@ class EpisodicMemory(nn.Module):
                 self.mem_vals[lru_slot].detach(),
                 self.mem_conf[lru_slot].detach(),
             )
-        best_idx = (surprise * write_mask.float()).argmax().item()
+        best_idx = (surprise * write_mask.float()).argmax()
 
         self.mem_keys[lru_slot].copy_((1 - wr) * self.mem_keys[lru_slot] + wr * keys[best_idx])
         self.mem_vals[lru_slot].copy_((1 - wr) * self.mem_vals[lru_slot] + wr * vals[best_idx])
         self.mem_age[lru_slot]  = 0
-        self.mem_conf[lru_slot] = float(surprise[best_idx].item())
+        self.mem_conf[lru_slot] = surprise[best_idx]
         self.mem_imp[lru_slot]  = importance
-        self.mem_durability[lru_slot] = max(0.01, self.mem_durability[lru_slot].item() * 0.8) if self.use_per_slot_durability else self.forgetting_rate
+        self.mem_durability[lru_slot] = (self.mem_durability[lru_slot] * 0.8).clamp(min=0.01) if self.use_per_slot_durability else self.forgetting_rate
         # Temporal ordering: record step
-        self.slot_order[lru_slot] = self.step[0]
+        self.slot_order[lru_slot] = self.step[0].clone()
         self.step[0] += 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -385,10 +385,10 @@ class EpisodicMemory(nn.Module):
         keys_with_pos = F.normalize(keys_snap + 0.1 * pos_emb, dim=-1)
         query_norm    = F.normalize(query_k, dim=-1)
 
-        sim  = query_norm @ keys_with_pos.T / math.sqrt(self.key_dim)  # [B, S]
+        sim  = query_norm @ keys_with_pos.T / max(math.sqrt(self.key_dim), 1e-8)  # [B, S]
         sal  = self._salience.score(sim, age_snap, age_snap.clamp(min=1),
                                     conf_snap, type_weight=0.8)
-        attn = F.softmax(sal, dim=-1)
+        attn = F.softmax(sal.float(), dim=-1).to(sal.dtype)
         retrieved = attn @ vals_snap
 
         # Phase 3 MSA: Memory Interleave for overflow retrieval
@@ -412,9 +412,11 @@ class EpisodicMemory(nn.Module):
             self._write(query_k.detach(), query_v.detach(), surprise.detach())
             with torch.no_grad():
                 matched_slot = attn.detach().argmax(dim=-1)
-                for s in matched_slot.tolist():
-                    if self.use_per_slot_durability:
-                        self.mem_durability[s] = min(0.2, self.mem_durability[s].item() + 0.005)
+                if self.use_per_slot_durability:
+                    # Vectorized durability update via scatter_add_
+                    counts = torch.bincount(matched_slot, minlength=self.num_slots).float()
+                    update = counts * 0.005
+                    self.mem_durability = (self.mem_durability + update).clamp(max=0.2)
 
         return out
 
@@ -603,11 +605,11 @@ class SemanticMemory(nn.Module):
         nars_conf = ev_snap / (ev_snap + 1.0)
         weighted_sim = raw_sim * type_mask * nars_conf.unsqueeze(0)
         sal = self._salience.score(weighted_sim, age_snap, ev_snap, nars_conf, type_weight=0.9)
-        attn = F.softmax(sal / self.temperature, dim=-1)
+        attn = F.softmax((sal / self.temperature).float(), dim=-1).to(sal.dtype)
         # S3.2: Activation spreading (disabled by default)
         if self.use_activation_spreading:
             attn = self._activation_spreading(attn, p_norm)
-            attn = F.softmax(attn, dim=-1)  # re-normalize after spreading
+            attn = F.softmax(attn.float(), dim=-1).to(attn.dtype)  # re-normalize after spreading
         return attn @ p_snap
 
     def diversity_loss(self) -> torch.Tensor:
@@ -647,11 +649,11 @@ class SemanticMemory(nn.Module):
         weighted_sim = raw_sim * type_mask * conf_weight.unsqueeze(0)   # [B, P]
         sal  = self._salience.score(weighted_sim, age_snap, ev_snap,
                                     conf_weight, type_weight=0.9)
-        attn = F.softmax(sal / self.temperature, dim=-1)             # [B, P]
+        attn = F.softmax((sal / self.temperature).float(), dim=-1).to(sal.dtype)             # [B, P]
         # S3.2: Activation spreading (disabled by default)
         if self.use_activation_spreading:
             attn = self._activation_spreading(attn, p_norm)
-            attn = F.softmax(attn, dim=-1)
+            attn = F.softmax(attn.float(), dim=-1).to(attn.dtype)
         retrieved = attn @ p_snap                                    # [B, D]
 
         combined = torch.cat([x, retrieved], dim=-1)                 # [B, 2D]
@@ -739,7 +741,7 @@ class ProceduralMemory(nn.Module):
 
         # Weight by success rate
         weighted_sim = sim * self.success_rate.detach().clone().unsqueeze(0)  # [B, P]
-        attn = F.softmax(weighted_sim / 0.1, dim=-1)                 # [B, P]
+        attn = F.softmax((weighted_sim / 0.1).float(), dim=-1).to(weighted_sim.dtype)                 # [B, P]
 
         # Retrieve and project patterns
         retrieved = attn @ self.patterns                             # [B, D]
@@ -831,21 +833,21 @@ class ConsolidationEngine(nn.Module):
         x: [B, D] current hidden state
         Returns consolidated representation [B, D].
         """
-        # Estimate importance of current input
-        importance = self.importance_head(x.detach()).mean().item()
+        # Estimate importance of current input (keep as tensor until branch)
+        importance_tensor = self.importance_head(x.detach()).mean()
 
         # Working -> Episodic: promote important patterns
-        if importance > 0.5 and self.training:
+        if self.training and importance_tensor > 0.5:
             e_candidate = self.w2e_proj(x)               # [B, D]
             # Manually trigger episodic write for important inputs
             with torch.no_grad():
                 ek = episodic.key_proj(e_candidate.detach())
                 ev = episodic.val_proj(e_candidate.detach())
                 surprise = episodic._surprise(ek)
-                episodic._write(ek, ev, surprise, importance=importance)
+                episodic._write(ek, ev, surprise, importance=importance_tensor.item())
 
         # Episodic -> Semantic: distill high-confidence episodic patterns
-        if importance > 0.7 and self.training:
+        if importance_tensor > 0.7 and self.training:
             s_candidate = self.e2s_proj(x)
             with torch.no_grad():
                 semantic._update_prototypes(s_candidate.detach())
@@ -1021,7 +1023,7 @@ class HBMAMemory(nn.Module):
         outputs = [mod(x) for _, mod in all_subs]
 
         # Learned routing
-        gate = F.softmax(self.router(x), dim=-1)  # [B, n]
+        gate = F.softmax(self.router(x).float(), dim=-1).to(x.dtype)  # [B, n]
         blended = sum(
             gate[:, i:i+1] * out for i, out in enumerate(outputs)
         )  # [B, D]

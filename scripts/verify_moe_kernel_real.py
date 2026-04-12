@@ -112,9 +112,12 @@ def main():
     # --------------------------------------------------------
     print("\n[4] Forward pass HDIMModel (MoEKernel) on real encodings...")
     dom = domains[:BATCH_SIZE].to(DEVICE)
-    output, routing_weights, invariant, aux_state = model(
+    res = model(
         enc_a, dom, return_state=True, memory_mode="none"
     )
+    output = res.output
+    invariant = res.invariant
+    aux_state = res.aux_state
     check("Output non-NaN", not torch.isnan(output).any(), f"shape={output.shape}")
     check("Invariant non-NaN", not torch.isnan(invariant).any(), f"shape={invariant.shape}")
     check("router_loss valid", torch.isfinite(aux_state.router_loss),
@@ -159,7 +162,8 @@ def main():
         [p for p in model.parameters() if p.requires_grad], lr=1e-3
     )
     optimizer.zero_grad()
-    out2, _, inv2, aux2 = model(enc_a, dom, return_state=True, memory_mode="none")
+    res2 = model(enc_a, dom, return_state=True, memory_mode="none")
+    out2, inv2, aux2 = res2.output, res2.invariant, res2.aux_state
     loss = F.mse_loss(inv2, torch.zeros_like(inv2)) + aux2.router_loss + aux2.z_loss
     loss.backward()
 
@@ -182,7 +186,8 @@ def main():
     losses = []
     for step in range(3):
         optimizer.zero_grad()
-        out_s, _, inv_s, aux_s = model(enc_a, dom, return_state=True, memory_mode="none")
+        res_s = model(enc_a, dom, return_state=True, memory_mode="none")
+        out_s, inv_s, aux_s = res_s.output, res_s.invariant, res_s.aux_state
         loss_s = F.mse_loss(out_s, enc_a) + 0.01 * aux_s.router_loss
         loss_s.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

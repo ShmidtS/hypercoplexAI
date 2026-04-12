@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from src.models.hdim_model import HDIMAuxState, HDIMModel
+from src.models.results import ForwardResult
 from src.training.augmentations import EmbeddingAugmenter
 @dataclass(frozen=True)
 class TrainingRegime:
@@ -202,7 +203,7 @@ class HDIMTrainer:
     def _compute_pair_iso_targets(
         self, pair_encoding: torch.Tensor, pair_domain_id: torch.Tensor
     ) -> torch.Tensor:
-        _, _, _, _, aux_state = self._forward_batch(
+        result = self._forward_batch(
             pair_encoding,
             pair_domain_id,
             TrainingRegime(
@@ -211,12 +212,12 @@ class HDIMTrainer:
                 memory_mode="retrieve",
             ),
         )
-        return self._training_invariant(aux_state).detach()
+        return self._training_invariant(result.aux_state).detach()
 
     def _compute_pair_iso_targets_from_text(
         self, pair_texts: Sequence[str], pair_domain_id: torch.Tensor
     ) -> torch.Tensor:
-        _, _, _, _, aux_state = self._forward_text_batch(
+        result = self._forward_text_batch(
             pair_texts,
             pair_domain_id,
             TrainingRegime(
@@ -225,7 +226,7 @@ class HDIMTrainer:
                 memory_mode="retrieve",
             ),
         )
-        return self._training_invariant(aux_state).detach()
+        return self._training_invariant(result.aux_state).detach()
 
     def _compute_reconstruction_loss(
         self, output: torch.Tensor, target: torch.Tensor
@@ -325,7 +326,7 @@ class HDIMTrainer:
         if self._uses_text_model() and self._has_pair_texts(batch):
             pair_texts = self._extract_texts(batch, "pair_text")
             pair_domain_id = batch["pair_domain_id"].to(self.device)
-            _, _, _, _, aux_state = self._forward_text_batch(
+            result = self._forward_text_batch(
                 pair_texts,
                 pair_domain_id,
                 TrainingRegime(
@@ -334,6 +335,7 @@ class HDIMTrainer:
                     memory_mode="retrieve",
                 ),
             )
+            aux_state = result.aux_state
             return (
                 self._training_invariant(aux_state).detach(),
                 aux_state.exported_invariant.detach(),
@@ -343,7 +345,7 @@ class HDIMTrainer:
         pair_domain_id = batch.get("pair_domain_id")
         if pair_encoding is None or pair_domain_id is None:
             return None
-        _, _, _, _, aux_state = self._forward_batch(
+        result = self._forward_batch(
             pair_encoding.to(self.device),
             pair_domain_id.to(self.device),
             TrainingRegime(
@@ -352,6 +354,7 @@ class HDIMTrainer:
                 memory_mode="retrieve",
             ),
         )
+        aux_state = result.aux_state
         return (
             self._training_invariant(aux_state).detach(),
             aux_state.exported_invariant.detach(),
@@ -633,7 +636,12 @@ class HDIMTrainer:
             elif positive_mask.sum() > 1:
                 pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
                 sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
-            focal_matrix = sim_matrix * gamma
+            pos_mask = (pair_relation_label > 0.5)  # (B,)
+            focal_matrix = torch.where(
+                pos_mask.unsqueeze(1),
+                sim_matrix,
+                sim_matrix * gamma
+            )
             loss_per_sample = F.cross_entropy(
                 focal_matrix[pos_indices], labels[pos_indices], reduction='none'
             )
@@ -674,14 +682,14 @@ class HDIMTrainer:
 
         sim_matrix = (src @ tgt.T / temperature).float()  # force fp32 for AMP safety
 
-        pos_indices = positive_mask.nonzero(as_tuple=True)[0]
         diag_mask = torch.eye(B, dtype=torch.bool, device=self.device)
 
         # Vectorized: mask diagonal to -inf for all rows at once
         masked_sim = sim_matrix.clone()
         masked_sim.masked_fill_(diag_mask, -torch.finfo(torch.float32).max)
         log_denom = torch.logsumexp(masked_sim, dim=1)  # (B,)
-        s_pos = sim_matrix.diag()  # (B,)
+        pos_mask = (pair_relation_label > 0.5).float()  # (B,)
+        s_pos = (sim_matrix * pos_mask.unsqueeze(1)).sum(dim=1) / pos_mask.unsqueeze(1).sum(dim=1).clamp(min=1)
         loss_per_sample = -(s_pos - log_denom)  # (B,)
         # Apply weights only to positive samples
         weights = pair_weight * positive_mask.float()
@@ -775,11 +783,17 @@ class HDIMTrainer:
         # Исключаем диагональ (anchor = себя)
         pos_mask.fill_diagonal_(False)
 
-        # Знаменатель: все a ≠ i
+        # Знаменатель: все a ≠ i, excluding same-group positives (false negatives)
         eye = torch.eye(B, dtype=torch.bool, device=self.device)
-        denom_mask = ~eye  # (B, B)
+        if pair_group_id is not None:
+            group_match = pair_group_id.unsqueeze(0) == pair_group_id.unsqueeze(1)
+            label_pos = (pair_relation_label > 0.5)
+            fn_mask = ~(group_match & label_pos.unsqueeze(0))
+            denom_mask = ~eye & fn_mask
+        else:
+            denom_mask = ~eye
 
-        log_denom = torch.logsumexp(sim_matrix.masked_fill(eye, -torch.finfo(torch.float32).max), dim=-1)
+        log_denom = torch.logsumexp(sim_matrix.masked_fill(~denom_mask, -torch.finfo(torch.float32).max), dim=-1)
 
         # Vectorized: for each sample, average over positive similarities
         num_pos = pos_mask.sum(dim=1).clamp(min=1)  # (B,) — at least 1 to avoid div by 0
@@ -1002,8 +1016,8 @@ class HDIMTrainer:
         regime: TrainingRegime,
         *,
         return_encoding: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState, torch.Tensor]:
-        result = self.model.forward_texts(
+    ) -> ForwardResult:
+        return self.model.forward_texts(
             texts,
             domain_id,
             return_state=True,
@@ -1011,18 +1025,13 @@ class HDIMTrainer:
             memory_mode=regime.memory_mode,
             return_encoding=return_encoding,
         )
-        if return_encoding:
-            output, routing_weights, invariant, slot_outputs, aux_state, encodings = result
-            return (output, routing_weights, invariant, slot_outputs, aux_state, encodings)
-        output, routing_weights, invariant, slot_outputs, aux_state = result
-        return (output, routing_weights, invariant, slot_outputs, aux_state)
 
     def _forward_batch(
         self,
         encoding: torch.Tensor,
         domain_id: torch.Tensor,
         regime: TrainingRegime,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, HDIMAuxState]:
+    ) -> ForwardResult:
         return self.model(
             encoding,
             domain_id,
@@ -1043,15 +1052,17 @@ class HDIMTrainer:
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
                 # Encode source once (was double-encoded by transfer_text_pairs + _encode_texts)
                 _src_enc, _src_scales = self._encode_texts(texts, collect_matryoshka=True)
-                output, routing_weights, invariant, _slot_outputs, aux_state = (
-                    self.model.core_model.transfer_pairs(
+                tp_result = self.model.core_model.transfer_pairs(
                         _src_enc,
                         domain_id,
                         pair_domain_id,
                         update_memory=regime.update_memory,
                         memory_mode=regime.memory_mode,
                     )
-                )
+                output = tp_result.output
+                routing_weights = tp_result.routing_weights
+                invariant = tp_result.invariant
+                aux_state = tp_result.aux_state
                 _prl = batch.get("pair_relation_label")
                 _tgt_enc, _tgt_scales = self._encode_texts(pair_texts, collect_matryoshka=True)
                 # Apply embedding augmentation to pair (non-anchor) side
@@ -1078,9 +1089,14 @@ class HDIMTrainer:
                 else:
                     recon_target = _tgt_enc
             else:
-                output, routing_weights, invariant, _slot_outputs, aux_state, recon_target = self._forward_text_batch(
+                txt_result = self._forward_text_batch(
                     texts, domain_id, regime, return_encoding=True
                 )
+                output = txt_result.output
+                routing_weights = txt_result.routing_weights
+                invariant = txt_result.invariant
+                aux_state = txt_result.aux_state
+                recon_target = txt_result.encodings
         else:
             encoding = batch["encoding"].to(self.device)
             if regime.mode == "paired":
@@ -1089,13 +1105,17 @@ class HDIMTrainer:
                 if self._augmenter is not None:
                     pair_encoding = self._augmenter(pair_encoding, pairs_only=False)
                 pair_domain_id = batch["pair_domain_id"].to(self.device)
-                output, routing_weights, invariant, _slot_outputs, aux_state = self.model.transfer_pairs(
+                tp_result = self.model.transfer_pairs(
                     encoding,
                     domain_id,
                     pair_domain_id,
                     update_memory=regime.update_memory,
                     memory_mode=regime.memory_mode,
                 )
+                output = tp_result.output
+                routing_weights = tp_result.routing_weights
+                invariant = tp_result.invariant
+                aux_state = tp_result.aux_state
                 # For negative pairs: recon_target = source encoding (no transfer)
                 # For positive pairs: recon_target = pair_encoding (cross-domain transfer)
                 pair_relation_label = batch.get("pair_relation_label")
@@ -1105,9 +1125,13 @@ class HDIMTrainer:
                 else:
                     recon_target = pair_encoding
             else:
-                output, routing_weights, invariant, _slot_outputs, aux_state = self._forward_batch(
+                fwd_result = self._forward_batch(
                     encoding, domain_id, regime
                 )
+                output = fwd_result.output
+                routing_weights = fwd_result.routing_weights
+                invariant = fwd_result.invariant
+                aux_state = fwd_result.aux_state
                 recon_target = encoding
         training_invariant = self._training_invariant(aux_state)
         iso_target, loss_pair, pair_exported_target = self._compute_pair_loss_terms(aux_state, batch)
@@ -1206,13 +1230,21 @@ class HDIMTrainer:
         if torch.isnan(loss_total) or torch.isinf(loss_total):
             _components = {
                 "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
-                "loss_routing": loss_routing, "loss_memory": loss_memory, "loss_sts": loss_sts,
-                "loss_z": loss_z, "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
+                "loss_routing": loss_routing, "loss_memory": loss_memory,
+                "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
                 "loss_expert_ortho": loss_expert_ortho, "online_loss": aux_state.online_loss,
             }
             _nan_names = [k for k, v in _components.items() if torch.isnan(v) or torch.isinf(v)]
             print(f"  [NaN guard] NaN/Inf in loss components: {_nan_names}")
-            loss_total = torch.tensor(0.0, device=loss_total.device, requires_grad=True)
+            batch_losses = {
+                "loss_total": torch.tensor(0.0, device=loss_total.device),
+                "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
+                "loss_routing": loss_routing, "loss_memory": loss_memory,
+                "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
+                "loss_expert_ortho": loss_expert_ortho, "online_loss": aux_state.online_loss,
+                "_nan_skip": True,
+            }
+            return batch_losses
         batch_losses = {
             "loss_total": loss_total,
             "loss_recon": loss_recon,
@@ -1257,6 +1289,9 @@ class HDIMTrainer:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         losses = self._compute_batch_losses(batch)
+        if losses.get("_nan_skip"):
+            self.optimizer.zero_grad(set_to_none=True)
+            return losses["loss_total"]
         loss_total = losses["loss_total"]
 
         # Phase 31: Experience replay from OnlineLearner buffer
@@ -1279,7 +1314,6 @@ class HDIMTrainer:
                 scaler._scale = torch.tensor(new_scale, device=scaler._scale.device, dtype=scaler._scale.dtype)
                 scaler.update()
                 self._last_grad_norm = float('inf')
-                self._step += 1
                 return loss_total.detach()
 
             scaler.scale(loss_total).backward()
@@ -1301,6 +1335,7 @@ class HDIMTrainer:
             else:
                 scaler.step(self.optimizer)
                 scaler.update()
+                self._step += 1
         else:
             loss_total.backward()
             has_nan_grad = False
@@ -1312,7 +1347,7 @@ class HDIMTrainer:
             self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
             if not has_nan_grad:
                 self.optimizer.step()
-        self._step += 1
+                self._step += 1
         self._last_loss_components = {
             k: v.item() if isinstance(v, torch.Tensor) and v.dim() == 0 else v
             for k, v in losses.items()

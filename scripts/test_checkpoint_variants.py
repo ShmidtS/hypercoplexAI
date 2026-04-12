@@ -290,8 +290,8 @@ def compute_metrics_simple(model, texts_a, texts_b, labels, device):
             enc_b = model.encode_texts(batch_b, device=dev)
 
             dom = torch.zeros(enc_a.shape[0], dtype=torch.long, device=dev)
-            _, _, inv_a, _ = model(enc_a, dom, return_state=True, memory_mode="none")
-            _, _, inv_b, _ = model(enc_b, dom, return_state=True, memory_mode="none")
+            inv_a = model(enc_a, dom, return_state=True, memory_mode="none").invariant
+            inv_b = model(enc_b, dom, return_state=True, memory_mode="none").invariant
 
             all_inv_a.append(inv_a.cpu())
             all_inv_b.append(inv_b.cpu())

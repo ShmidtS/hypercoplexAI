@@ -1239,7 +1239,7 @@ class TestBatchedExpertExecution:
 
         slot_inputs = torch.randn(4, 64)
 
-        with pytest.raises(RuntimeError, match="homogeneous DomainExpert"):
+        with pytest.raises(RuntimeError, match="homogeneous architecture"):
             kernel._run_experts_batched(slot_inputs)
 
 

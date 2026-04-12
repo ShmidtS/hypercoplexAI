@@ -435,9 +435,10 @@ class TestSurpriseSignalIntegration:
         domain_id = torch.tensor([0, 1])
 
         with torch.no_grad():
-            output, routing_weights, invariant, slot_outputs, aux_state = model.forward(
+            result = model.forward(
                 x, domain_id, return_state=True
             )
+            aux_state = result.aux_state
 
         # aux_state should have memory_surprise field
         assert hasattr(aux_state, 'memory_surprise')
@@ -466,9 +467,10 @@ class TestSurpriseSignalIntegration:
         domain_id = torch.tensor([0, 1])
 
         with torch.no_grad():
-            output, routing_weights, invariant, slot_outputs, aux_state = model.forward(
+            result = model.forward(
                 x, domain_id, return_state=True
             )
+            aux_state = result.aux_state
 
         # hallucination_risk should be computed
         assert hasattr(aux_state, 'hallucination_risk')

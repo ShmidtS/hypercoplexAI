@@ -270,7 +270,7 @@ class TitansMemoryModule(nn.Module):
             elif strategy == 'geometric':
                 # Экспоненциальное затухание — сохраняет паттерны, убирает шум
                 # decay_factor ≈ 0.607 при decay_window=50 (медленное забывание)
-                decay = torch.exp(torch.tensor(-1.0 / max(decay_window, 1.0)))
+                decay = torch.exp(torch.tensor(-1.0 / max(decay_window, 1.0)).clamp(max=80))
                 self.memory.weight.mul_(decay)
                 self.momentum_S.mul_(decay * 0.5)  # momentum затухает быстрее
             elif strategy == 'stabilize':

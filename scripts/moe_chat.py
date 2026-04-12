@@ -303,7 +303,9 @@ def encode_text(model, text: str):
         semantic_hints = semantic_domain_hints(text)
         hint_domain = max(semantic_hints, key=semantic_hints.get) if semantic_hints else "math"
         dom = torch.tensor([DOMAIN_IDX[hint_domain]], dtype=torch.long, device=DEVICE)
-        out, _, _, _, aux_state = model(enc, dom, return_state=True, memory_mode="retrieve")
+        res = model(enc, dom, return_state=True, memory_mode="retrieve")
+        out = res.output
+        aux_state = res.aux_state
         expert_weights = aux_state.routing_weights[0].cpu()
         # Normalize routing scores to probabilities for display/dominant detection
         weights_sum = expert_weights.sum().clamp(min=1e-8)

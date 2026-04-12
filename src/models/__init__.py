@@ -5,6 +5,10 @@ from src.models.hdim_model import (
     HDIMModel,
     HDIMRuntimeConfig,
 )
+from src.models.results import (
+    CoreResult,
+    ForwardResult,
+)
 from src.models.text_hdim_model import (
     SimpleTextEncoder,
     TextHDIMModel,
@@ -15,6 +19,8 @@ __all__ = [
     "HDIMConfig",
     "HDIMModel",
     "HDIMRuntimeConfig",
+    "CoreResult",
+    "ForwardResult",
     "SimpleTextEncoder",
     "TextHDIMModel",
     "TextPairScoreResult",

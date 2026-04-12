@@ -24,7 +24,9 @@ from .moe_kernel import (
     CodeExpert,
     ScienceExpert,
     create_expert,
+    register_expert,
     EXPERT_REGISTRY,
+    EXPERT_CONFIGS,
 )
 from .moe_interface import MoERouter
 from .moe_kernel_adapter import MoEKernelAdapter
@@ -72,7 +74,7 @@ __all__ = [
     # MoE
     'MoEKernel', 'MoEKernelConfig', 'MoEKernelState',
     'DomainExpert', 'MathExpert', 'LanguageExpert', 'CodeExpert', 'ScienceExpert',
-    'create_expert', 'EXPERT_REGISTRY',
+    'create_expert', 'register_expert', 'EXPERT_REGISTRY', 'EXPERT_CONFIGS',
     'MoERouter', 'MoEKernelAdapter', 'SoftMoERouter', 'MaxScoreRouter', 'RouterCheckpoint', 'RouterResult',
     # Hallucination detection
     'HallucinationDetector', 'HallucinationDetectionResult', 'SemanticEntropyProbe',

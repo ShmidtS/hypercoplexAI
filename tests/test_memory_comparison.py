@@ -54,7 +54,10 @@ def _train_one_epoch(
     for X, D in loader:
         X, D = X.to(device), D.to(device)
         optimizer.zero_grad()
-        out, routing_weights, invariant, _, _ = model(X, D)
+        result = model(X, D)
+        out = result.output
+        routing_weights = result.routing_weights
+        invariant = result.invariant
         # Reconstruction loss
         loss_recon = nn.functional.mse_loss(out, X)
         # Routing entropy loss (encourage diverse routing)
@@ -83,7 +86,10 @@ def _eval_model(
     with torch.no_grad():
         for X, D in loader:
             X, D = X.to(device), D.to(device)
-            out, routing_weights, invariant, _, _ = model(X, D)
+            result = model(X, D)
+            out = result.output
+            routing_weights = result.routing_weights
+            invariant = result.invariant
             loss = nn.functional.mse_loss(out, X)
             eps = 1e-8
             rw_norm = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + eps)
@@ -204,10 +210,10 @@ class TestMemoryComparison:
         m = HDIMModel(cfg)
         x = torch.randn(8, 64)
         d = torch.randint(0, 4, (8,))
-        out, rw, inv, _, _ = m(x, d)
-        assert out.shape == (8, 64)
-        assert rw.shape == (8, 4)  # num_experts=4
-        assert inv.shape == (8, 64)
+        res = m(x, d)
+        assert res.output.shape == (8, 64)
+        assert res.routing_weights.shape == (8, 4)  # num_experts=4
+        assert res.invariant.shape == (8, 64)
 
     def test_titans_forward_shapes(self):
         """Titans model produces correct output shapes."""
@@ -215,10 +221,10 @@ class TestMemoryComparison:
         m = HDIMModel(cfg)
         x = torch.randn(8, 64)
         d = torch.randint(0, 4, (8,))
-        out, rw, inv, _, _ = m(x, d)
-        assert out.shape == (8, 64)
-        assert rw.shape == (8, 4)
-        assert inv.shape == (8, 64)
+        res = m(x, d)
+        assert res.output.shape == (8, 64)
+        assert res.routing_weights.shape == (8, 4)
+        assert res.invariant.shape == (8, 64)
 
     def test_reset_memory(self):
         """reset_memory works for both memory types."""
@@ -234,11 +240,12 @@ class TestMemoryComparison:
         x = torch.randn(3, 64)
         src_ids = torch.tensor([0, 2, 1], dtype=torch.long)
         tgt_ids = torch.tensor([1, 3, 0], dtype=torch.long)
-        out, routing, inv, slot_outputs, state = m.transfer_pairs(
+        result = m.transfer_pairs(
             x, src_ids, tgt_ids,
             update_memory=False,
             memory_mode="retrieve",
         )
+        out, routing, inv = result.output, result.routing_weights, result.invariant
         assert out.shape == (3, 64)
         assert routing.shape == (3, cfg.num_experts)
         assert inv.shape == (3, 64)

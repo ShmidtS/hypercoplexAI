@@ -31,7 +31,9 @@ for i in range(5):
     domain_id = torch.tensor([i % 4])
 
     with torch.no_grad():
-        output, weights, inv, slot, aux = model(x, domain_id, return_state=True)
+        res = model(x, domain_id, return_state=True)
+        output = res.output
+        aux = res.aux_state
 
     expert_idx = aux.topk_idx[0, 0].item()
     expert_name = model.pipeline.moe.expert_names[expert_idx]
