@@ -1230,20 +1230,14 @@ class HDIMTrainer:
         if torch.isnan(loss_total) or torch.isinf(loss_total):
             _components = {
                 "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
-                "loss_routing": loss_routing, "loss_memory": loss_memory,
-                "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
+                "loss_routing": loss_routing, "loss_memory": loss_memory, "loss_sts": loss_sts,
+                "loss_z": loss_z, "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
                 "loss_expert_ortho": loss_expert_ortho, "online_loss": aux_state.online_loss,
             }
             _nan_names = [k for k, v in _components.items() if torch.isnan(v) or torch.isinf(v)]
             print(f"  [NaN guard] NaN/Inf in loss components: {_nan_names}")
-            batch_losses = {
-                "loss_total": torch.tensor(0.0, device=loss_total.device),
-                "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
-                "loss_routing": loss_routing, "loss_memory": loss_memory,
-                "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
-                "loss_expert_ortho": loss_expert_ortho, "online_loss": aux_state.online_loss,
-                "_nan_skip": True,
-            }
+            batch_losses = {k: torch.tensor(0.0) for k in _components}
+            batch_losses["_nan_skip"] = True
             return batch_losses
         batch_losses = {
             "loss_total": loss_total,
@@ -1369,25 +1363,17 @@ class HDIMTrainer:
         return -entropy
     def validate(self, dataloader: DataLoader) -> Dict[str, float]:
         self.model.eval()
-        totals: Dict[str, float] = {
-            "loss_recon": 0.0,
-            "loss_iso": 0.0,
-            "loss_pair": 0.0,
-            "loss_routing": 0.0,
-            "loss_memory": 0.0,
-            "loss_diversity": 0.0,
-            "loss_matryoshka": 0.0,
-            "loss_total": 0.0,
-        }
+        totals: dict = {}
         n_batches = 0
         with torch.no_grad():
             for batch in dataloader:
                 losses = self._compute_batch_losses(batch)
-                for key in totals:
-                    val = losses[key].item()
-                    # Skip NaN/Inf values to prevent corruption of validation metrics
-                    if math.isfinite(val):
-                        totals[key] += val
+                for key, val in losses.items():
+                    if key.startswith("_"):
+                        continue
+                    v = val.item() if isinstance(val, torch.Tensor) and val.dim() == 0 else None
+                    if v is not None and math.isfinite(v):
+                        totals[key] = totals.get(key, 0.0) + v
                 n_batches += 1
         if n_batches > 0:
             for key in totals:

@@ -17,6 +17,9 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from src.models.hdim_model import MSAConfig
 from typing import Optional, Tuple
 
 import torch
@@ -25,7 +28,7 @@ import torch.nn.functional as F
 
 # Phase 2 MSA: Sparse retrieval for SemanticMemory
 # Phase 3 MSA: Overflow buffer for EpisodicMemory
-from src.core.msa_attention import MSASparseIndex, MSAOverflowBuffer, MSAConfig
+from src.core.prototype_memory import MSASparseIndex, MSAOverflowBuffer
 from src.core.nars_truth import NarsTruth
 
 
@@ -82,27 +85,6 @@ class ConsolidationContext:
     procedural: Optional[ProceduralMemory]
     is_training: bool
     step: int
-
-# ---------------------------------------------------------------------------
-# MSA Configuration
-# ---------------------------------------------------------------------------
-
-@dataclass
-class MSAConfig:
-    """Configuration for MSA sparse retrieval in SemanticMemory."""
-
-    top_k: int = 16
-    """Number of top prototypes to retrieve."""
-
-    chunk_size: int = 64
-    """Compression window size (P from paper)."""
-
-    temperature: float = 0.1
-    """Temperature for softmax in top-k selection."""
-
-    compression_threshold: int = 128
-    """Minimum prototypes before chunk compression activates."""
-
 
 # ---------------------------------------------------------------------------
 # Salience Scorer (vectorised, differentiable where needed)
@@ -197,7 +179,7 @@ class WorkingMemory(nn.Module):
     @torch.no_grad()
     def _write(self, x: torch.Tensor, importance: float = 0.5) -> None:
         """Write mean of batch to next buffer slot."""
-        slot = int(self.write_ptr.item()) % self.capacity
+        slot = self.write_ptr[0] % self.capacity
         self.buf[slot] = x.detach().mean(0)
         self.buf_age[slot] = 0
         self.buf_freq[slot] = 1
@@ -205,11 +187,11 @@ class WorkingMemory(nn.Module):
         self.buf_age += 1
         self.buf_age[slot] = 0
         self.write_ptr[0] = (slot + 1) % self.capacity
-        self.filled[0] = min(self.filled.item() + 1, self.capacity)
+        self.filled[0] = (self.filled[0] + 1).clamp(max=self.capacity)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, D] → memory-augmented [B, D]"""
-        n = max(int(self.filled.item()), 1)
+        n = max(int(self.filled[0]), 1)
         # buf_snap требует clone для градиентного вычисления; остальные - detach only
         buf_snap = self.buf[:n].detach().clone() # [N, D] — нужен clone для k_proj/v_proj
         age_snap = self.buf_age[:n].detach()  # read-only metadata
@@ -501,7 +483,11 @@ class SemanticMemory(nn.Module):
         self.use_nars_revision = use_nars_revision
         self.use_msa = use_msa
         if use_msa:
-            cfg = msa_config or MSAConfig()
+            if msa_config is not None:
+                cfg = msa_config
+            else:
+                from src.models.hdim_model import MSAConfig as _MSAConfig
+                cfg = _MSAConfig()
             self.msa_index = MSASparseIndex(
                 dim=hidden_dim,
                 num_prototypes=num_prototypes,
@@ -517,9 +503,10 @@ class SemanticMemory(nn.Module):
     def _update_prototypes(self, h: torch.Tensor) -> None:
         """EMA update of prototype centroids with confidence tracking.
 
-        Uses scatter-reduce for vectorized centroid computation.
-        Per-prototype contradiction checks remain in a loop (cosine sim
-        against current prototype is O(D) per prototype, negligible).
+        Fully vectorized — no per-prototype .item() calls.
+        Contradiction checks use batched cosine similarity instead of loop.
+        NARS revision path (rare, requires Python-level logic) defers .item()
+        to the point of use via tensor indexing.
         """
         h_norm = F.normalize(h.detach(), dim=-1)                     # [B, D]
         p_norm = F.normalize(self.prototypes, dim=-1)                # [P, D]
@@ -539,38 +526,62 @@ class SemanticMemory(nn.Module):
         proto_sum.scatter_add_(0, assigns.unsqueeze(-1).expand(-1, D), h_norm_f32)
         proto_count.scatter_add_(0, assigns, torch.ones_like(assigns, dtype=torch.float32))
 
-        # Per-prototype loop: contradiction check + EMA update
+        # Compute centroids for all prototypes at once
         has_samples = proto_count > 0
-        for p in range(self.num_prototypes):
-            if not has_samples[p]:
-                continue
-            centroid = proto_sum[p] / proto_count[p]
+        safe_count = proto_count.clamp(min=1).unsqueeze(-1)          # [P, 1]
+        centroids = proto_sum / safe_count                            # [P, D]
 
-            # Contradiction check: if very dissimilar to current prototype
-            curr_sim = F.cosine_similarity(centroid.unsqueeze(0),
-                                           self.prototypes[p].unsqueeze(0)).item()
-            if curr_sim < self.contradiction_thresh:
-                if self.use_nars_revision:
-                    existing = NarsTruth(freq=self.proto_conf[p].item(), conf=NarsTruth.w2c(self.proto_evidence[p].item()))
+        # Batched cosine similarity: all prototypes vs their centroids
+        # Only compute for prototypes that have samples
+        active_mask = has_samples                                    # [P]
+        if not active_mask.any():
+            return
+
+        # Vectorized contradiction check — single GPU operation
+        active_idx = active_mask.nonzero(as_tuple=True)[0]           # [A]
+        active_centroids = centroids[active_idx]                     # [A, D]
+        active_protos = self.prototypes[active_idx]                  # [A, D]
+        curr_sims = F.cosine_similarity(active_centroids, active_protos, dim=-1)  # [A]
+
+        # Split into contradicted vs aligned (vectorized masks)
+        contradicted = curr_sims < self.contradiction_thresh
+        aligned = ~contradicted
+
+        if self.use_nars_revision:
+            # NARS revision requires per-prototype logic — defer .item() to Python boundary
+            for i, p in enumerate(active_idx):
+                p = p.item()
+                if contradicted[i]:
+                    existing = NarsTruth(freq=float(self.proto_conf[p]), conf=NarsTruth.w2c(float(self.proto_evidence[p])))
                     negative = NarsTruth(freq=0.0, conf=0.5)
                     revised = NarsTruth.revision(existing, negative)
                     self.proto_conf[p] = revised.freq
                     self.proto_evidence[p] = NarsTruth.c2w(revised.conf)
                 else:
-                    self.proto_conf[p] = max(0.0, self.proto_conf[p].item() - 0.1)
-            else:
-                if self.use_nars_revision:
-                    existing = NarsTruth(freq=self.proto_conf[p].item(), conf=NarsTruth.w2c(self.proto_evidence[p].item()))
-                    observation = NarsTruth(freq=curr_sim, conf=NarsTruth.RELIANCE)
+                    existing = NarsTruth(freq=float(self.proto_conf[p]), conf=NarsTruth.w2c(float(self.proto_evidence[p])))
+                    observation = NarsTruth(freq=float(curr_sims[i]), conf=NarsTruth.RELIANCE)
                     revised = NarsTruth.revision(existing, observation)
                     self.proto_conf[p] = revised.freq
                     self.proto_evidence[p] = NarsTruth.c2w(revised.conf)
-                else:
-                    self.proto_conf[p] = min(1.0, self.proto_conf[p].item() + 0.05)
-                self.proto_age[p]      = 0
+                    self.proto_age[p] = 0
+                    updated = self.ema_momentum * self.prototypes[p] + (1 - self.ema_momentum) * centroids[p]
+                    self.prototypes[p] = F.normalize(updated, dim=-1)
+        else:
+            # Fully vectorized non-NARS path — zero .item() calls
+            contra_idx = active_idx[contradicted]
+            align_idx = active_idx[aligned]
 
-                updated = self.ema_momentum * self.prototypes[p] + (1 - self.ema_momentum) * centroid
-                self.prototypes[p] = F.normalize(updated, dim=-1)
+            # Contradicted: decrease confidence
+            if contra_idx.numel() > 0:
+                self.proto_conf[contra_idx] = (self.proto_conf[contra_idx] - 0.1).clamp(min=0.0)
+
+            # Aligned: increase confidence, reset age, EMA update prototype
+            if align_idx.numel() > 0:
+                self.proto_conf[align_idx] = (self.proto_conf[align_idx] + 0.05).clamp(max=1.0)
+                self.proto_age[align_idx] = 0
+                updated = (self.ema_momentum * self.prototypes[align_idx]
+                           + (1 - self.ema_momentum) * centroids[align_idx])
+                self.prototypes[align_idx] = F.normalize(updated, dim=-1)
 
     def _activation_spreading(self, attn: torch.Tensor, p_norm: torch.Tensor) -> torch.Tensor:
         """S3.2: NARS-inspired activation spreading.
@@ -626,7 +637,7 @@ class SemanticMemory(nn.Module):
 
         # Type routing — soft routing to emphasise relevant prototype partition
         type_logits = self.type_router(x)                            # [B, 4]
-        type_weights = F.softmax(type_logits, dim=-1)                # [B, 4]
+        type_weights = F.softmax(type_logits.float(), dim=-1).to(type_logits.dtype)  # [B, 4]
 
         # Snap all buffers before potential inplace updates in _update_prototypes
         p_snap    = self.prototypes.detach().clone()                 # [P, D]
@@ -844,7 +855,7 @@ class ConsolidationEngine(nn.Module):
                 ek = episodic.key_proj(e_candidate.detach())
                 ev = episodic.val_proj(e_candidate.detach())
                 surprise = episodic._surprise(ek)
-                episodic._write(ek, ev, surprise, importance=importance_tensor.item())
+                episodic._write(ek, ev, surprise, importance=float(importance_tensor))
 
         # Episodic -> Semantic: distill high-confidence episodic patterns
         if importance_tensor > 0.7 and self.training:

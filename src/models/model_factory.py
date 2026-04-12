@@ -27,33 +27,7 @@ from src.training.experiment_config import ExperimentConfig
 # ---------------------------------------------------------------------------
 
 
-def _patch_soft_router(core_model: HDIMModel, z_loss_weight: float = 0.0) -> None:
-    """Replace pipeline.moe with SoftMoERouter in-place.
-
-    The replacement uses the same input_dim / num_experts as the original
-    R3MoERouter so the pipeline contract is preserved.
-    """
-    from src.core.soft_moe_router import SoftMoERouter
-
-    pipeline = core_model.pipeline
-    cfg = core_model.config
-    # R3MoERouter operates on clifford-space vectors
-    input_dim: int = pipeline.clifford_dim
-    expert_dim: int = input_dim * 2  # sensible default
-    # num_experts is guaranteed to be set after __post_init__
-    num_experts = cfg.num_experts or 4
-
-    new_moe = SoftMoERouter(
-        input_dim=input_dim,
-        num_experts=num_experts,
-        expert_dim=expert_dim,
-        top_k=cfg.top_k,
-        z_loss_weight=z_loss_weight,
-    )
-    pipeline.moe = new_moe  # type: ignore[assignment]
-
-
-def _patch_sbert_encoder(
+def _make_sbert_encoder(
     text_model: TextHDIMModel,
     *,
     model_name: str = "paraphrase-multilingual-mpnet-base-v2",
@@ -63,7 +37,7 @@ def _patch_sbert_encoder(
     freeze_bottom_frac: float | None = None,
     projection_hidden: int | None = None,
 ) -> None:
-    """Replace text_model.text_encoder with SBERTEncoder in-place."""
+    """Set text_model.text_encoder to SBERTEncoder."""
     from src.models.sbert_encoder import SBERTEncoder
 
     core_cfg = text_model.core_model.config
@@ -76,10 +50,10 @@ def _patch_sbert_encoder(
         freeze_bottom_frac=freeze_bottom_frac,
         projection_hidden=projection_hidden,
     )
-    text_model.text_encoder = new_encoder  # type: ignore[assignment]
+    text_model.text_encoder = new_encoder
 
 
-def _patch_modernbert_encoder(
+def _make_modernbert_encoder(
     text_model: TextHDIMModel,
     *,
     model_name: str = "answerdotai/ModernBERT-base",
@@ -88,7 +62,7 @@ def _patch_modernbert_encoder(
     max_length: int = 512,
     matryoshka_dims: list[int] | None = None,
 ) -> None:
-    """Replace text_model.text_encoder with ModernBertEncoder in-place."""
+    """Set text_model.text_encoder to ModernBertEncoder."""
     from src.models.modern_text_encoder import ModernBertEncoder
 
     core_cfg = text_model.core_model.config
@@ -100,10 +74,10 @@ def _patch_modernbert_encoder(
         max_length=max_length,
         matryoshka_dims=matryoshka_dims,
     )
-    text_model.text_encoder = new_encoder  # type: ignore[assignment]
+    text_model.text_encoder = new_encoder
 
 
-def _patch_moe_kernel(
+def _make_moe_kernel(
     core_model: HDIMModel,
     *,
     expert_names: list | None = None,
@@ -111,11 +85,10 @@ def _patch_moe_kernel(
     ortho_loss_weight: float = 0.01,
     use_can_experts: bool = False,
 ) -> None:
-    """Replace pipeline.moe with MoEKernel (wrapped as drop-in) in-place.
+    """Set pipeline.moe to MoEKernel (via MoEKernelAdapter).
 
-    MoEKernel returns (output, MoEKernelState), but HDIMPipeline expects
-    (output, router_state_dict). The inner MoEKernelRouterAdapter bridges
-    the gap so the pipeline contract is fully preserved.
+    Uses the canonical MoEKernelAdapter from src.core.moe_kernel_adapter
+    which wraps MoEKernel to the MoERouter interface.
 
     Supports both built-in experts (math, language, code, science) and
     custom experts registered via `register_expert()` from moe_kernel.
@@ -136,10 +109,10 @@ def _patch_moe_kernel(
         >>> class MedicalExpert(DomainExpert):
         ...     pass  # custom implementation
         >>> register_expert("medical", MedicalExpert)
-        >>> _patch_moe_kernel(model, expert_names=["math", "medical"])
+        >>> _make_moe_kernel(model, expert_names=["math", "medical"])
     """
-    import torch.nn as nn
     from src.core.moe_kernel import MoEKernel, MoEKernelConfig
+    from src.core.moe_kernel_adapter import MoEKernelAdapter
 
     pipeline = core_model.pipeline
     cfg = core_model.config
@@ -174,47 +147,7 @@ def _patch_moe_kernel(
         use_can_experts=use_can_experts,
     )
 
-    class MoEKernelRouterAdapter(nn.Module):
-        """Wraps MoEKernel to match the (output, router_state_dict) API of SoftMoERouter."""
-
-        def __init__(self, kernel: MoEKernel, top_k: int = 2):
-            super().__init__()
-            self.kernel = kernel
-            # Expose attributes expected by HDIMPipeline / HDIMModel
-            self.num_experts = kernel.num_experts
-            self.num_slots = kernel.num_slots
-            self.top_k = top_k
-
-        def expert_orthogonalization_loss(self):
-            return self.kernel.expert_orthogonalization_loss()
-
-        def forward(self, x):
-            import torch
-
-            output, state = self.kernel(x)
-            top_k = min(self.top_k, state.expert_weights.shape[-1])
-            topk_weights, topk_idx = state.expert_weights.topk(top_k, dim=-1)
-            topk_weights_norm = topk_weights / topk_weights.sum(
-                -1, keepdim=True
-            ).clamp_min(1e-8)
-            router_state = {
-                "loss": state.total_loss(),
-                "router_loss": state.router_loss + state.ortho_loss,
-                "z_loss": state.z_loss,
-                "gate_weights": state.expert_weights,
-                "scores": state.expert_weights,
-                "expert_usage": state.expert_usage,
-                "routing_entropy": state.routing_entropy,
-                "dispatch_weights": state.dispatch_weights,
-                "train_scores_snapshot": self.kernel.train_scores.detach().clone(),
-                "topk_idx": topk_idx,
-                "topk_gate_weights": topk_weights_norm,
-                "moe_kernel_state": state,
-                "slot_outputs": state.slot_outputs,
-            }
-            return output, router_state
-
-    pipeline.moe = MoEKernelRouterAdapter(MoEKernel(kernel_cfg), top_k=cfg.top_k)  # type: ignore[assignment]
+    pipeline.moe = MoEKernelAdapter(MoEKernel(kernel_cfg))
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +167,10 @@ def build_text_hdim_model(
     z_loss_weight: float = 0.0,
 ) -> TextHDIMModel:
     """Build a TextHDIMModel with optional SoftMoERouter."""
-    core_model = HDIMModel(cfg)
+    if soft_router and z_loss_weight > 0:
+        cfg.z_loss_weight = z_loss_weight
 
-    if soft_router:
-        _patch_soft_router(core_model, z_loss_weight=z_loss_weight)
-
-    return TextHDIMModel(core_model)
+    return TextHDIMModel(HDIMModel(cfg))
 
 
 def build_sbert_hdim_model(
@@ -255,14 +186,9 @@ def build_sbert_hdim_model(
     z_loss_weight: float = 0.0,
 ) -> TextHDIMModel:
     """Build a TextHDIMModel with frozen SBERT encoder and optional SoftMoERouter."""
-    core_model = HDIMModel(cfg)
+    text_model = build_text_hdim_model(cfg, soft_router=soft_router, z_loss_weight=z_loss_weight)
 
-    if soft_router:
-        _patch_soft_router(core_model, z_loss_weight=z_loss_weight)
-
-    text_model = TextHDIMModel(core_model)
-
-    _patch_sbert_encoder(
+    _make_sbert_encoder(
         text_model,
         model_name=sbert_model_name,
         freeze=freeze_sbert,
@@ -287,14 +213,9 @@ def build_modernbert_hdim_model(
     z_loss_weight: float = 0.0,
 ) -> TextHDIMModel:
     """Build a TextHDIMModel with ModernBERT encoder and optional SoftMoERouter."""
-    core_model = HDIMModel(cfg)
+    text_model = build_text_hdim_model(cfg, soft_router=soft_router, z_loss_weight=z_loss_weight)
 
-    if soft_router:
-        _patch_soft_router(core_model, z_loss_weight=z_loss_weight)
-
-    text_model = TextHDIMModel(core_model)
-
-    _patch_modernbert_encoder(
+    _make_modernbert_encoder(
         text_model,
         model_name=modernbert_model_name,
         freeze=freeze_modernbert,

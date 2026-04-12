@@ -91,6 +91,28 @@ class HDIMTextConfig:
 
 
 @dataclass
+class MSAConfig:
+    """Configuration for MSA prototype memory subsystem.
+
+    Encapsulates all MSA-specific hyperparameters controlling prototype
+    memory behavior, sparse retrieval, and overflow management.
+    """
+
+    dim: int = 256
+    num_prototypes: int = 256
+    top_k: int = 16
+    chunk_size: int = 64
+    num_heads: int = 4
+    temperature: float = 0.1
+    ema_momentum: float = 0.995
+    overflow_capacity: int = 10000
+    max_hops: int = 3
+    interleave_threshold: float = 0.5
+    compression_threshold: int = 128
+    diversity_loss_weight: float = 1.0
+
+
+@dataclass
 class HDIMConfig:
     """Configuration dataclass for HDIMModel.
 
@@ -104,10 +126,11 @@ class HDIMConfig:
         clifford_r: Nilpotent basis vectors.
         top_k: Number of active experts per token.
         memory_key_dim: Dimensionality of Titans memory keys.
-        memory_type: Memory module type: titans | hippocampus | neocortex | cls | hbma | msa.
+        memory_type: Memory module type: titans | hippocampus | neocortex | cls | hbma | msa | prototype.
         domain_names: Explicit domain name list. If None, auto-generates
             ['domain_0', 'domain_1', ...] up to num_domains.
         expert_names: Explicit expert name list. If provided, num_experts is computed from it.
+        msa: Sub-config for MSA prototype memory. If None, auto-created from deprecated msa_* fields.
     """
 
     hidden_dim: int = 64
@@ -119,10 +142,11 @@ class HDIMConfig:
     clifford_r: int = 0
     top_k: int = 2
     memory_key_dim: int = 32
-    memory_type: str = "titans"  # titans | hippocampus | neocortex | cls | hbma | msa
+    memory_type: str = "titans"  # titans | hippocampus | neocortex | cls | hbma | msa | prototype
     domain_names: Optional[List[str]] = None
     expert_names: Optional[List[str]] = None  # New field for dynamic expert names
     text: HDIMTextConfig = field(default_factory=HDIMTextConfig)
+    msa: Optional[MSAConfig] = None
     # Phase 31: Self-Evolution (Online Learning)
     online_learning: bool = False  # Enable online TTT learning
     online_replay_size: int = 10000  # Experience replay buffer size
@@ -136,12 +160,13 @@ class HDIMConfig:
     # Phase 33: Hallucination Feedback Loop (Self-Correction)
     hallucination_feedback: bool = False # Enable hallucination feedback loop
     hallucination_feedback_config: Optional[dict] = None # Override default feedback config
-    # MSA memory configuration
+    z_loss_weight: float = 0.0  # Router z-loss regularization weight
+    # Backward compat: deprecated msa_* fields auto-migrated to msa sub-config
     msa_num_prototypes: int = 256
     msa_top_k: int = 16
     msa_chunk_size: int = 64
     msa_num_heads: int = 4
-    msa_temperature: float = 0.07
+    msa_temperature: float = 0.1
     msa_ema_momentum: float = 0.995
     msa_overflow_capacity: int = 10000
     msa_max_hops: int = 3
@@ -150,6 +175,21 @@ class HDIMConfig:
     msa_diversity_loss_weight: float = 1.0
 
     def __post_init__(self):
+        # Backward compat: auto-migrate msa_* fields to msa sub-config
+        if self.msa is None:
+            self.msa = MSAConfig(
+                num_prototypes=self.msa_num_prototypes,
+                top_k=self.msa_top_k,
+                chunk_size=self.msa_chunk_size,
+                num_heads=self.msa_num_heads,
+                temperature=self.msa_temperature,
+                ema_momentum=self.msa_ema_momentum,
+                overflow_capacity=self.msa_overflow_capacity,
+                max_hops=self.msa_max_hops,
+                interleave_threshold=self.msa_interleave_threshold,
+                compression_threshold=self.msa_compression_threshold,
+                diversity_loss_weight=self.msa_diversity_loss_weight,
+            )
         # Compute num_experts from expert_names if provided
         if self.expert_names is not None:
             computed = len(self.expert_names)
@@ -187,19 +227,21 @@ class HDIMModel(nn.Module):
         self.config = config
         self._domain_names: List[str] = config.get_domain_names()
 
-        msa_config = {
-            'num_prototypes': config.msa_num_prototypes,
-            'top_k': config.msa_top_k,
-            'chunk_size': config.msa_chunk_size,
-            'num_heads': config.msa_num_heads,
-            'temperature': config.msa_temperature,
-            'ema_momentum': config.msa_ema_momentum,
-            'overflow_capacity': config.msa_overflow_capacity,
-            'max_hops': config.msa_max_hops,
-            'interleave_threshold': config.msa_interleave_threshold,
-            'compression_threshold': config.msa_compression_threshold,
-            'diversity_loss_weight': config.msa_diversity_loss_weight,
-        }
+        msa_config = None
+        if config.msa is not None:
+            msa_config = {
+                'num_prototypes': config.msa.num_prototypes,
+                'top_k': config.msa.top_k,
+                'chunk_size': config.msa.chunk_size,
+                'num_heads': config.msa.num_heads,
+                'temperature': config.msa.temperature,
+                'ema_momentum': config.msa.ema_momentum,
+                'overflow_capacity': config.msa.overflow_capacity,
+                'max_hops': config.msa.max_hops,
+                'interleave_threshold': config.msa.interleave_threshold,
+                'compression_threshold': config.msa.compression_threshold,
+                'diversity_loss_weight': config.msa.diversity_loss_weight,
+            }
 
         self.pipeline = HDIMPipeline(
             input_dim=config.hidden_dim,
@@ -213,6 +255,7 @@ class HDIMModel(nn.Module):
             memory_key_dim=config.memory_key_dim,
             memory_type=config.memory_type,
             msa_config=msa_config,
+            z_loss_weight=config.z_loss_weight,
         )
 
         self.dropout = nn.Dropout(config.dropout)

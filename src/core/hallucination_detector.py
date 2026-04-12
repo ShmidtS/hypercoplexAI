@@ -107,25 +107,24 @@ class HallucinationDetector(nn.Module):
         """Maximum possible Shannon entropy for num_experts."""
         return math.log(self.num_experts)
 
+    @torch.no_grad()
     def compute_eigen_score(
         self,
         routing_repr: torch.Tensor,
-        top_k: int = 5,
     ) -> torch.Tensor:
         """Compute EigenScore for hallucination detection.
 
-        EigenScore = 1 / (sum of top-k singular values)
+        EigenScore = 1 / (sum of top-50% singular values)
         High S concentration = low uncertainty = low hallucination risk.
 
         Based on INSIDE paper (Chen et al., ICLR 2024): variance in embedding
         space indicates uncertainty. Low singular value sum = high variance =
         potential hallucination.
 
-        Processes each sample independently (batch dimension preserved).
+        Uses batched svdvals with float() cast for fp16 stability.
 
         Args:
             routing_repr: (batch, clifford_dim) — routing representations
-            top_k: Number of singular values to consider
 
         Returns:
             eigen_score: (batch,) — per-sample inverse singular value sum
@@ -136,12 +135,13 @@ class HallucinationDetector(nn.Module):
         # Batched eigen score via torch.linalg.svdvals (single GPU kernel)
         if routing_repr.dim() == 2:
             routing_repr = routing_repr.unsqueeze(1)  # (B, 1, D) for batched svdvals
-        S = torch.linalg.svdvals(routing_repr)         # (B, min(M, N))
-        k = min(top_k, S.shape[-1])
-        eigen_scores = 1.0 / (S[:, :k].sum(dim=-1) + 1e-8)  # (B,)
+        s_vals = torch.linalg.svdvals(routing_repr.float())  # (B, min(M, N))
+        k = max(1, int(s_vals.shape[-1] * 0.5))
+        eigen_score = 1.0 / (s_vals[:, :k].sum(dim=-1) + 1e-8)  # (B,)
 
-        return eigen_scores
+        return eigen_score
 
+    @torch.no_grad()
     def compute_hallucination_risk(
         self,
         routing_entropy: torch.Tensor,
@@ -206,7 +206,7 @@ class HallucinationDetector(nn.Module):
         # Ensure risk is in [0, 1]
         risk_clamped = torch.clamp(risk, 0.0, 1.0)
 
-        # Per-batch result — tensor comparisons for evidence_count (no .item() in hot path)
+        # Compute all means on GPU first
         risk_mean = risk_clamped.mean()
         entropy_mean = routing_entropy.mean()
         confidence_mean = moe_confidence.mean()
@@ -224,17 +224,24 @@ class HallucinationDetector(nn.Module):
             + (semantic_mean > 0.5)
         ).sum().item())
 
-        # Final .item() only at dataclass boundary (outside forward pass hot path)
-        risk_val = risk_mean.item()
+        # Single GPU->CPU transfer: stack all scalars, .item() once
+        _batch = torch.stack([
+            entropy_mean, confidence_mean, mismatch_mean,
+            loss_mean, eigen_mean, semantic_mean, risk_mean,
+        ]).cpu()
+        _entropy_v, _conf_v, _mismatch_v, _loss_v, _eigen_v, _semantic_v, _risk_v = (
+            float(v) for v in _batch
+        )
+
         return HallucinationDetectionResult(
-            routing_entropy=round(entropy_mean.item(), 6),
-            moe_confidence=round(confidence_mean.item(), 6),
-            memory_mismatch=round(mismatch_mean.item(), 6),
-            memory_loss=round(loss_mean.item(), 6),
-            eigen_score=round(eigen_mean.item(), 6),
-            semantic_entropy=round(semantic_mean.item(), 6),
-            hallucination_risk=round(risk_val, 6),
-            is_potential_hallucination=risk_val > self.risk_threshold,
+            routing_entropy=round(_entropy_v, 6),
+            moe_confidence=round(_conf_v, 6),
+            memory_mismatch=round(_mismatch_v, 6),
+            memory_loss=round(_loss_v, 6),
+            eigen_score=round(_eigen_v, 6),
+            semantic_entropy=round(_semantic_v, 6),
+            hallucination_risk=round(_risk_v, 6),
+            is_potential_hallucination=_risk_v > self.risk_threshold,
             evidence_count=evidence_count,
         )
 

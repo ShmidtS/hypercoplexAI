@@ -316,5 +316,5 @@ class TestSoftMoERouterAlignment:
                 input_is_invariant=False,
             )
         assert "alignment" in router_state
-        assert isinstance(router_state["alignment"], float)
-        assert 0.0 <= router_state["alignment"] <= 1.0
+        assert isinstance(router_state["alignment"], torch.Tensor)
+        assert 0.0 <= router_state["alignment"].item() <= 1.0

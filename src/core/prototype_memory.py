@@ -17,7 +17,6 @@ Reference: MSA paper — Memory Sparse Attention for Long-Context LLMs
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -25,29 +24,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .memory_interface import MemoryInterface, MemoryResult
-
-
-@dataclass
-class MSAConfig:
-    """Configuration for MSA sparse index."""
-
-    dim: int = 256
-    """Hidden dimension for projections."""
-
-    top_k: int = 16
-    """Number of top prototypes to retrieve."""
-
-    chunk_size: int = 64
-    """Compression window size (P from paper)."""
-
-    num_heads: int = 4
-    """Number of attention heads for multi-head routing."""
-
-    temperature: float = 0.1
-    """Temperature for softmax in top-k selection."""
-
-    compression_threshold: int = 128
-    """Minimum prototypes before chunk compression activates."""
 
 
 class MSASparseIndex(nn.Module):
@@ -985,3 +961,8 @@ class MSAMemory(MemoryInterface):
     def memory_loss(self) -> torch.Tensor:
         """Current auxiliary memory loss (routing diversity)."""
         return self._last_diversity_loss
+
+
+# Backward-compatible aliases
+PrototypeMemory = MSAMemory
+PrototypeIndex = MSASparseIndex

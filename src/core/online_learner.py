@@ -241,6 +241,7 @@ class OnlineLearner(nn.Module):
                     alpha=1 - self.ema_decay,
                 )
 
+    @torch.no_grad()
     def compute_surprise(
         self,
         x: torch.Tensor,
@@ -285,167 +286,80 @@ class OnlineLearner(nn.Module):
     ) -> Tuple[torch.Tensor, bool, float]:
         """Perform online gradient update.
 
+        Delegates to ``online_update_with_mode`` so that replay buffer,
+        expert tracking, and EMA updates all follow the unified code path.
+        When *target* is supplied it overrides the mode-dependent loss
+        computation with a plain MSE against that target.
+
         Args:
             x: Input encoding [batch, hidden_dim]
             expert_idx: Which expert this belongs to
-            target: Target encoding (if None, use EMA target)
+            target: Target encoding (if None, use mode-dependent loss)
             force_update: Force update regardless of surprise
 
         Returns:
             (loss, updated, surprise_mean): loss value, whether update happened, mean surprise
         """
-        self.step_count += 1
+        loss, updated, surprise_mean = self.online_update_with_mode(
+            x, expert_idx, force_update=force_update,
+        )
 
-        # Compute surprise
-        surprise = self.compute_surprise(x)
-        surprise_mean = float(surprise.mean().item())
+        # Override loss when an explicit target is given
+        if updated and target is not None:
+            loss = F.mse_loss(x, target)
 
-        # Check if should update
-        should_update = force_update or (surprise_mean > self.surprise_threshold and self.training)
+        return loss, updated, surprise_mean
 
-        if not should_update:
-            return torch.tensor(0.0, device=x.device, dtype=x.dtype), False, surprise_mean
+    def _online_update(
+        self,
+        x: torch.Tensor,
+        expert_idx: int,
+        surprise: torch.Tensor,
+        surprise_mean: float,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Execute online update with current gradient mode strategy.
 
-        # Initialize EMA if needed
-        self._init_ema(x.mean(dim=0))
+        All three modes share the same skeleton (replay buffer store,
+        expert tracking, EMA update) and differ only in replay input
+        preparation and loss computation.
 
-        # Compute target (use EMA if no target provided)
-        if target is None:
-            with torch.no_grad():
-                target = self.ema_weights.unsqueeze(0).expand(x.size(0), -1)
-
-        # Compute loss
-        loss = F.mse_loss(x, target)
-
-        # Gradient step
+        Returns:
+            (loss, updated): loss tensor, whether update happened
+        """
+        # --- Replay buffer store (strategy-dependent input) ---
         if self.training:
-            # Store for replay buffer
-            x_detached = x.detach()
+            if self.gradient_mode == GradientMode.SELECTIVE:
+                x_for_replay = (x * self.gradient_scale).detach()
+            else:
+                x_for_replay = x.detach()
+
             for i in range(x.size(0)):
                 self.replay_buffer.add(
-                    encoding=x_detached[i],
+                    encoding=x_for_replay[i],
                     domain_id=expert_idx,
                     surprise=float(surprise[i].item()),
                 )
 
-            # Update tracking
+            # --- Expert tracking ---
             self.expert_update_count[expert_idx] += 1
             self.expert_surprise_accum[expert_idx] += surprise_mean
 
-        # Update EMA
-        self._update_ema(x.mean(dim=0))
-
-        return loss, True, surprise_mean
-
-    def _update_detached(
-        self,
-        x: torch.Tensor,
-        expert_idx: int,
-        surprise: torch.Tensor,
-        surprise_mean: float,
-    ) -> Tuple[torch.Tensor, bool]:
-        """Detached update: no gradient flow (original behavior).
-
-        Returns:
-            (loss, updated): loss tensor (always 0.0 for detached), whether update happened
-        """
-        # Store for replay buffer
-        x_detached = x.detach()
-        for i in range(x.size(0)):
-            self.replay_buffer.add(
-                encoding=x_detached[i],
-                domain_id=expert_idx,
-                surprise=float(surprise[i].item()),
-            )
-
-        # Update tracking
-        self.expert_update_count[expert_idx] += 1
-        self.expert_surprise_accum[expert_idx] += surprise_mean
-
-        # Update EMA
-        self._update_ema(x.mean(dim=0))
-
-        return torch.tensor(0.0, device=x.device, dtype=x.dtype), True
-
-    def _update_selective(
-        self,
-        x: torch.Tensor,
-        expert_idx: int,
-        surprise: torch.Tensor,
-        surprise_mean: float,
-        model: Optional[nn.Module] = None,
-    ) -> Tuple[torch.Tensor, bool]:
-        """Selective update: gradients only for replay buffer consolidation.
-
-        This enables gradient flow for replay buffer samples while keeping
-        the main forward pass detached.
-
-        Returns:
-            (loss, updated): scaled loss for replay gradient, whether update happened
-        """
-        # Store with gradient tracking for replay
-        x_scaled = x * self.gradient_scale
-        for i in range(x.size(0)):
-            self.replay_buffer.add(
-                encoding=x_scaled[i].detach(),
-                domain_id=expert_idx,
-                surprise=float(surprise[i].item()),
-            )
-
-        # Update tracking
-        self.expert_update_count[expert_idx] += 1
-        self.expert_surprise_accum[expert_idx] += surprise_mean
-
-        # Compute scaled loss for replay buffer gradient
-        if self._ema_initialized:
-            target = self.ema_weights.unsqueeze(0).expand(x.size(0), -1)
-            loss = F.mse_loss(x_scaled, target) * self.gradient_scale
-        else:
+        # --- Loss computation (strategy-dependent) ---
+        if self.gradient_mode == GradientMode.DETACHED:
             loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        elif self.gradient_mode == GradientMode.SELECTIVE:
+            if self._ema_initialized:
+                target = self.ema_weights.unsqueeze(0).expand(x.size(0), -1)
+                loss = F.mse_loss(x * self.gradient_scale, target) * self.gradient_scale
+            else:
+                loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        elif self.gradient_mode == GradientMode.FULL:
+            target = self.ema_weights.unsqueeze(0).expand(x.size(0), -1)
+            loss = F.mse_loss(x * self.gradient_scale, target)
+        else:
+            raise ValueError(f"Unknown gradient mode: {self.gradient_mode}")
 
-        # Update EMA
-        self._update_ema(x.mean(dim=0))
-
-        return loss, True
-
-    def _update_full(
-        self,
-        x: torch.Tensor,
-        expert_idx: int,
-        surprise: torch.Tensor,
-        surprise_mean: float,
-        model: Optional[nn.Module] = None,
-    ) -> Tuple[torch.Tensor, bool]:
-        """Full gradient update: experimental mode with gradient clipping.
-
-        WARNING: This can destabilize training. Use with caution.
-
-        Returns:
-            (loss, updated): full gradient loss, whether update happened
-        """
-        # Compute target
-        if not self._ema_initialized:
-            self._init_ema(x.mean(dim=0))
-
-        target = self.ema_weights.unsqueeze(0).expand(x.size(0), -1)
-
-        # Scaled MSE loss with gradient flow
-        loss = F.mse_loss(x * self.gradient_scale, target)
-
-        # Store for replay buffer
-        x_detached = x.detach()
-        for i in range(x.size(0)):
-            self.replay_buffer.add(
-                encoding=x_detached[i],
-                domain_id=expert_idx,
-                surprise=float(surprise[i].item()),
-            )
-
-        # Update tracking
-        self.expert_update_count[expert_idx] += 1
-        self.expert_surprise_accum[expert_idx] += surprise_mean
-
-        # Update EMA
+        # --- EMA update ---
         self._update_ema(x.mean(dim=0))
 
         return loss, True
@@ -486,15 +400,8 @@ class OnlineLearner(nn.Module):
         # Initialize EMA if needed
         self._init_ema(x.mean(dim=0))
 
-        # Dispatch to appropriate update method
-        if self.gradient_mode == GradientMode.DETACHED:
-            loss, updated = self._update_detached(x, expert_idx, surprise, surprise_mean)
-        elif self.gradient_mode == GradientMode.SELECTIVE:
-            loss, updated = self._update_selective(x, expert_idx, surprise, surprise_mean, model)
-        elif self.gradient_mode == GradientMode.FULL:
-            loss, updated = self._update_full(x, expert_idx, surprise, surprise_mean, model)
-        else:
-            raise ValueError(f"Unknown gradient mode: {self.gradient_mode}")
+        # Dispatch to unified update method
+        loss, updated = self._online_update(x, expert_idx, surprise, surprise_mean)
 
         return loss, updated, surprise_mean
 

@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from src.core.moe_kernel import (
     MoEKernel, MoEKernelConfig, MoEKernelState,
-    DomainExpert, MathExpert, LanguageExpert, CodeExpert, ScienceExpert,
+    MLPExpert, DomainExpert, MathExpert, LanguageExpert, CodeExpert, ScienceExpert,
     create_expert, EXPERT_REGISTRY, register_expert, get_registered_expert_names,
 )
 
@@ -704,7 +704,7 @@ class TestRegisterExpert:
         class NotAnExpert:
             pass
 
-        with pytest.raises(TypeError, match="must inherit from DomainExpert"):
+        with pytest.raises(TypeError, match="must inherit from MLPExpert"):
             register_expert("invalid", NotAnExpert)
 
     def test_get_registered_expert_names_returns_list(self):
@@ -904,11 +904,11 @@ class TestRegisterExpert:
             """Tests for CAN-style experts using CliffordInteractionLayer."""
         
             def test_domain_expert_use_can_flag(self):
-                """DomainExpert with use_can=True uses CliffordInteractionLayer."""
-                expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
+                """MLPExpert with use_can=True uses CliffordInteractionLayer as pre_hook."""
+                expert = MLPExpert(input_dim=16, hidden_dim=32, use_can=True)
                 assert expert.use_can is True
-                assert hasattr(expert, 'interaction')
-                assert not hasattr(expert, 'net') or expert.net is None
+                assert hasattr(expert, 'pre_hook')
+                assert expert.pre_hook is not None
         
             def test_domain_expert_use_can_false(self):
                 """DomainExpert with use_can=False uses standard FFN."""
@@ -1075,9 +1075,9 @@ class TestBatchedExpertExecution:
         kernel = MoEKernel(cfg)
         kernel.eval()
 
-        # All experts should be plain DomainExpert
+        # All experts should be plain MLPExpert (DomainExpert alias)
         for expert in kernel.experts:
-            assert type(expert).__name__ == "DomainExpert"
+            assert isinstance(expert, MLPExpert)
 
         # Forward pass
         x = torch.randn(16, 64)

@@ -96,13 +96,10 @@ class TestEigenScore:
         detector = HallucinationDetector(num_experts=4)
 
         routing_repr = torch.randn(4, 64)
-        eigen_k5 = detector.compute_eigen_score(routing_repr, top_k=5)
-        eigen_k10 = detector.compute_eigen_score(routing_repr, top_k=10)
+        eigen = detector.compute_eigen_score(routing_repr)
 
-        # Different top_k should give different results in most cases
-        # Both should be positive
-        assert (eigen_k5 > 0).all()
-        assert (eigen_k10 > 0).all()
+        # eigen_score should be positive
+        assert (eigen > 0).all()
 
     def test_eigen_score_1d_input(self):
         detector = HallucinationDetector(num_experts=4)

@@ -18,6 +18,7 @@ from .moe_kernel import (
     MoEKernel,
     MoEKernelConfig,
     MoEKernelState,
+    MLPExpert,
     DomainExpert,
     MathExpert,
     LanguageExpert,
@@ -51,7 +52,7 @@ from .transfer_engine import TransferEngine
 
 # Memory interface
 from .memory_interface import MemoryInterface, TitansAdapter, HBMAMemoryAdapter
-from .msa_attention import MSAMemory
+from .prototype_memory import MSAMemory, PrototypeMemory, PrototypeIndex
 
 # Continual normalization
 from .continual_norm import ContinualNorm
@@ -73,7 +74,7 @@ __all__ = [
     'TransferState',  # moved to separate module
     # MoE
     'MoEKernel', 'MoEKernelConfig', 'MoEKernelState',
-    'DomainExpert', 'MathExpert', 'LanguageExpert', 'CodeExpert', 'ScienceExpert',
+    'MLPExpert', 'DomainExpert', 'MathExpert', 'LanguageExpert', 'CodeExpert', 'ScienceExpert',
     'create_expert', 'register_expert', 'EXPERT_REGISTRY', 'EXPERT_CONFIGS',
     'MoERouter', 'MoEKernelAdapter', 'SoftMoERouter', 'MaxScoreRouter', 'RouterCheckpoint', 'RouterResult',
     # Hallucination detection
@@ -86,7 +87,7 @@ __all__ = [
     # SRP Components
     'DomainEncoder', 'InvariantProcessor', 'InvariantMemoryState', 'TransferEngine',
     # Memory interface
-    'MemoryInterface', 'TitansAdapter', 'HBMAMemoryAdapter', 'MSAMemory',
+    'MemoryInterface', 'TitansAdapter', 'HBMAMemoryAdapter', 'MSAMemory', 'PrototypeMemory', 'PrototypeIndex',
     # Continual normalization
     'ContinualNorm',
     # Clifford interaction layers

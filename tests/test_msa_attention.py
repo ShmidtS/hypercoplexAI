@@ -11,11 +11,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.core.msa_attention import (
+from src.core.prototype_memory import (
     MSAOverflowBuffer,
-    MSAConfig,
     MSASparseIndex,
 )
+from src.models.hdim_model import MSAConfig
 
 
 class TestMSASparseIndex:
@@ -313,7 +313,8 @@ class TestSemanticMemoryMSA:
 
     def test_msa_config_override(self):
         """Test that MSAConfig can override defaults."""
-        from src.core.hbma_memory import SemanticMemory, MSAConfig
+        from src.core.hbma_memory import SemanticMemory
+        from src.models.hdim_model import MSAConfig
         
         cfg = MSAConfig(top_k=8, chunk_size=32, temperature=0.05)
         memory = SemanticMemory(

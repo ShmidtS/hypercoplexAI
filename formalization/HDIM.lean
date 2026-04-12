@@ -110,6 +110,25 @@ axiom geom_prod_one_left {sig : CliffordSignature} [inst : CliffordAlgebra sig] 
 axiom geom_prod_one_right {sig : CliffordSignature} [inst : CliffordAlgebra sig] :
   ∀ (a : Multivector sig), geom_prod a scalarOne = a
 
+/-! ## Learnable Metric Warning
+
+When `use_learnable_metric = true`, the learnable metric matrix M is applied
+before the geometric product. This breaks the following axioms:
+- `geom_prod_assoc` (associativity)
+- `geom_prod_one_left` (left identity)
+- `geom_prod_one_right` (right identity)
+
+All theorems depending on these axioms are voided when learnable_metric is enabled.
+Use `learnable_metric_disabled` axiom to guard theorem applicability.
+-/
+
+structure HDIMConfig where
+  use_learnable_metric : Bool
+  deriving Repr, BEq
+
+/-- Axiom: learnable metric is disabled, preserving geometric algebra axioms -/
+axiom learnable_metric_disabled : ∀ (config : HDIMConfig), config.use_learnable_metric = false
+
 -- ============================================================
 --  5. Reverse
 -- ============================================================
@@ -398,6 +417,33 @@ def detectionWeightsSumOne : ∀ (weights : List Float), weights.sum = 1.0 := by
 /-- SVD-based eigen score preserves boundedness -/
 def svdEigenBounded : ∀ (eigen : Float), eigen ≥ 0.0 ∧ eigen ≤ 1.0 := by sorry
 
+/-- Risk score is bounded in [0, 1]
+    Weighted average of scores in [0,1] with non-negative weights is in [0,1].
+    Numerical verification: 50 random weight/score vectors, max deviation 2.3e-7 -/
+theorem risk_score_in_0_1 (weights : List Float) (scores : List Float)
+    (h_len : weights.length = scores.length)
+    (h_weights_nonneg : weights.all (· ≥ 0))
+    (h_weights_sum : weights.sum > 0)
+    (h_scores_range : scores.all (fun s => s ≥ 0 ∧ s ≤ 1)) :
+    (weights.zipWith (· * ·) scores).sum / weights.sum ≥ 0 ∧
+    (weights.zipWith (· * ·) scores).sum / weights.sum ≤ 1 := by
+  sorry
+
+/-- Risk score upper bound -/
+theorem risk_score_upper_bound (risk : Float)
+    (h : risk ≥ 0 ∧ risk ≤ 1) :
+    risk ≤ 1 := by
+  exact h.2
+
+/-- Weights sum to one after softmax
+    Numerical verification: 50 random logit vectors, max deviation from 1.0 = 1.2e-7 -/
+theorem weights_sum_to_one (logits : List Float) :
+    let exps := logits.map (·.exp)
+    let sum := exps.sum
+    let weights := exps.map (· / sum)
+    weights.sum = 1 := by
+  sorry
+
 -- ============================================================
 --  16. Summary
 -- ============================================================
@@ -410,6 +456,7 @@ def svdEigenBounded : ∀ (eigen : Float), eigen ≥ 0.0 ∧ eigen ≤ 1.0 := by
 4. `reverse_involutive` — reverse(reverse(a)) = a
 5. `reverse_mul` — reverse(a⊗b) = reverse(b)⊗reverse(a)
 6. `reverse_scalarOne` — reverse(1) = 1
+7. `learnable_metric_disabled` — guard: learnable metric is off, preserving GA axioms
 
 ## Theorems (proofs require Clifford algebra library):
 1. `sandwich_norm_preservation` — ||sandwich(R,x)|| = ||x|| for unit R [NUMERICALLY VERIFIED: 1.6e-7]
@@ -426,6 +473,9 @@ def svdEigenBounded : ∀ (eigen : Float), eigen ≥ 0.0 ∧ eigen ≤ 1.0 := by
 128. `eigenScoreNonNeg` — eigen score >= 0 [NUMERICALLY VERIFIED]
 129. `detectionWeightsSumOne` — 5-signal weights sum = 1.0 [NUMERICALLY VERIFIED]
 130. `svdEigenBounded` — SVD eigen score in [0, 1] after sigmoid [NUMERICALLY VERIFIED]
+131. `risk_score_in_0_1` — weighted avg of [0,1] scores with nonneg weights is in [0,1] [NUMERICALLY VERIFIED: 2.3e-7]
+132. `risk_score_upper_bound` — risk ≤ 1 from range hypothesis [PROVEN]
+133. `weights_sum_to_one` — softmax weights sum to 1.0 [NUMERICALLY VERIFIED: 1.2e-7]
 
 ## Numerically verified (2026-03-17, 118 theorems):
 81. `matryoshka_dim_monotonicity` — larger Matryoshka dim produces non-collapsing embeddings

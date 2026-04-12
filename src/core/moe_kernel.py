@@ -121,17 +121,18 @@ class MoEKernelState:
 # Доменные эксперты
 # ============================================================
 
-class DomainExpert(nn.Module):
+class MLPExpert(nn.Module):
     """
-    Лёгкий FFN-эксперт с конфигурируемой активацией и архитектурой.
+    Parameterized FFN-expert with configurable activation, architecture,
+    and optional pre-hook transform.
 
-    Поддерживает варианты через config dict:
+    Supports variants via config dict:
       - activation: "gelu"|"silu"|"tanh"|"relu" (default: "gelu")
       - architecture: "standard"|"bottleneck" (default: "standard")
-      - pre_norm: bool (default: False) — LayerNorm перед FFN
+      - pre_norm: bool (default: False) — LayerNorm before FFN
 
-    При use_can=True использует CliffordInteractionLayer вместо FFN
-    для геометрических взаимодействий над 16D мультивекторами.
+    pre_hook: optional nn.Module applied before FFN (e.g., CliffordInteractionLayer).
+    When use_can=True, a CliffordInteractionLayer is created as pre_hook.
     """
 
     ACTIVATION_MAP = {
@@ -149,20 +150,30 @@ class DomainExpert(nn.Module):
         name: str = "expert",
         use_can: bool = False,
         config: Optional[Dict] = None,
+        pre_hook: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.name = name
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.use_can = use_can
         self._config = config or {}
         self.architecture = self._config.get("architecture", "standard")
         self._pre_norm = self._config.get("pre_norm", False)
 
-        if use_can:
+        # pre_hook: optional transform before FFN (e.g., CliffordInteractionLayer)
+        if pre_hook is not None:
+            self.pre_hook = pre_hook
+        elif use_can:
             from src.core.clifford_interaction import CliffordInteractionLayer
-            self.interaction = CliffordInteractionLayer(dim=input_dim, dropout=dropout)
+            self.pre_hook = CliffordInteractionLayer(dim=input_dim, dropout=dropout)
         else:
+            self.pre_hook = None
+
+        # When use_can=True (no explicit pre_hook), Clifford replaces FFN entirely.
+        # When pre_hook is explicitly provided, it runs before the FFN.
+        _can_replaces_ffn = use_can and pre_hook is None
+
+        if not _can_replaces_ffn:
             if self._pre_norm:
                 self.pre_norm = nn.LayerNorm(input_dim)
 
@@ -185,12 +196,16 @@ class DomainExpert(nn.Module):
                     nn.Dropout(dropout),
                     nn.Linear(hidden_dim, input_dim),
                 )
-        self._init_weights()
+
+            self._init_weights()
+
+    @property
+    def use_can(self) -> bool:
+        """True if a pre_hook (CliffordInteractionLayer) is configured."""
+        return self.pre_hook is not None
 
     def _init_weights(self):
-        """Инициализация весов для FFN-слоёв (не применяется к CAN)."""
-        if self.use_can:
-            return
+        """Weight initialization for FFN layers."""
         for module in self.net.modules():
             if isinstance(module, nn.Linear):
                 nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
@@ -200,11 +215,18 @@ class DomainExpert(nn.Module):
                     nn.init.uniform_(module.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_can:
-            return self.interaction(x)
+        if self.pre_hook is not None and not hasattr(self, 'net'):
+            # CAN replaces FFN: pre_hook output is the final output
+            return self.pre_hook(x)
+        if self.pre_hook is not None:
+            x = self.pre_hook(x)
         if self._pre_norm:
             x = self.pre_norm(x)
         return self.net(x)
+
+
+# Backward-compatible alias
+DomainExpert = MLPExpert
 
 
 EXPERT_CONFIGS: Dict[str, Dict] = {
@@ -243,14 +265,14 @@ def register_expert(name: str, expert_cls: type, config: Optional[Dict] = None) 
         config: Опциональная конфигурация для DomainExpert
 
     Raises:
-        TypeError: Если expert_cls не наследует DomainExpert
+        TypeError: Если expert_cls не наследует MLPExpert
 
     Example:
         >>> from src.core.moe_kernel import DomainExpert, register_expert
         >>> register_expert("medical", DomainExpert, config={"activation": "tanh"})
     """
-    if not issubclass(expert_cls, DomainExpert):
-        raise TypeError(f"{expert_cls.__name__} must inherit from DomainExpert")
+    if not issubclass(expert_cls, MLPExpert):
+        raise TypeError(f"{expert_cls.__name__} must inherit from MLPExpert")
     EXPERT_REGISTRY[name] = expert_cls
     if config is not None:
         EXPERT_CONFIGS[name] = config
@@ -275,7 +297,7 @@ def create_expert(
     hidden_dim: int,
     dropout: float,
     use_can: bool = False,
-) -> DomainExpert:
+) -> MLPExpert:
     """Создаёт эксперт по имени домена из реестра.
 
     Args:
@@ -283,25 +305,26 @@ def create_expert(
         input_dim: Размерность входа
         hidden_dim: Размерность скрытого слоя FFN
         dropout: Dropout rate
-        use_can: Если True, использует CliffordInteractionLayer вместо FFN
+        use_can: Если True, использует CliffordInteractionLayer как pre_hook
 
     Returns:
-        DomainExpert с FFN или CAN-слоем
+        MLPExpert (DomainExpert) с FFN или CAN-слоем
     """
-    cls = EXPERT_REGISTRY.get(name, DomainExpert)
+    cls = EXPERT_REGISTRY.get(name, MLPExpert)
     config = EXPERT_CONFIGS.get(name, {})
     if use_can:
-        return DomainExpert(input_dim, hidden_dim, dropout, name=name, use_can=use_can)
+        return MLPExpert(input_dim, hidden_dim, dropout, name=name, use_can=use_can)
     # Built-in subclasses (MathExpert, etc.) hardcode name/config in __init__
-    if cls is not DomainExpert:
+    if cls is not MLPExpert:
         return cls(input_dim, hidden_dim, dropout)
-    return DomainExpert(input_dim, hidden_dim, dropout, name=name, config=config)
+    return MLPExpert(input_dim, hidden_dim, dropout, name=name, config=config)
 
 
 # ============================================================
 # Backward-compatible aliases — thin subclasses with config
 # ============================================================
 
+# Backward-compatible aliases — thin subclasses forwarding to MLPExpert (DomainExpert)
 class MathExpert(DomainExpert):
     """Эксперт для математических и алгебраических паттернов (bottleneck + GELU)."""
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
@@ -315,7 +338,7 @@ class LanguageExpert(DomainExpert):
 
 
 class CodeExpert(DomainExpert):
-    """Эксперт для структурных паттернов кода и логики (SiLU)."""
+    """Эксперт для структурных патторнов кода и логики (SiLU)."""
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__(input_dim, hidden_dim, dropout, name="code", config=EXPERT_CONFIGS["code"])
 
@@ -507,7 +530,9 @@ class MoEKernel(nn.Module):
                 Sequential: ~0.8ms per forward
                 Batched:    ~0.3ms per forward
         """
-        outputs = []
+        num_slots = slot_inputs.shape[0]
+        D = slot_inputs.shape[1]
+        outputs = torch.empty(num_slots, D, device=slot_inputs.device, dtype=slot_inputs.dtype)
         for e_idx, expert in enumerate(self.experts):
             start = e_idx * self.slots_per_expert
             end = start + self.slots_per_expert
@@ -516,8 +541,8 @@ class MoEKernel(nn.Module):
             # Защита от NaN/Inf
             expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=10.0, neginf=-10.0)
             expert_output = torch.clamp(expert_output, -10.0, 10.0)
-            outputs.append(expert_output)
-        return torch.cat(outputs, dim=0)  # (num_slots, D)
+            outputs[start:end] = expert_output
+        return outputs
 
     def _run_experts_batched(self, slot_inputs: torch.Tensor) -> torch.Tensor:
         """
@@ -546,11 +571,11 @@ class MoEKernel(nn.Module):
             h = GELU(bmm(W1_stack, x))  # (E, slots, H)
             y = bmm(W2_stack, h)        # (E, slots, D)
         """
-        # Check if all experts are homogeneous DomainExpert with same architecture
+        # Check if all experts are homogeneous MLPExpert (DomainExpert) with same architecture
         for expert in self.experts:
-            if not isinstance(expert, DomainExpert) or expert.use_can:
+            if not isinstance(expert, MLPExpert) or expert.use_can:
                 raise RuntimeError(
-                    f"_run_experts_batched requires homogeneous DomainExpert instances, "
+                    f"_run_experts_batched requires homogeneous MLPExpert instances, "
                     f"got {type(expert).__name__}. Use _run_experts() for heterogeneous experts."
                 )
         first = self.experts[0]
@@ -616,7 +641,7 @@ class MoEKernel(nn.Module):
         """
         Check if batched expert execution is applicable.
 
-        Returns True if all experts are homogeneous DomainExpert instances
+        Returns True if all experts are homogeneous MLPExpert (DomainExpert) instances
         with standard (2-layer FFN) architecture and same activation.
         Bottleneck architecture is not supported by _run_experts_batched.
         """
@@ -624,7 +649,7 @@ class MoEKernel(nn.Module):
             return False
 
         for expert in self.experts:
-            if not isinstance(expert, DomainExpert) or expert.use_can:
+            if not isinstance(expert, MLPExpert) or expert.use_can:
                 return False
 
         # All must share the same architecture and activation

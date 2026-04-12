@@ -30,7 +30,7 @@ import torch.nn as nn
 from src.core.titans_memory import TitansMemoryModule
 from src.core.hbma_memory import HBMAMemory, CLSMemory
 from src.core.memory_interface import TitansAdapter, HBMAMemoryAdapter
-from src.core.msa_attention import MSAMemory
+from src.core.prototype_memory import MSAMemory
 
 
 # Version for persistence format compatibility

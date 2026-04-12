@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from .hypercomplex import CliffordAlgebra
 from .domain_operators import sandwich_transfer
+from .moe_interface import MoERouter
 from .memory_interface import MemoryInterface, TitansAdapter, HBMAMemoryAdapter
 from .domain_encoder import DomainEncoder
 from .invariant_processor import InvariantProcessor, InvariantMemoryState
@@ -89,6 +90,7 @@ class HDIMPipeline(nn.Module):
         memory_key_dim: int = 32,
         memory_type: str = 'titans',
         msa_config: Optional[dict] = None,
+        z_loss_weight: float = 0.0,
     ):
         super().__init__()
 
@@ -132,8 +134,8 @@ class HDIMPipeline(nn.Module):
         elif memory_type == 'hbma':
             from .hbma_memory import HBMAMemory
             self.memory = HBMAMemoryAdapter(HBMAMemory(hidden_dim=clifford_dim))
-        elif memory_type == 'msa':
-            from .msa_attention import MSAMemory
+        elif memory_type in ('msa', 'prototype'):
+            from .prototype_memory import MSAMemory
             msa_kwargs = msa_config or {}
             self.memory: MemoryInterface = MSAMemory(
                 hidden_dim=clifford_dim,
@@ -152,6 +154,7 @@ class HDIMPipeline(nn.Module):
             algebra=self.algebra,
             num_experts=num_experts,
             top_k=top_k,
+            z_loss_weight=z_loss_weight,
         )
 
         # Backward compatibility aliases
@@ -226,7 +229,8 @@ class HDIMPipeline(nn.Module):
         )
 
         alignment = router_state.get("alignment", 1.0)
-        transfer_truth = NarsTruth(freq=1.0, conf=alignment)
+        conf_val = alignment.item() if isinstance(alignment, torch.Tensor) else alignment
+        transfer_truth = NarsTruth(freq=1.0, conf=conf_val)
 
         transfer_state = TransferState(
             g_source=g_source,

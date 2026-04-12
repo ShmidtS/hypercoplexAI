@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.core.moe_interface import TextEncoder
 from src.models.hdim_model import HDIMAuxState, HDIMModel, HDIMTextConfig
 from src.models.results import ForwardResult
 
@@ -160,6 +161,12 @@ class SimpleTextEncoder(nn.Module):
             attention_mask = attention_mask.to(device)
         return token_ids, attention_mask
 
+    def encode(
+        self,
+        texts: list,
+    ) -> torch.Tensor:
+        return self.forward(texts, device=self.device, dtype=self.dtype)
+
     def forward(
         self,
         texts: Sequence[str],
@@ -223,7 +230,7 @@ class TextHDIMModel(nn.Module):
             )
 
         self.text_config = text_config
-        self.text_encoder = SimpleTextEncoder.from_text_config(
+        self.text_encoder: TextEncoder = SimpleTextEncoder.from_text_config(
             output_dim=core_model.config.hidden_dim,
             text_config=text_config,
             fallback_dropout=core_model.config.dropout,

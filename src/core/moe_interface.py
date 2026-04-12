@@ -14,10 +14,29 @@ Architecture:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Protocol, TypedDict, runtime_checkable
 
 import torch
 from torch import Tensor, nn
+
+
+@runtime_checkable
+class TextEncoder(Protocol):
+    """Protocol for text encoding components (SimpleTextEncoder, SBERTEncoder, ModernBertEncoder)."""
+
+    def forward(self, texts: list, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor: ...
+    def encode(self, texts: list) -> torch.Tensor: ...
+
+
+class RouterState(TypedDict, total=False):
+    """Structured routing state returned by MoE routers."""
+
+    routing_weights: torch.Tensor
+    expert_indices: torch.Tensor
+    diversity_loss: torch.Tensor
+    z_loss: torch.Tensor
+    entropy: torch.Tensor
+    domain_logits: torch.Tensor
 
 
 class MoERouter(nn.Module, ABC):

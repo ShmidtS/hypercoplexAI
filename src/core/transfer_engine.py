@@ -23,7 +23,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .hypercomplex import CliffordAlgebra
 from .domain_operators import DomainRotationOperator, sandwich_transfer
-from .transfer_state import TransferState
+from .moe_interface import MoERouter
 from .nars_truth import NarsTruth
 
 
@@ -44,6 +44,7 @@ class TransferEngine(nn.Module):
         num_experts: int = 4,
         top_k: int = 2,
         router_cls: Optional[type] = None,
+        z_loss_weight: float = 0.0,
     ):
         """Инициализация TransferEngine.
 
@@ -54,6 +55,7 @@ class TransferEngine(nn.Module):
             num_experts: количество экспертов MoE
             top_k: топ-k маршрутизации
             router_cls: класс роутера MoE (None = SoftMoERouter)
+            z_loss_weight: weight for router z-loss regularization
         """
         super().__init__()
 
@@ -69,11 +71,12 @@ class TransferEngine(nn.Module):
             router_cls = SoftMoERouter
 
         # MoE router: soft routing к доменным экспертам
-        self.moe = router_cls(
+        self.moe: MoERouter = router_cls(
             input_dim=clifford_dim,
             num_experts=num_experts,
             expert_dim=clifford_dim * 2,
             top_k=top_k,
+            z_loss_weight=z_loss_weight,
         )
 
         # Decoder: мультивектор -> выход
@@ -134,7 +137,7 @@ class TransferEngine(nn.Module):
         if hasattr(source_rotor, '_normalized_R') and hasattr(target_rotor, '_normalized_R'):
             source_norm = source_rotor._normalized_R().norm()
             target_norm = target_rotor._normalized_R().norm()
-            alignment = (source_norm * target_norm).clamp(0.0, 1.0).item()
+            alignment = (source_norm * target_norm).clamp(0.0, 1.0)
         else:
             alignment = 1.0
 
@@ -166,11 +169,12 @@ class TransferEngine(nn.Module):
         # Compute alignment from inverse rotor quality
         if hasattr(self.algebra, '_normalized_R'):
             rotor_norm = self.algebra._normalized_R(inv_rotor).norm()
-            alignment = (1.0 / (1.0 + rotor_norm)).clamp(0.0, 1.0).item()
+            alignment = (1.0 / (1.0 + rotor_norm)).clamp(0.0, 1.0)
         else:
             alignment = 0.5
 
-        return u_source_estimated, NarsTruth(freq=1.0, conf=alignment)
+        conf_val = alignment.item() if isinstance(alignment, torch.Tensor) else alignment
+        return u_source_estimated, NarsTruth(freq=1.0, conf=conf_val)
 
     def forward(
         self,

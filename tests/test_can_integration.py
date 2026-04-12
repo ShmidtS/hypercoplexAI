@@ -196,8 +196,8 @@ class TestDomainExpertCAN:
         expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
         
         assert expert.use_can is True
-        assert hasattr(expert, 'interaction')
-        assert isinstance(expert.interaction, CliffordInteractionLayer)
+        assert hasattr(expert, 'pre_hook')
+        assert isinstance(expert.pre_hook, CliffordInteractionLayer)
 
     def test_can_expert_forward(self):
         """Test forward pass through CAN expert."""
