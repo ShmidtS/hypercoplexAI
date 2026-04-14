@@ -55,6 +55,7 @@ class MoEKernelAdapter(MoERouter):
         self.kernel = kernel
         self.num_experts = kernel.num_experts
         self.num_slots = kernel.num_experts  # MoEKernel uses 1 slot per expert
+        self.top_k = min(2, kernel.num_experts)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Dict[str, Any]]:
         """Route input through MoEKernel experts.
@@ -100,6 +101,53 @@ class MoEKernelAdapter(MoERouter):
         })
 
         return output, info
+
+    @property
+    def expert_names(self) -> list:
+        """Proxy: delegate expert_names to kernel."""
+        return self.kernel.expert_names
+
+    @property
+    def train_scores(self) -> Tensor:
+        """Proxy: delegate train_scores to kernel (in-place ops like fill_/mul_/add_ work)."""
+        return self.kernel.train_scores
+
+    def enable_shared_expert(self) -> None:
+        """Enable shared expert at runtime.
+
+        MoEKernel reads use_shared_expert at __init__; this sets the
+        runtime flag AND creates the shared_expert module if missing.
+        """
+        if getattr(self.kernel, 'shared_expert', None) is not None:
+            return
+        self.kernel.use_shared_expert = True
+        self.kernel.config.use_shared_expert = True
+        input_dim = self.kernel.config.input_dim
+        hidden_dim = self.kernel.config.expert_hidden_dim
+        self.kernel.shared_expert = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_dim, input_dim),
+        )
+
+    def enable_aux_loss_free(self, aux_lr: float = 0.01) -> None:
+        """Enable aux-loss-free load balancing at runtime.
+
+        MoEKernel stores bias as _expert_bias buffer and uses _aux_lr.
+        When disabled at init, _expert_bias is registered as None —
+        replace it with a real tensor.
+        """
+        self.kernel.config.use_aux_loss_free = True
+        self.kernel.config.use_bias_balancing = True
+        self.kernel._aux_lr = aux_lr
+        bias = getattr(self.kernel, '_expert_bias', None)
+        if bias is None:
+            self.kernel._expert_bias = torch.zeros(self.kernel.num_experts)
+
+    def enable_expert_ortho(self) -> None:
+        """Enable expert orthogonalization loss at runtime."""
+        self.kernel.use_expert_ortho = True
+        self.kernel.config.use_expert_ortho = True
 
     def get_expert_load(self) -> Tensor:
         """Return current expert load statistics from MoEKernel.

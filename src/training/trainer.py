@@ -695,7 +695,7 @@ class HDIMTrainer:
         weights = pair_weight * positive_mask.float()
         if weights.sum() == 0:
             return self._zero_loss(source_inv)
-        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
+        return ((loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)).clamp(min=0)
 
     def _compute_uniformity_alignment_loss(
         self,
@@ -744,7 +744,7 @@ class HDIMTrainer:
         neg_sq = (-t_uniform * sq_dists_off).float()  # fp32 для logsumexp стабильности
         loss_uniform = torch.logsumexp(neg_sq, dim=-1).mean() - math.log(neg_sq.shape[-1])
 
-        return lambda_align * loss_align + lambda_uniform * loss_uniform
+        return (lambda_align * loss_align + lambda_uniform * loss_uniform).clamp(min=0)
 
     def _compute_supcon_loss(
         self,

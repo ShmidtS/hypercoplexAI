@@ -227,6 +227,9 @@ def build_modernbert_hdim_model(
     return text_model
 
 
+_patch_moe_kernel = _make_moe_kernel
+
+
 def model_from_experiment_config(
     exp: ExperimentConfig,
 ) -> Union[TextHDIMModel, HDIMModel]:
