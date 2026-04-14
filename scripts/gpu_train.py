@@ -462,8 +462,8 @@ def run_gpu_training(
         learnable_temperature=getattr(args, 'learnable_temperature', False),
         lambda_dcl=getattr(args, 'lambda_dcl', 0.0),
         lambda_uniformity=getattr(args, 'lambda_uniformity', 0.0),
-        lambda_diversity_var=getattr(args, 'lambda_diversity_var', 0.01),
-        lambda_diversity_ortho=getattr(args, 'lambda_diversity_ortho', 0.005),
+        lambda_diversity_var=getattr(args, 'lambda_diversity_var', 0.0),
+        lambda_diversity_ortho=getattr(args, 'lambda_diversity_ortho', 0.0),
         lambda_matryoshka=getattr(args, 'lambda_matryoshka', 0.1),
         aug_noise_std=getattr(args, 'aug_noise_std', 0.0),
         aug_mixup_alpha=getattr(args, 'aug_mixup_alpha', 0.0),
@@ -832,7 +832,7 @@ def main() -> None:
     parser.add_argument("--clifford_r", type=int, default=0,
                         help="Clifford algebra nilpotent bases (default=0)")
     # Loss weights
-    parser.add_argument("--lambda_iso", type=float, default=0.1)
+    parser.add_argument("--lambda_iso", type=float, default=0.0)
     parser.add_argument("--lambda_pair", type=float, default=0.4)
     parser.add_argument("--lambda_routing", type=float, default=0.05)
     parser.add_argument("--lambda_z", type=float, default=0.0,
@@ -841,7 +841,7 @@ def main() -> None:
                         help="DCL loss weight (Decoupled Contrastive, Yeh et al. 2022, try 0.3-0.5)")
     parser.add_argument("--lambda_uniformity", type=float, default=0.0,
                         help="Uniformity+Alignment loss weight (Wang & Isola 2020, try 0.1-0.3)")
-    parser.add_argument("--lambda_memory", type=float, default=0.01)
+    parser.add_argument("--lambda_memory", type=float, default=0.05)
     parser.add_argument("--lambda_diversity_var", type=float, default=0.0,
                         help="Diversity variance weight (anti-collapse, 0.0=disabled)")
     parser.add_argument("--lambda_diversity_ortho", type=float, default=0.0,
@@ -890,7 +890,7 @@ def main() -> None:
     parser.add_argument("--use_infonce", action="store_true", default=True,
                         help="Use InfoNCE loss instead of ranking margin (default: True)")
     parser.add_argument("--no_infonce", dest="use_infonce", action="store_false")
-    parser.add_argument("--infonce_temperature", type=float, default=0.07,
+    parser.add_argument("--infonce_temperature", type=float, default=0.15,
                         help="InfoNCE temperature (default: 0.07)")
     # Real data
     parser.add_argument("--real_pairs", type=str, default=None,
@@ -915,7 +915,7 @@ def main() -> None:
                         help="LR scheduler type (default: cosine_restarts)")
     parser.add_argument("--t_mult", type=int, default=2,
                         help="T_mult for cosine_restarts scheduler (default: 2, use 1 for stable LR)")
-    parser.add_argument("--learnable_temperature", action="store_true", default=False,
+    parser.add_argument("--learnable_temperature", action="store_true", default=True,
                         help="Use learnable InfoNCE temperature (log-parameterized)")
     parser.add_argument("--temperature_lr_mult", type=float, default=0.1,
                         help="LR multiplier for learnable temperature param (default: 0.1)")
@@ -936,13 +936,13 @@ def main() -> None:
     # Phase 26: MoE Expert features
     parser.add_argument("--moe_kernel", action="store_true", default=False,
                         help="Replace pipeline.moe with MoEKernel (domain experts: math/language/code/science)")
-    parser.add_argument("--shared_expert", action="store_true", default=False,
+    parser.add_argument("--shared_expert", action="store_true", default=True,
                         help="Enable DeepSeek-V3 always-on shared expert in SoftMoERouter")
-    parser.add_argument("--aux_loss_free", action="store_true", default=False,
+    parser.add_argument("--aux_loss_free", action="store_true", default=True,
                         help="Enable Auxiliary-Loss-Free load balancing (DeepSeek-V3)")
     parser.add_argument("--aux_lr", type=float, default=0.001,
                         help="Bias adjustment rate for auxiliary-loss-free balancing")
-    parser.add_argument("--expert_ortho", action="store_true", default=False,
+    parser.add_argument("--expert_ortho", action="store_true", default=True,
                         help="Enable expert orthogonalization loss (arXiv:2505.22323)")
     parser.add_argument("--lambda_expert_ortho", type=float, default=0.0,
                         help="Weight for expert orthogonalization loss (try 0.01-0.05)")

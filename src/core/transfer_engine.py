@@ -124,14 +124,21 @@ class TransferEngine(nn.Module):
         else:
             u_route, router_state = self.moe(u_mem)
 
-        # Sandwich transfer through domain rotors
+        # Sandwich transfer through domain rotors with true structural invariant
         _, g_target = sandwich_transfer(
             self.algebra,
-            u_route,
+            u_mem,
             source_rotor,
             target_rotor,
-            invariant_override=u_route,
         )
+
+        # MoE adaptation: residual applied separately after transfer
+        moe_delta = u_route - u_mem
+        R_tgt_n = target_rotor._normalized_R()
+        R_tgt_inv = target_rotor.get_inverse()
+        step = self.algebra.geometric_product(R_tgt_n.expand(*moe_delta.shape), moe_delta)
+        moe_residual = self.algebra.geometric_product(step, R_tgt_inv.expand(*moe_delta.shape))
+        g_target = g_target + moe_residual
 
         # Compute alignment confidence from rotor normalization quality
         if hasattr(source_rotor, '_normalized_R') and hasattr(target_rotor, '_normalized_R'):
@@ -167,11 +174,8 @@ class TransferEngine(nn.Module):
         u_source_estimated = self.algebra.sandwich(inv_rotor, u_target, unit=True)
 
         # Compute alignment from inverse rotor quality
-        if hasattr(self.algebra, '_normalized_R'):
-            rotor_norm = self.algebra._normalized_R(inv_rotor).norm()
-            alignment = (1.0 / (1.0 + rotor_norm)).clamp(0.0, 1.0)
-        else:
-            alignment = 0.5
+        rotor_norm = self.algebra.norm(inv_rotor)
+        alignment = (1.0 / (1.0 + (rotor_norm - 1.0).abs())).clamp(0.0, 1.0)
 
         conf_val = alignment.item() if isinstance(alignment, torch.Tensor) else alignment
         return u_source_estimated, NarsTruth(freq=1.0, conf=conf_val)

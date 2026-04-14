@@ -32,7 +32,6 @@ from .moe_kernel import (
 from .moe_interface import MoERouter
 from .moe_kernel_adapter import MoEKernelAdapter
 from .soft_moe_router import SoftMoERouter
-from .maxscore_router import MaxScoreRouter, RouterCheckpoint, RouterResult
 from .hallucination_detector import HallucinationDetector, HallucinationDetectionResult
 from .semantic_entropy_probe import SemanticEntropyProbe
 from .online_lora import (
@@ -54,8 +53,6 @@ from .transfer_engine import TransferEngine
 from .memory_interface import MemoryInterface, TitansAdapter, HBMAMemoryAdapter
 from .prototype_memory import MSAMemory, PrototypeMemory, PrototypeIndex
 
-# Continual normalization
-from .continual_norm import ContinualNorm
 from .nars_truth import NarsTruth
 
 # Clifford interaction layers
@@ -76,7 +73,7 @@ __all__ = [
     'MoEKernel', 'MoEKernelConfig', 'MoEKernelState',
     'MLPExpert', 'DomainExpert', 'MathExpert', 'LanguageExpert', 'CodeExpert', 'ScienceExpert',
     'create_expert', 'register_expert', 'EXPERT_REGISTRY', 'EXPERT_CONFIGS',
-    'MoERouter', 'MoEKernelAdapter', 'SoftMoERouter', 'MaxScoreRouter', 'RouterCheckpoint', 'RouterResult',
+    'MoERouter', 'MoEKernelAdapter', 'SoftMoERouter',
     # Hallucination detection
     'HallucinationDetector', 'HallucinationDetectionResult', 'SemanticEntropyProbe',
     # Online-LoRA
@@ -88,8 +85,6 @@ __all__ = [
     'DomainEncoder', 'InvariantProcessor', 'InvariantMemoryState', 'TransferEngine',
     # Memory interface
     'MemoryInterface', 'TitansAdapter', 'HBMAMemoryAdapter', 'MSAMemory', 'PrototypeMemory', 'PrototypeIndex',
-    # Continual normalization
-    'ContinualNorm',
     # Clifford interaction layers
     'CliffordInteractionLayer', 'CliffordFFN',
     # NARS truth

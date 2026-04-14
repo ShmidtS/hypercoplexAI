@@ -69,6 +69,8 @@ class ExperimentConfig:
     # ------------------------------------------------------------------ #
     # Phase-2 optional advanced components
     # ------------------------------------------------------------------ #
+    pretrained_encoder: bool = False
+    z_loss_weight: float = 0.0
     soft_router: bool = False
     modernbert_encoder: bool = False
     modernbert_model_name: str = "answerdotai/ModernBERT-base"
