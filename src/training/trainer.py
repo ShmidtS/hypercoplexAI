@@ -1190,7 +1190,7 @@ class HDIMTrainer:
             + self.lambda_memory * loss_memory
             + self.lambda_sts * loss_sts
             + self.lambda_z * loss_z
-            + (self.lambda_diversity_var + self.lambda_diversity_ortho) * loss_diversity  # disabled when 0
+            + loss_diversity  # already scaled by lambdas inside _compute_diversity_loss
             + self.lambda_matryoshka * loss_matryoshka
             + self.lambda_expert_ortho * loss_expert_ortho
             + self.lambda_online * aux_state.online_loss
