@@ -38,11 +38,13 @@ class HDIMKernelChat:
 		print(f"Device: {self.device}")
 
 		self.config = HDIMConfig(
-			hidden_dim=256,
+			hidden_dim=768,
 			num_experts=4,
 			num_domains=4,
 			memory_type="titans",
 			top_k=2,
+			clifford_p=3,
+			clifford_q=1,
 		)
 
 		print("Building HDIM model...")
@@ -56,6 +58,7 @@ class HDIMKernelChat:
 				self.model.core_model,
 				expert_names=["math", "language", "code", "science"],
 				z_loss_weight=0.01,
+				ortho_loss_weight=0.01,
 			)
 			print("Demo mode: random weights")
 		else:
@@ -162,7 +165,7 @@ class HDIMKernelChat:
 			hidden_dim = proj_bias.shape[0]
 			print(f"Detected hidden_dim={hidden_dim} from checkpoint")
 		else:
-			hidden_dim = 256
+			hidden_dim = 768
 
 		config = HDIMConfig(
 			hidden_dim=hidden_dim,
@@ -170,6 +173,8 @@ class HDIMKernelChat:
 			num_domains=4,
 			memory_type="titans",
 			top_k=2,
+			clifford_p=3,
+			clifford_q=1,
 		)
 
 		model = build_sbert_hdim_model(config, soft_router=True)
@@ -177,6 +182,7 @@ class HDIMKernelChat:
 			model.core_model,
 			expert_names=["math", "language", "code", "science"],
 			z_loss_weight=0.01,
+			ortho_loss_weight=0.01,
 		)
 		print("Loading weights...")
 		model.load_state_dict(checkpoint["model_state_dict"])
@@ -365,8 +371,8 @@ def main():
 	parser.add_argument(
 		"--checkpoint",
 		type=str,
-		default=r"E:\hypercoplexAI\artifacts\run_018\checkpoints\best.pt",
-		help="Path to model checkpoint",
+		default=None,
+		help="Path to model checkpoint (auto-detect if not specified)",
 	)
 	parser.add_argument("--demo", action="store_true", help="Run in demo mode")
 	args = parser.parse_args()
@@ -374,6 +380,24 @@ def main():
 	if args.demo:
 		chat = HDIMKernelChat(demo_mode=True)
 	else:
+		if args.checkpoint is None:
+			import glob
+			artifact_dirs = sorted(glob.glob(r"E:\hypercoplexAI\artifacts\run_*"))
+			if artifact_dirs:
+				latest = artifact_dirs[-1]
+				best_pt = os.path.join(latest, "checkpoints", "best.pt")
+				final_pt = os.path.join(latest, "checkpoints", "epoch_0030.pt")
+				if os.path.exists(best_pt):
+					args.checkpoint = best_pt
+				elif os.path.exists(final_pt):
+					args.checkpoint = final_pt
+				else:
+					pts = glob.glob(os.path.join(latest, "checkpoints", "*.pt"))
+					if pts:
+						args.checkpoint = sorted(pts)[-1]
+			if args.checkpoint is None:
+				print("No checkpoint found. Use --demo or --checkpoint PATH")
+				sys.exit(1)
 		chat = HDIMKernelChat(checkpoint_path=args.checkpoint, demo_mode=False)
 
 	chat.chat_loop()

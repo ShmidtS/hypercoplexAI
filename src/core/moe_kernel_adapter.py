@@ -142,7 +142,10 @@ class MoEKernelAdapter(MoERouter):
         self.kernel._aux_lr = aux_lr
         bias = getattr(self.kernel, '_expert_bias', None)
         if bias is None:
-            self.kernel._expert_bias = torch.zeros(self.kernel.num_experts)
+            device = next(self.kernel.parameters()).device
+            self.kernel.register_buffer(
+                "_expert_bias", torch.zeros(self.kernel.num_experts, device=device)
+            )
 
     def enable_expert_ortho(self) -> None:
         """Enable expert orthogonalization loss at runtime."""

@@ -231,10 +231,10 @@ def build_model():
     checkpoint_path = next((path for path in CHECKPOINT_CANDIDATES if path.exists()), None)
 
     if checkpoint_path is not None:
-        ckpt = torch.load(str(checkpoint_path), map_location=DEVICE, weights_only=False)
+        ckpt = torch.load(str(checkpoint_path), map_location=DEVICE, weights_only=True)
         sd = ckpt.get("model_state_dict", ckpt)
         proj_bias = sd.get("text_encoder.projection.4.bias")
-        hidden_dim = proj_bias.shape[0] if proj_bias is not None else 256
+        hidden_dim = proj_bias.shape[0] if proj_bias is not None else 768
         # Infer clifford_p from checkpoint: learnable_metric shape gives clifford_dim
         # dim = 2^(p+q+r), with q=1,r=0 → p = log2(dim) - 1
         _lm = sd.get("core_model.pipeline.algebra.learnable_metric")
@@ -269,7 +269,7 @@ def build_model():
             f"[init] Checkpoint loaded from {checkpoint_path}: epoch={epoch}{score_str} ({len(result.missing_keys)} missing keys)"
         )
     else:
-        cfg = HDIMConfig(hidden_dim=256, num_experts=4, num_domains=4, top_k=2)
+        cfg = HDIMConfig(hidden_dim=768, num_experts=4, num_domains=4, top_k=2)
         model = build_sbert_hdim_model(cfg, soft_router=False, freeze_sbert=True)
         _patch_moe_kernel(
             model.core_model,
