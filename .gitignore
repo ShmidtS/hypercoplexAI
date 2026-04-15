@@ -144,3 +144,4 @@ artifacts/
 data/
 pytest*/
 formalization/.lake/
+runs/

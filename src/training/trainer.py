@@ -1236,8 +1236,14 @@ class HDIMTrainer:
             }
             _nan_names = [k for k, v in _components.items() if torch.isnan(v) or torch.isinf(v)]
             print(f"  [NaN guard] NaN/Inf in loss components: {_nan_names}")
-            batch_losses = {k: torch.tensor(0.0) for k in _components}
-            batch_losses["_nan_skip"] = True
+            batch_losses = {
+                "loss_total": torch.tensor(0.0, device=loss_total.device),
+                "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
+                "loss_routing": loss_routing, "loss_memory": loss_memory,
+                "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
+                "loss_expert_ortho": loss_expert_ortho, "online_loss": aux_state.online_loss,
+                "_nan_skip": True,
+            }
             return batch_losses
         batch_losses = {
             "loss_total": loss_total,
