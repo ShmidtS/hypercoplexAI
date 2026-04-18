@@ -50,13 +50,15 @@ class DomainRotationOperator(nn.Module):
         return self.R / (norm + 1e-4)
 
     def get_inverse(self) -> torch.Tensor:
-        """Обратный ротор: R⁻¹ = ~R / ||R||².
-        Для единичного ротора (||R||≈1) R⁻¹ = ~R.
-        Epsilon только для защиты от ||R||=0 (обучение)."""
+        """Обратный ротор: R⁻¹ = ~R / <R*~R>_0.
+        Использует скалярную часть геометрического произведения R*~R
+        напрямую (с сохранением знака), а не norm()², которая теряет
+        знак для timelike-роторов в Cl(p,q) с q>0."""
+        eps = 1e-8
         R_n = self._normalized_R()
         R_rev = self.algebra.reverse(R_n)
-        norm_sq = self.algebra.norm(R_n) ** 2
-        return R_rev / (norm_sq + 1e-4)
+        quad_form = self.algebra.geometric_product(R_n, R_rev)[..., 0]
+        return R_rev / (quad_form + eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # unit=False: epsilon для численной стабильности под AMP (fp16 optimizer

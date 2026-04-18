@@ -591,6 +591,8 @@ class HDIMModel(nn.Module):
             routing_entropy = routing_entropy / num_groups
             train_scores_snapshot = train_scores_snapshot / num_groups
             expert_usage = expert_usage / num_groups
+            router_loss = router_loss / num_groups
+            z_loss = z_loss / num_groups
 
         # 5) Transfer
         step2 = pipeline.algebra.geometric_product(R_transfer, u_route)

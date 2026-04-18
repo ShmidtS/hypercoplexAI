@@ -193,6 +193,7 @@ class TitansMemoryModule(nn.Module):
         # Evidence-strength EMA: tracks gradient signal with bounded growth
         ema_beta = 0.99
         self.evidence_strength.mul_(ema_beta).add_(eta.detach().abs().mean() * (1 - ema_beta))
+        self.evidence_strength.clamp_(max=10.0)
         # Phase 22: gradient-based surprise + adaptive forgetting
         effective_alpha = alpha
         if self.use_gradient_surprise:

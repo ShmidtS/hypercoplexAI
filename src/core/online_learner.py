@@ -427,7 +427,10 @@ class OnlineLearner(nn.Module):
             # Simple intra-class contrastive loss
             loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
 
-            for domain_id in domain_ids.unique():
+            centroids = []
+            unique_domains = domain_ids.unique()
+
+            for domain_id in unique_domains:
                 domain_mask = domain_ids == domain_id
                 domain_encodings = encoding[domain_mask]
 
@@ -436,7 +439,18 @@ class OnlineLearner(nn.Module):
                     center = domain_encodings.mean(dim=0, keepdim=True)
                     loss += F.mse_loss(domain_encodings, center.expand_as(domain_encodings))
 
-            return loss / max(len(domain_ids.unique()), 1)
+                centroids.append(encoding[domain_mask].mean(dim=0))
+
+            # Inter-class repulsion: push domain centroids apart
+            if len(centroids) > 1:
+                centroids = torch.stack(centroids)
+                sim = F.cosine_similarity(centroids.unsqueeze(0), centroids.unsqueeze(1), dim=-1)
+                n = sim.size(0)
+                mask = ~torch.eye(n, dtype=torch.bool, device=sim.device)
+                inter_loss = sim[mask].mean() if mask.any() else sim.mean()
+                loss = loss + inter_loss
+
+            return loss / max(len(unique_domains), 1)
 
         except ValueError:
             return None

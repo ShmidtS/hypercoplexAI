@@ -630,6 +630,7 @@ def run_gpu_training(
     quality_metrics: dict = {"STS_exported": 0.0, "STS_training": 0.0, "DRS": 0.0, "AFR": 0.0, "pair_margin": 0.0}
     nan_batches_total: int = 0
     consecutive_nan: int = 0
+    scheduler_step_count: int = 0
 
     for epoch in range(1, args.epochs + 1):
         trainer.set_epoch(epoch)
@@ -663,7 +664,9 @@ def run_gpu_training(
                 # Per-batch scheduler stepping (OneCycleLR, CosineWarmRestarts)
                 if scheduler_per_batch and not scheduler_needs_score:
                     prev_lr = optimizer.param_groups[0]["lr"]
-                    scheduler.step()
+                    if scheduler_step_count < total_steps:
+                        scheduler.step()
+                        scheduler_step_count += 1
                     try:
                         current_lr = scheduler.get_last_lr()[0]
                     except Exception:
@@ -809,8 +812,8 @@ def main() -> None:
                         help="Weight decay for AdamW optimizer (default: 1e-4)")
     parser.add_argument("--dropout", type=float, default=None,
                         help="Override model dropout probability (default: use HDIMConfig default)")
-    parser.add_argument("--warmup_epochs", type=int, default=20,
-                        help="T_0 for cosine_restarts in epochs (default: 20, Phase8e record)")
+    parser.add_argument("--warmup_epochs", type=int, default=3,
+                        help="T_0 for cosine_restarts in epochs (default: 3)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true", default=False)
@@ -834,20 +837,20 @@ def main() -> None:
                         help="Clifford algebra nilpotent bases (default=0)")
     # Loss weights
     parser.add_argument("--lambda_iso", type=float, default=0.0)
-    parser.add_argument("--lambda_pair", type=float, default=0.4)
+    parser.add_argument("--lambda_pair", type=float, default=0.5)
     parser.add_argument("--lambda_routing", type=float, default=0.05)
     parser.add_argument("--lambda_z", type=float, default=0.0,
                         help="Router z-loss weight (ST-MoE stability, default=0=disabled)")
-    parser.add_argument("--lambda_dcl", type=float, default=0.0,
-                        help="DCL loss weight (Decoupled Contrastive, Yeh et al. 2022, try 0.3-0.5)")
-    parser.add_argument("--lambda_uniformity", type=float, default=0.0,
-                        help="Uniformity+Alignment loss weight (Wang & Isola 2020, try 0.1-0.3)")
+    parser.add_argument("--lambda_dcl", type=float, default=0.05,
+                        help="DCL loss weight (Decoupled Contrastive, Yeh et al. 2022)")
+    parser.add_argument("--lambda_uniformity", type=float, default=0.02,
+                        help="Uniformity+Alignment loss weight (Wang & Isola 2020)")
     parser.add_argument("--lambda_memory", type=float, default=0.05)
     parser.add_argument("--lambda_diversity_var", type=float, default=0.0,
                         help="Diversity variance weight (anti-collapse, 0.0=disabled)")
     parser.add_argument("--lambda_diversity_ortho", type=float, default=0.0,
                         help="Diversity orthogonality weight (anti-collapse, 0.0=disabled)")
-    parser.add_argument("--lambda_matryoshka", type=float, default=0.1,
+    parser.add_argument("--lambda_matryoshka", type=float, default=0.15,
                         help="Matryoshka multi-scale loss weight")
     parser.add_argument("--ranking_margin", type=float, default=0.3)
     # Dataset
@@ -904,16 +907,16 @@ def main() -> None:
     parser.add_argument("--aug_mixup_alpha", type=float, default=0.0,
                         help="Mixup Beta alpha for embedding augmentation (0.0=disabled)")
     # Early stopping
-    parser.add_argument("--early_stopping_patience", type=int, default=0,
+    parser.add_argument("--early_stopping_patience", type=int, default=8,
                         help="Stop if best score not improved for N evals (0=disabled)")
     # Phase 5 additions
     parser.add_argument("--lambda_angle", type=float, default=0.0,
                         help="AnglE loss weight (0=off, try 0.3-0.5)")
     parser.add_argument("--lambda_supcon", type=float, default=0.0,
                         help="SupCon loss weight (Supervised Contrastive, нужен pair_group_id, try 0.1-0.5)")
-    parser.add_argument("--scheduler_type", default="cosine_restarts",
+    parser.add_argument("--scheduler_type", default="onecycle",
                         choices=["cosine_restarts", "cosine_decay", "plateau", "onecycle"],
-                        help="LR scheduler type (default: cosine_restarts)")
+                        help="LR scheduler type (default: onecycle)")
     parser.add_argument("--t_mult", type=int, default=2,
                         help="T_mult for cosine_restarts scheduler (default: 2, use 1 for stable LR)")
     parser.add_argument("--learnable_temperature", action="store_true", default=True,

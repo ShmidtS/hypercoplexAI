@@ -55,15 +55,22 @@ class ExperimentConfig:
     # Phase-2 loss coefficients
     # ------------------------------------------------------------------ #
     lambda_iso: float = 0.0  # DISABLED: conflicts with pair_loss, suppresses margin
-    lambda_pair: float = 0.4  # InfoNCE contrastive (optimal from Run 18)
+    lambda_pair: float = 0.5  # InfoNCE contrastive (boosted for margin signal)
     lambda_routing: float = 0.05
     lambda_memory: float = 0.05  # memory regularization (EMA stability)
+    lambda_dcl: float = 0.05  # DCL loss — decorrelation (Yeh et al. 2022)
+    lambda_uniformity: float = 0.02  # uniformity on hypersphere (Wang & Isola 2020)
+    lambda_diversity_var: float = 0.0  # DISABLED: anti-collapse variance
+    lambda_diversity_ortho: float = 0.0  # DISABLED: anti-collapse orthogonality
+    lambda_matryoshka: float = 0.15  # Matryoshka multi-scale loss
 
     # ------------------------------------------------------------------ #
     # Phase-2 training schedule extras
     # ------------------------------------------------------------------ #
     warmup_epochs: int = 3
-    early_stopping_patience: int = 5
+    early_stopping_patience: int = 8
+    infonce_temperature: float = 0.15  # InfoNCE temperature (0.07 too sharp, 0.15 balanced)
+    scheduler: str = "onecycle"  # LR scheduler type
     # Optional wall-clock budget in seconds; None means no limit.
     time_budget_s: Optional[float] = None
 

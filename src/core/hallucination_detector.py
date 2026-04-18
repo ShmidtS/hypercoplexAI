@@ -19,6 +19,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .semantic_entropy_probe import SemanticEntropyProbe
 
 
@@ -194,13 +195,18 @@ class HallucinationDetector(nn.Module):
         # Normalize eigen_score to [0, 1] via sigmoid (centered at 1.0 — expected mean)
         norm_eigen = torch.sigmoid(eigen_score - 1.0)
 
-        # Combined risk via 5-signal weighted sum
+        # Combined risk via 5-signal weighted sum with simplex projection
+        raw_weights = F.relu(torch.stack([
+            self.weight_entropy, self.weight_confidence, self.weight_mismatch,
+            self.weight_semantic, self.weight_eigen,
+        ]))
+        weights = raw_weights / (raw_weights.sum(dim=0) + 1e-8)
         risk = (
-            self.weight_entropy * norm_entropy
-            + self.weight_confidence * inv_confidence
-            + self.weight_mismatch * norm_mismatch
-            + self.weight_semantic * semantic_entropy
-            + self.weight_eigen * norm_eigen
+            weights[0] * norm_entropy
+            + weights[1] * inv_confidence
+            + weights[2] * norm_mismatch
+            + weights[3] * semantic_entropy
+            + weights[4] * norm_eigen
         )
 
         # Ensure risk is in [0, 1]

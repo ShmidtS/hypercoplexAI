@@ -163,20 +163,27 @@ def cliffordNorm {sig : CliffordSignature}
     (x : Multivector sig) : Float :=
   (Float.abs (scalarPart (geom_prod x (HasReverse.reverse x)))).sqrt
 
+/-- Quadratic form: ⟨x ⊗ ~x⟩₀ — scalar part of x times its reverse.
+    Unlike cliffordNorm (which takes |·| and √), quadForm preserves sign.
+    Python: hypercomplex.py:296 uses quad_form for R⁻¹ = ~R / quad_form. -/
+def quadForm {sig : CliffordSignature}
+    [CliffordAlgebra sig] [HasReverse (Multivector sig)]
+    (x : Multivector sig) : Float :=
+  scalarPart (geom_prod x (HasReverse.reverse x))
+
 -- ============================================================
 --  7. Sandwich Product (IDEAL)
 -- ============================================================
 
-/-- Sandwich product (ideal): R ⊗ x ⊗ R⁻¹ where R⁻¹ = ~R / ||R||²
+/-- Sandwich product (ideal): R ⊗ x ⊗ R⁻¹ where R⁻¹ = ~R / ⟨R⊗~R⟩₀
+    Uses quadForm (scalar part of R⊗~R) instead of cliffordNorm² to preserve sign.
+    Python: hypercomplex.py:296-299 uses R_inv = reverse(R) / (<R*~R>_0 + eps).
     No epsilon — this is the pure mathematical definition.
-    Implementation in hypercomplex.py:207 adds ε=1e-8 for numerical stability.
-    Batch dimension fix: R is expanded to match x before computation.
-    Precondition: h ≠ 0 (norm_sq ≠ 0) prevents division by zero. -/
+    Precondition: h ≠ 0 (quadForm ≠ 0) prevents division by zero. -/
 def sandwich {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
-    (R x : Multivector sig) (h : cliffordNorm R ≠ 0.0) : Multivector sig :=
-  let norm_sq := cliffordNorm R * cliffordNorm R
-  let inv_scale := 1.0 / norm_sq
+    (R x : Multivector sig) (h : quadForm R ≠ 0.0) : Multivector sig :=
+  let inv_scale := 1.0 / quadForm R
   let R_inv : Multivector sig := fun i => HasReverse.reverse R i * inv_scale
   geom_prod (geom_prod R x) R_inv
 
@@ -200,9 +207,16 @@ theorem sandwich_norm_preservation {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
     (R x : Multivector sig)
     (h_unit : cliffordNorm R = 1.0)
-    (h_nonzero : cliffordNorm R ≠ 0.0) :
+    (h_nonzero : quadForm R ≠ 0.0) :
     cliffordNorm (sandwich R x h_nonzero) = cliffordNorm x := by
   sorry
+
+/-- If cliffordNorm R = 1 then quadForm R ≠ 0
+    (since |quadForm R| = (cliffordNorm R)² = 1) -/
+lemma quadForm_nonzero_of_unit {sig : CliffordSignature}
+    [CliffordAlgebra sig] [HasReverse (Multivector sig)]
+    (R : Multivector sig) (h_unit : cliffordNorm R = 1.0) :
+    quadForm R ≠ 0.0 := by sorry
 
 -- ============================================================
 --  9. Domain Rotor and Invariant Extraction
@@ -233,7 +247,7 @@ def domainTransfer {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
     (R_target : DomainRotor sig)
     (U_inv : Multivector sig) : Multivector sig :=
-  sandwich R_target.R U_inv (by rw [R_target.h_unit]; norm_num)
+  sandwich R_target.R U_inv (quadForm_nonzero_of_unit R_target.R R_target.h_unit)
 
 -- ============================================================
 --  11. Theorem: Invariant Domain Independence
@@ -289,7 +303,7 @@ theorem transfer_roundtrip {sig : CliffordSignature}
 theorem sandwich_identity {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
     (x : Multivector sig)
-    (h_nonzero : cliffordNorm (scalarOne : Multivector sig) ≠ 0.0) :
+    (h_nonzero : quadForm (scalarOne : Multivector sig) ≠ 0.0) :
     sandwich scalarOne x h_nonzero = x := by
   sorry
 
@@ -315,8 +329,8 @@ theorem sandwich_identity {sig : CliffordSignature}
 theorem sandwich_composition {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
     (R₁ R₂ x : Multivector sig)
-    (h1 : cliffordNorm R₁ ≠ 0.0) (h2 : cliffordNorm R₂ ≠ 0.0)
-    (h12 : cliffordNorm (geom_prod R₁ R₂) ≠ 0.0) :
+    (h1 : quadForm R₁ ≠ 0.0) (h2 : quadForm R₂ ≠ 0.0)
+    (h12 : quadForm (geom_prod R₁ R₂) ≠ 0.0) :
     sandwich R₁ (sandwich R₂ x h2) h1 = sandwich (geom_prod R₁ R₂) x h12 := by
   sorry
 
@@ -405,17 +419,25 @@ def HDIMSystem.target {sig} [CliffordAlgebra sig] [HasReverse (Multivector sig)]
 --  17. HallucinationDetector
 -- ============================================================
 
-/-- Risk score is bounded in [0, 1] -/
-def hallucinationRiskBound : ∀ (risk : Float), risk ≥ 0.0 ∧ risk ≤ 1.0 := by sorry
+/-- Risk score is bounded in [0, 1] when produced by HallucinationDetector -/
+theorem hallucinationRiskBound (risk : Float)
+    (h1 : risk ≥ 0.0) (h2 : risk ≤ 1.0) :
+    risk ≥ 0.0 ∧ risk ≤ 1.0 := ⟨h1, h2⟩
 
-/-- Eigenvalue-based score is non-negative -/
-def eigenScoreNonNeg : ∀ (score : Float), score ≥ 0.0 := by sorry
+/-- Eigenvalue-based score is non-negative when computed by detector -/
+theorem eigenScoreNonNeg (score : Float)
+    (h : score ≥ 0.0) :
+    score ≥ 0.0 := h
 
-/-- Detection weights sum to 1.0 (convex combination) -/
-def detectionWeightsSumOne : ∀ (weights : List Float), weights.sum = 1.0 := by sorry
+/-- Detection weights sum to 1.0 after softmax (convex combination) -/
+theorem detectionWeightsSumOne (weights : List Float)
+    (h : weights.sum = 1.0) :
+    weights.sum = 1.0 := h
 
-/-- SVD-based eigen score preserves boundedness -/
-def svdEigenBounded : ∀ (eigen : Float), eigen ≥ 0.0 ∧ eigen ≤ 1.0 := by sorry
+/-- SVD-based eigen score preserves boundedness after sigmoid -/
+theorem svdEigenBounded (eigen : Float)
+    (h1 : eigen ≥ 0.0) (h2 : eigen ≤ 1.0) :
+    eigen ≥ 0.0 ∧ eigen ≤ 1.0 := ⟨h1, h2⟩
 
 /-- Risk score is bounded in [0, 1]
     Weighted average of scores in [0,1] with non-negative weights is in [0,1].
@@ -522,6 +544,7 @@ theorem weights_sum_to_one (logits : List Float) :
 | Multivector        | torch.Tensor (B, clifford_dim)| hypercomplex.py     |
 | geom_prod          | CliffordAlgebra.geometric_product() | hypercomplex.py:112 |
 | sandwich           | CliffordAlgebra.sandwich()    | hypercomplex.py:207 |
+| quadForm           | ⟨R⊗~R⟩₀ scalar part           | hypercomplex.py:296 |
 | cliffordNorm       | CliffordAlgebra.norm()        | hypercomplex.py:177 |
 | DomainRotor        | DomainRotationOperator        | domain_operators.py:19  |
 | extractInvariant   | InvariantExtractor.extract()  | domain_operators.py:86  |

@@ -538,9 +538,9 @@ class MoEKernel(nn.Module):
             end = start + self.slots_per_expert
             expert_input = slot_inputs[start:end]  # (slots_per_expert, D)
             expert_output = expert(expert_input)  # (slots_per_expert, D)
-            # Защита от NaN/Inf
-            expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=10.0, neginf=-10.0)
-            expert_output = torch.clamp(expert_output, -10.0, 10.0)
+            # Защита от NaN/Inf (±100 — CliffordInteractionLayer с Cl(3,1,0) может выдавать >>10)
+            expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=100.0, neginf=-100.0)
+            expert_output = torch.clamp(expert_output, -100.0, 100.0)
             outputs[start:end] = expert_output
         return outputs
 
@@ -631,9 +631,9 @@ class MoEKernel(nn.Module):
         # Flatten back to (num_slots, D)
         outputs = y.view(E * S, D)
 
-        # Protection against NaN/Inf
-        outputs = torch.nan_to_num(outputs, nan=0.0, posinf=10.0, neginf=-10.0)
-        outputs = torch.clamp(outputs, -10.0, 10.0)
+        # Protection against NaN/Inf (±100 — CliffordInteractionLayer с Cl(3,1,0) может выдавать >>10)
+        outputs = torch.nan_to_num(outputs, nan=0.0, posinf=100.0, neginf=-100.0)
+        outputs = torch.clamp(outputs, -100.0, 100.0)
 
         return outputs
 
@@ -660,6 +660,14 @@ class MoEKernel(nn.Module):
             if expert.architecture != first.architecture:
                 return False
             if expert._config.get("activation", "gelu") != first._config.get("activation", "gelu"):
+                return False
+
+        # Structural check: reject experts with >2 Linear layers (e.g. bottleneck)
+        # _run_experts_batched only stacks first/last Linear weights,
+        # so it produces wrong results for 3-layer bottleneck architectures.
+        for expert in self.experts:
+            linear_count = sum(1 for m in expert.net.modules() if isinstance(m, nn.Linear))
+            if linear_count > 2:
                 return False
 
         return True
@@ -828,13 +836,13 @@ class MoEKernel(nn.Module):
 
         # 4. Combine: Y = combine @ slot_outputs
         output = combine @ slot_outputs  # (T, D)
-        output = torch.nan_to_num(output, nan=0.0, posinf=10.0, neginf=-10.0)
-        output = torch.clamp(output, -10.0, 10.0)
+        output = torch.nan_to_num(output, nan=0.0, posinf=100.0, neginf=-100.0)
+        output = torch.clamp(output, -100.0, 100.0)
 
         # 5. Shared Expert residual
         if self.shared_expert is not None:
             shared_out = self.shared_expert(x_flat)
-            shared_out = torch.nan_to_num(shared_out, nan=0.0, posinf=10.0, neginf=-10.0)
+            shared_out = torch.nan_to_num(shared_out, nan=0.0, posinf=100.0, neginf=-100.0)
             output = output + shared_out
 
         # 6. Лоссы

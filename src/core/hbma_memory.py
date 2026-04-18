@@ -398,7 +398,7 @@ class EpisodicMemory(nn.Module):
                     # Vectorized durability update via scatter_add_
                     counts = torch.bincount(matched_slot, minlength=self.num_slots).float()
                     update = counts * 0.005
-                    self.mem_durability = (self.mem_durability + update).clamp(max=0.2)
+                    self.mem_durability.copy_((self.mem_durability + update).clamp(max=0.2))
 
         return out
 
@@ -625,7 +625,7 @@ class SemanticMemory(nn.Module):
 
     def diversity_loss(self) -> torch.Tensor:
         """Prototype diversity loss — prevents semantic collapse."""
-        p = F.normalize(self.prototypes.detach(), dim=-1)
+        p = F.normalize(self.prototypes, dim=-1)
         sim = p @ p.T
         mask = ~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
         return sim[mask].pow(2).mean()
@@ -708,10 +708,12 @@ class ProceduralMemory(nn.Module):
         hidden_dim: int,
         num_patterns: int = 32,
         dropout: float = 0.1,
+        temperature: float = 0.1,
     ) -> None:
         super().__init__()
         self.hidden_dim   = hidden_dim
         self.num_patterns = num_patterns
+        self.temperature  = temperature
 
         # Learnable pattern prototypes (trained by backprop)
         self.patterns = nn.Parameter(torch.randn(num_patterns, hidden_dim) * 0.02)
@@ -752,7 +754,7 @@ class ProceduralMemory(nn.Module):
 
         # Weight by success rate
         weighted_sim = sim * self.success_rate.detach().clone().unsqueeze(0)  # [B, P]
-        attn = F.softmax((weighted_sim / 0.1).float(), dim=-1).to(weighted_sim.dtype)                 # [B, P]
+        attn = F.softmax((weighted_sim / self.temperature).float(), dim=-1).to(weighted_sim.dtype)                 # [B, P]
 
         # Retrieve and project patterns
         retrieved = attn @ self.patterns                             # [B, D]
