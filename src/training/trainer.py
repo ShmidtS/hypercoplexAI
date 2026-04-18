@@ -34,7 +34,7 @@ class HDIMTrainer:
         negative_margin: float = 1.0,
         ranking_margin: float = 0.2,
         use_infonce: bool = True,
-        infonce_temperature: float = 0.15,
+        infonce_temperature: float = 0.10,
         lambda_sts: float = 0.0,  # DISABLED: duplicates InfoNCE semantics
         lambda_angle: float = 0.0,
         lambda_supcon: float = 0.0,
@@ -166,16 +166,14 @@ class HDIMTrainer:
         texts: Sequence[str],
         *,
         collect_matryoshka: bool = False,
-    ) -> tuple[torch.Tensor, dict[int, torch.Tensor] | None] | torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor] | None]:
         if collect_matryoshka and hasattr(self.model, 'encode_texts_matryoshka'):
             full_enc, scales = self.model.encode_texts_matryoshka(
                 texts, device=self.device,
             )
             return full_enc, scales
         enc = self.model.encode_texts(texts, device=self.device)
-        if collect_matryoshka:
-            return enc, None
-        return enc
+        return enc, None
 
     def _extract_iso_targets(
         self, batch: Dict[str, Any], aux_state: HDIMAuxState
@@ -1232,7 +1230,7 @@ class HDIMTrainer:
                 "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
                 "loss_routing": loss_routing, "loss_memory": loss_memory, "loss_sts": loss_sts,
                 "loss_z": loss_z, "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
-                "loss_expert_ortho": loss_expert_ortho, "online_loss": aux_state.online_loss,
+                "loss_expert_ortho": loss_expert_ortho, "loss_online": aux_state.online_loss,
             }
             _nan_names = [k for k, v in _components.items() if torch.isnan(v) or torch.isinf(v)]
             print(f"  [NaN guard] NaN/Inf in loss components: {_nan_names}")
@@ -1240,8 +1238,10 @@ class HDIMTrainer:
                 "loss_total": torch.tensor(0.0, device=loss_total.device),
                 "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
                 "loss_routing": loss_routing, "loss_memory": loss_memory,
+                "loss_sts": torch.tensor(0.0, device=loss_total.device),
+                "loss_z": torch.tensor(0.0, device=loss_total.device),
                 "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
-                "loss_expert_ortho": loss_expert_ortho, "online_loss": aux_state.online_loss,
+                "loss_expert_ortho": loss_expert_ortho, "loss_online": aux_state.online_loss,
                 "_nan_skip": True,
             }
             return batch_losses

@@ -63,6 +63,7 @@ class ExperimentConfig:
     # Phase-2 training schedule extras
     # ------------------------------------------------------------------ #
     warmup_epochs: int = 3
+    early_stopping_patience: int = 5
     # Optional wall-clock budget in seconds; None means no limit.
     time_budget_s: Optional[float] = None
 

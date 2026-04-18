@@ -325,6 +325,33 @@ def encode_text(model, text: str):
         return exported_inv, blended_weights, DOMAIN_NAMES[top_idx], out, aux_state
 
 
+def encode_text_with_domain(model, text: str, domain: str):
+    """Encode text with a forced target domain. Returns same 5-tuple as encode_text."""
+    text = str(text)
+    with torch.no_grad():
+        enc = model.encode_texts([text], device=DEVICE)
+        dom = torch.tensor([DOMAIN_IDX[domain]], dtype=torch.long, device=DEVICE)
+        res = model(enc, dom, return_state=True, memory_mode="retrieve")
+        out = res.output
+        aux_state = res.aux_state
+        expert_weights = aux_state.routing_weights[0].cpu()
+        weights_sum = expert_weights.sum().clamp(min=1e-8)
+        expert_probs = expert_weights / weights_sum
+        blended: dict[str, float] = {}
+        semantic_hints = semantic_domain_hints(text)
+        for name in DOMAIN_NAMES:
+            model_w = expert_probs[DOMAIN_IDX[name]].item()
+            sem_w = semantic_hints.get(name, 0.25)
+            blended[name] = (1 - SEMANTIC_BLEND) * model_w + SEMANTIC_BLEND * sem_w
+        total = sum(blended.values())
+        for name in blended:
+            blended[name] /= total
+        blended_weights = torch.tensor([blended[n] for n in DOMAIN_NAMES])
+        top_idx: int = int(blended_weights.argmax().item())
+        exported_inv = aux_state.exported_invariant
+        return exported_inv, blended_weights, DOMAIN_NAMES[top_idx], out, aux_state
+
+
 def format_bar(weights, width=20):
     bars = []
     w_max = max(weights.tolist()) if weights.numel() > 0 else 1.0
@@ -1172,23 +1199,18 @@ def main():
             if target not in DOMAIN_IDX:
                 print(f"[error] Unknown domain. Choose from: {DOMAIN_NAMES}")
                 continue
-            if last_invariant is None:
+            if last_text is None:
                 print("[error] Enter a text first.")
                 continue
-            # Transfer invariant to target domain (last_invariant is now in clifford space)
+            # Re-encode last text with target domain to get proper transfer
             with torch.no_grad():
-                pipeline = model.core_model.pipeline
-                tgt_name = f"domain_{DOMAIN_IDX[target]}"
-                r_target = pipeline.domain_rotors[tgt_name]
-                g_target = r_target(last_invariant)
-                transferred = pipeline.decoder(g_target)
-                print(f"[transfer -> {target}] embedding shape: {transferred.shape}")
-                print(
-                    f" Cosine sim to original: {cosine_sim(last_invariant, g_target):.4f}"
-                )
-                print(
-                    f" Norm ratio: {g_target.norm().item():.4f} / {last_invariant.norm().item():.4f}"
-                )
+                inv_t, ew_t, dom_t, _, _ = encode_text_with_domain(model, last_text, target)
+                sim = cosine_sim(last_invariant, inv_t)
+                print(f"[transfer -> {target}] dominant: {dom_t.upper()}")
+                print(f" Invariant norm: {inv_t.norm().item():.4f}")
+                print(f" Cosine sim to source: {sim:.4f}")
+                print(f" Norm ratio: {inv_t.norm().item():.4f} / {last_invariant.norm().item():.4f}")
+                print(format_bar(ew_t))
             continue
 
         if user_input.startswith(":compare "):

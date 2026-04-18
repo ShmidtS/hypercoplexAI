@@ -571,7 +571,7 @@ class HDIMModel(nn.Module):
             u_route[mask] = group_route.to(dtype=u_route.dtype)
 
             routing_weights[mask] = group_router_state["gate_weights"].to(dtype=dtype)
-            topk_idx[mask] = group_router_state["topk_idx"].to(device=device)
+            topk_idx[mask] = group_router_state["topk_idx"].to(device=device, dtype=torch.long)
             topk_gate_weights[mask] = group_router_state["topk_gate_weights"].to(dtype=dtype)
             router_loss = router_loss + group_router_state["router_loss"].to(dtype=dtype)
             z_loss = z_loss + group_router_state.get(
@@ -623,7 +623,7 @@ class HDIMModel(nn.Module):
             memory_mismatch=torch.tensor(memory_surprise_val) if memory_surprise_val is not None else None,
             memory_loss=memory_loss,
             )
-            hallucination_risk = result.hallucination_risk
+            hallucination_risk = float(result.hallucination_risk)
 
         # Phase 33: Hallucination Feedback Loop (Self-Correction)
         feedback_action = None

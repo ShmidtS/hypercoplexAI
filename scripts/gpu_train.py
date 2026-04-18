@@ -573,9 +573,10 @@ def run_gpu_training(
             _num_workers = 0
         else:
             _num_workers = min(4, _os.cpu_count() or 1) if device.type == "cuda" else 0
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=False, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=False, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
-    metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=False, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+    _pin = device.type == "cuda"
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, pin_memory=_pin, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, pin_memory=_pin, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
+    metrics_loader = DataLoader(metrics_ds, batch_size=args.batch_size, pin_memory=_pin, num_workers=_num_workers, persistent_workers=(_num_workers > 0), prefetch_factor=(2 if _num_workers > 0 else None))
     print(f"DataLoader: num_workers={_num_workers}, pin_memory={device.type == chr(99)+chr(117)+chr(100)+chr(97)}")
 
     print(f"Dataset: {len(train_ds)} train / {len(val_ds)} val")
