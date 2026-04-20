@@ -345,7 +345,10 @@ class EpisodicMemory(nn.Module):
         self.mem_age[lru_slot]  = 0
         self.mem_conf[lru_slot] = surprise[best_idx]
         self.mem_imp[lru_slot]  = importance
-        self.mem_durability[lru_slot] = (self.mem_durability[lru_slot] * 0.8).clamp(min=0.01) if self.use_per_slot_durability else self.forgetting_rate
+        if self.use_per_slot_durability:
+            self.mem_durability[lru_slot].copy_((self.mem_durability[lru_slot] * 0.8).clamp(min=0.01))
+        else:
+            self.mem_durability[lru_slot].fill_(self.forgetting_rate)
         # Temporal ordering: record step
         self.slot_order[lru_slot] = self.step[0].clone()
         self.step[0] += 1
@@ -469,7 +472,8 @@ class SemanticMemory(nn.Module):
             nn.Linear(hidden_dim // 2, 4),
         )
 
-        self.register_buffer("prototypes",    F.normalize(torch.randn(num_prototypes, hidden_dim), dim=-1))
+        self.prototypes = nn.Parameter(F.normalize(torch.randn(num_prototypes, hidden_dim), dim=-1))
+        self.prototypes.requires_grad = False
         self.register_buffer("proto_conf",    torch.full((num_prototypes,), 0.5))   # confidence [0,1]
         self.register_buffer("proto_evidence",torch.ones(num_prototypes))            # evidence count
         self.register_buffer("proto_age",     torch.zeros(num_prototypes))           # steps since update
@@ -565,7 +569,7 @@ class SemanticMemory(nn.Module):
                     self.proto_evidence[p] = NarsTruth.c2w(revised.conf)
                     self.proto_age[p] = 0
                     updated = self.ema_momentum * self.prototypes[p] + (1 - self.ema_momentum) * centroids[p]
-                    self.prototypes[p] = F.normalize(updated, dim=-1)
+                    self.prototypes[p].copy_(F.normalize(updated, dim=-1))
         else:
             # Fully vectorized non-NARS path — zero .item() calls
             contra_idx = active_idx[contradicted]
@@ -581,7 +585,7 @@ class SemanticMemory(nn.Module):
                 self.proto_age[align_idx] = 0
                 updated = (self.ema_momentum * self.prototypes[align_idx]
                            + (1 - self.ema_momentum) * centroids[align_idx])
-                self.prototypes[align_idx] = F.normalize(updated, dim=-1)
+                self.prototypes[align_idx].copy_(F.normalize(updated, dim=-1))
 
     def _activation_spreading(self, attn: torch.Tensor, p_norm: torch.Tensor) -> torch.Tensor:
         """S3.2: NARS-inspired activation spreading.

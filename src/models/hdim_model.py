@@ -14,7 +14,9 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+from src.core.domain_operators import DomainIndexEmbedding
 from src.core.hdim_pipeline import HDIMPipeline
+from src.core.per_domain_lora import PerDomainLoRA
 from src.models.results import CoreResult, ForwardResult
 
 
@@ -49,7 +51,7 @@ class HDIMAuxState:
     hallucination_risk: float = 0.0
     memory_surprise: float | None = None
     feedback_action: str | None = None  # Phase 33: Hallucination feedback action
-    online_loss: torch.Tensor = torch.tensor(0.0)  # Phase 31: Online learning loss
+    online_loss: Optional[torch.Tensor] = None  # Phase 31: Online learning loss
     online_updated: bool = False  # Phase 31: Whether online update fired
 
     def to_dict(self) -> Dict[str, Union[torch.Tensor, bool, str, float, None]]:
@@ -161,6 +163,10 @@ class HDIMConfig:
     hallucination_feedback: bool = False # Enable hallucination feedback loop
     hallucination_feedback_config: Optional[dict] = None # Override default feedback config
     z_loss_weight: float = 0.0  # Router z-loss regularization weight
+    n_shared_experts: int = 0  # DeepSeek-V3 style multiple shared experts
+    use_domain_embedding: bool = False  # Sinusoidal domain-index embedding
+    use_domain_lora: bool = False  # Per-domain LoRA specialization
+    domain_lora_rank: int = 4  # LoRA rank for per-domain adapters
     # Backward compat: deprecated msa_* fields auto-migrated to msa sub-config
     msa_num_prototypes: int = 256
     msa_top_k: int = 16
@@ -256,10 +262,22 @@ class HDIMModel(nn.Module):
             memory_type=config.memory_type,
             msa_config=msa_config,
             z_loss_weight=config.z_loss_weight,
+            n_shared_experts=config.n_shared_experts,
         )
 
         self.dropout = nn.Dropout(config.dropout)
+        self.domain_embedding: Optional[DomainIndexEmbedding] = None
+        if config.use_domain_embedding:
+            self.domain_embedding = DomainIndexEmbedding(
+                dim=config.hidden_dim, max_domains=config.num_domains,
+            )
         clifford_dim = self.pipeline.clifford_dim
+        self.domain_lora: Optional[PerDomainLoRA] = None
+        if config.use_domain_lora:
+            self.domain_lora = PerDomainLoRA(
+                dim=clifford_dim, rank=config.domain_lora_rank,
+                num_domains=config.num_domains,
+            )
         self.training_inv_head = nn.Linear(clifford_dim, config.hidden_dim)
 
         # Phase 31: Online Learner for self-evolution (uses moe output dimension)
@@ -299,6 +317,10 @@ class HDIMModel(nn.Module):
                 enabled=True,
             )
         # Rotor stacks rebuild each forward (requires_grad rotors need fresh graph)
+        # Eval-mode cache avoids redundant rebuilds when parameters are static
+        self._cached_rotors_n: Optional[torch.Tensor] = None
+        self._cached_rotors_inv: Optional[torch.Tensor] = None
+        self._rotor_cache_param_version: int = -1
 
     def _domain_idx_to_name(self, domain_idx: int) -> str:
         """Convert an integer domain index to its registered name."""
@@ -366,7 +388,7 @@ class HDIMModel(nn.Module):
             hallucination_risk=hallucination_risk,
             memory_surprise=memory_surprise,
             feedback_action=feedback_action,
-            online_loss=online_loss if online_loss is not None else torch.tensor(0.0),
+            online_loss=online_loss,
             online_updated=online_updated,
         )
 
@@ -474,6 +496,40 @@ class HDIMModel(nn.Module):
         )
         return rotors_n, rotors_inv
 
+    def _current_rotor_version(self) -> int:
+        """Hash of all rotor parameter versions for cache invalidation."""
+        pipeline = self.pipeline
+        return sum(
+            pipeline.domain_rotors[name].R._version
+            for name in self._domain_names
+        )
+
+    def _clear_rotor_cache(self) -> None:
+        """Invalidate cached rotor stacks (e.g. on mode switch)."""
+        self._cached_rotors_n = None
+        self._cached_rotors_inv = None
+        self._rotor_cache_param_version = -1
+
+    def _get_rotor_stacks(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return rotor stacks, caching in eval mode when parameters are unchanged."""
+        if self.training:
+            return self._build_rotor_stacks()
+        current_version = self._current_rotor_version()
+        if (self._cached_rotors_n is not None
+                and self._rotor_cache_param_version == current_version):
+            return self._cached_rotors_n, self._cached_rotors_inv
+        rotors_n, rotors_inv = self._build_rotor_stacks()
+        self._cached_rotors_n = rotors_n
+        self._cached_rotors_inv = rotors_inv
+        self._rotor_cache_param_version = current_version
+        return rotors_n, rotors_inv
+
+    def train(self, mode: bool = True):
+        """Switch training mode, clearing rotor cache on transitions."""
+        super().train(mode)
+        self._clear_rotor_cache()
+        return self
+
     def _forward_core(
         self,
         x: torch.Tensor,
@@ -483,6 +539,7 @@ class HDIMModel(nn.Module):
         R_transfer_inv: torch.Tensor,
         group_masks: List[torch.Tensor],
         runtime: HDIMRuntimeConfig,
+        domain_id: Optional[torch.Tensor] = None,
     ) -> CoreResult:
         """Shared core for forward and transfer_pairs.
 
@@ -594,6 +651,13 @@ class HDIMModel(nn.Module):
             router_loss = router_loss / num_groups
             z_loss = z_loss / num_groups
 
+        # 4.5) Per-domain LoRA specialization
+        if self.domain_lora is not None and domain_id is not None:
+            for d_idx in range(self.config.num_domains):
+                mask = domain_id == d_idx
+                if mask.sum().item() > 0:
+                    u_route[mask] = self.domain_lora(u_route[mask], d_idx)
+
         # 5) Transfer
         step2 = pipeline.algebra.geometric_product(R_transfer, u_route)
         g_target = pipeline.algebra.geometric_product(step2, R_transfer_inv)
@@ -622,7 +686,7 @@ class HDIMModel(nn.Module):
             "gate_weights": routing_weights,
             "topk_gate_weights": topk_gate_weights,
             },
-            memory_mismatch=torch.tensor(memory_surprise_val) if memory_surprise_val is not None else None,
+            memory_mismatch=torch.tensor(memory_surprise_val, device=device, dtype=dtype) if memory_surprise_val is not None else None,
             memory_loss=memory_loss,
             )
             hallucination_risk = float(result.hallucination_risk)
@@ -694,7 +758,7 @@ class HDIMModel(nn.Module):
             memory_mode=memory_mode,
         )
 
-        rotors_n, rotors_inv = self._build_rotor_stacks()
+        rotors_n, rotors_inv = self._get_rotor_stacks()
         R_per_sample = rotors_n[domain_id]
         R_inv_per_sample = rotors_inv[domain_id]
 
@@ -702,10 +766,12 @@ class HDIMModel(nn.Module):
 
         core = self._forward_core(
             x, R_inv_per_sample, R_per_sample, R_per_sample, R_inv_per_sample,
-            group_masks, runtime,
+            group_masks, runtime, domain_id=domain_id,
         )
 
         invariant = self.training_inv_head(core.exported_invariant).to(dtype=x.dtype)
+        if self.domain_embedding is not None:
+            invariant = invariant + self.domain_embedding(domain_id).to(dtype=x.dtype)
 
         aux_state = None
         if return_state:
@@ -775,6 +841,7 @@ class HDIMModel(nn.Module):
     def add_domain(self, domain_name: str) -> None:
         """Add a new domain rotor to the pipeline in runtime."""
         self.pipeline.add_domain(domain_name)
+        self._clear_rotor_cache()
 
     def reset_memory(self, strategy: str = "geometric") -> None:
         """Reset stateful HDIM memory and router replay state.
@@ -821,7 +888,7 @@ class HDIMModel(nn.Module):
             memory_mode=memory_mode,
         )
 
-        rotors_n, rotors_inv = self._build_rotor_stacks()
+        rotors_n, rotors_inv = self._get_rotor_stacks()
         R_src_per_sample = rotors_n[source_domain_id]
         R_src_inv_per_sample = rotors_inv[source_domain_id]
         R_tgt_per_sample = rotors_n[target_domain_id]
@@ -838,12 +905,16 @@ class HDIMModel(nn.Module):
             source_encoding,
             R_src_inv_per_sample, R_src_per_sample,
             R_tgt_per_sample, R_tgt_inv_per_sample,
-            group_masks, runtime,
+            group_masks, runtime, domain_id=source_domain_id,
         )
 
         invariant = self.training_inv_head(core.exported_invariant).to(
             dtype=source_encoding.dtype
         )
+        if self.domain_embedding is not None:
+            invariant = invariant + self.domain_embedding(source_domain_id).to(
+                dtype=source_encoding.dtype
+            )
 
         aux_state = self._build_aux_state(
             raw_invariant=core.raw_invariant,
@@ -907,6 +978,11 @@ class HDIMModel(nn.Module):
         """Enable expert orthogonalization loss."""
         if hasattr(self.pipeline.moe, 'enable_expert_ortho'):
             self.pipeline.moe.enable_expert_ortho()
+
+    def compute_expert_ortho_loss(self) -> torch.Tensor:
+        if hasattr(self.pipeline.moe, 'expert_orthogonalization_loss'):
+            return self.pipeline.moe.expert_orthogonalization_loss()
+        return torch.tensor(0.0, device=next(self.parameters()).device, dtype=next(self.parameters()).dtype)
 
     def enable_gradient_checkpointing(self) -> None:
         """Enable gradient checkpointing on pipeline."""

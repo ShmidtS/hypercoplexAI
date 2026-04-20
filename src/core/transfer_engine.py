@@ -45,6 +45,7 @@ class TransferEngine(nn.Module):
         top_k: int = 2,
         router_cls: Optional[type] = None,
         z_loss_weight: float = 0.0,
+        n_shared_experts: int = 0,
     ):
         """Инициализация TransferEngine.
 
@@ -56,6 +57,7 @@ class TransferEngine(nn.Module):
             top_k: топ-k маршрутизации
             router_cls: класс роутера MoE (None = SoftMoERouter)
             z_loss_weight: weight for router z-loss regularization
+            n_shared_experts: number of DeepSeek-V3 style shared experts
         """
         super().__init__()
 
@@ -77,6 +79,7 @@ class TransferEngine(nn.Module):
             expert_dim=clifford_dim * 2,
             top_k=top_k,
             z_loss_weight=z_loss_weight,
+            n_shared_experts=n_shared_experts,
         )
 
         # Decoder: мультивектор -> выход

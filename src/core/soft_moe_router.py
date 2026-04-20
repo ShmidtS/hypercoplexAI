@@ -61,6 +61,7 @@ class SoftMoERouter(MoERouter):
         temperature: float = 1.0,
         z_loss_weight: float = 0.0,
         use_shared_expert: bool = False,
+        n_shared_experts: int = 0,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -71,6 +72,7 @@ class SoftMoERouter(MoERouter):
         self.temperature = temperature
         self.num_slots = num_experts * slots_per_expert
         self.z_loss_weight = z_loss_weight
+        self.n_shared_experts = n_shared_experts
 
         # Dispatch parameter matrix: (input_dim, num_slots)
         self.dispatch_proj = nn.Linear(input_dim, self.num_slots, bias=False)
@@ -95,10 +97,20 @@ class SoftMoERouter(MoERouter):
         )
 
         # Phase 26: Shared Expert (DeepSeek-V3)
-        # BUG-07 FIX: only create _shared_expert when use_shared_expert=True
         self.use_shared_expert = use_shared_expert
         self._shared_expert: Optional[nn.Module] = None
-        if self.use_shared_expert:
+        self.shared_experts: Optional[nn.ModuleList] = None
+
+        if self.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(self.input_dim, self.expert_dim),
+                    nn.GELU(),
+                    nn.Linear(self.expert_dim, self.input_dim),
+                )
+                for _ in range(self.n_shared_experts)
+            ])
+        elif self.use_shared_expert:
             self._shared_expert = nn.Sequential(
                 nn.Linear(self.input_dim, self.expert_dim),
                 nn.GELU(),
@@ -144,7 +156,7 @@ class SoftMoERouter(MoERouter):
         # BUG-09 FIX: compute z_loss locally, return it — do NOT store on self
         z_loss: Optional[torch.Tensor] = None
         if self.z_loss_weight > 0:
-            lse = torch.logsumexp(logits, dim=-1)
+            lse = torch.logsumexp(logits.float(), dim=-1).to(logits.dtype)
             z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
 
         T = x.shape[0]
@@ -154,9 +166,9 @@ class SoftMoERouter(MoERouter):
             dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype) / self.num_slots
         else:
             # dispatch: нормализация по токенам (каждый слот получает mix токенов)
-            dispatch = F.softmax(logits, dim=0)   # (T, num_slots)
+            dispatch = F.softmax(logits.float(), dim=0).to(logits.dtype)   # (T, num_slots)
         # combine: нормализация по слотам (каждый токен получает mix слотов)
-        combine = F.softmax(logits, dim=-1)   # (T, num_slots)
+        combine = F.softmax(logits.float(), dim=-1).to(logits.dtype)   # (T, num_slots)
         return dispatch, combine, z_loss
 
     def _evaluate_experts(self, slot_inputs: torch.Tensor) -> torch.Tensor:
@@ -209,7 +221,10 @@ class SoftMoERouter(MoERouter):
         output = torch.clamp(output, min=-100.0, max=100.0)
 
         # Phase 26: Shared Expert (DeepSeek-V3) — always-on FFN
-        if self.use_shared_expert:
+        if self.shared_experts is not None:
+            shared_sum = torch.stack([expert(x_flat) for expert in self.shared_experts]).mean(dim=0)
+            output = output + shared_sum
+        elif self.use_shared_expert:
             shared_out = self._shared_expert(x_flat)  # type: ignore[union-attr]
             output = output + shared_out
 
@@ -354,6 +369,7 @@ class SoftMoERouter(MoERouter):
         # Sign-based update: overloaded -> negative delta (decrease bias)
         delta = torch.sign(expert_load - self._target_load)
         self._expert_bias.add_(delta, alpha=-self._aux_lr)
+        self._expert_bias.data.clamp_(-1.0, 1.0)
 
     def enable_aux_loss_free(self, aux_lr: float = 0.001, bias_update_frequency: int = 100) -> None:
         """Enable Auxiliary-Loss-Free balancing (DeepSeek-V3).

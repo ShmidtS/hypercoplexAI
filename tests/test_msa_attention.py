@@ -282,7 +282,7 @@ class TestSemanticMemoryMSA:
         semantic_dense.eval()
         
         # Copy prototypes to ensure same starting point
-        semantic_msa.prototypes.copy_(semantic_dense.prototypes.detach())
+        semantic_msa.prototypes.data.copy_(semantic_dense.prototypes.data)
         
         with torch.no_grad():
             out_msa = semantic_msa(batch_input)

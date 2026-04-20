@@ -250,6 +250,16 @@ def model_from_experiment_config(
     elif exp.num_experts is not None:
         cfg_kwargs["num_experts"] = exp.num_experts
 
+    if getattr(exp, "n_shared_experts", 0) > 0:
+        cfg_kwargs["n_shared_experts"] = exp.n_shared_experts
+
+    if getattr(exp, "use_domain_embedding", False):
+        cfg_kwargs["use_domain_embedding"] = exp.use_domain_embedding
+
+    if getattr(exp, "use_domain_lora", False):
+        cfg_kwargs["use_domain_lora"] = exp.use_domain_lora
+        cfg_kwargs["domain_lora_rank"] = getattr(exp, "domain_lora_rank", 4)
+
     cfg = HDIMConfig(**cfg_kwargs)
 
     needs_text = (
@@ -263,7 +273,7 @@ def model_from_experiment_config(
 
     if needs_text:
         if getattr(exp, "modernbert_encoder", False):
-            return build_modernbert_hdim_model(
+            model = build_modernbert_hdim_model(
                 cfg,
                 soft_router=exp.soft_router,
                 modernbert_model_name=getattr(
@@ -275,16 +285,27 @@ def model_from_experiment_config(
                 matryoshka_dims=getattr(exp, "matryoshka_dims", None),
                 z_loss_weight=z_loss_weight,
             )
-        if getattr(exp, "pretrained_encoder", False):
-            return build_sbert_hdim_model(
+        elif getattr(exp, "pretrained_encoder", False):
+            model = build_sbert_hdim_model(
                 cfg,
                 soft_router=exp.soft_router,
                 z_loss_weight=z_loss_weight,
             )
-        return build_text_hdim_model(
-            cfg,
-            soft_router=exp.soft_router,
+        else:
+            model = build_text_hdim_model(
+                cfg,
+                soft_router=exp.soft_router,
+                z_loss_weight=z_loss_weight,
+            )
+    else:
+        model = HDIMModel(cfg)
+
+    if getattr(exp, "moe_kernel", False):
+        core_model = model.core_model if isinstance(model, TextHDIMModel) else model
+        _make_moe_kernel(
+            core_model,
+            expert_names=getattr(exp, "moe_kernel_expert_names", None),
             z_loss_weight=z_loss_weight,
         )
 
-    return HDIMModel(cfg)
+    return model

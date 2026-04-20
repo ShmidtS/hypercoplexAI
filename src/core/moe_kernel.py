@@ -651,6 +651,8 @@ class MoEKernel(nn.Module):
         for expert in self.experts:
             if not isinstance(expert, MLPExpert) or expert.use_can:
                 return False
+            if expert.architecture == "bottleneck":
+                return False
 
         # All must share the same architecture and activation
         first = self.experts[0]

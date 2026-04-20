@@ -202,6 +202,7 @@ class TitansMemoryModule(nn.Module):
             if self.use_adaptive_forgetting:
                 effective_alpha = self._adaptive_alpha(surprise, alpha)
         # Evidence-strength scaling: high evidence → smaller alpha → less forgetting
+        self.evidence_strength.clamp_(min=0.0, max=10.0)
         evidence_factor = 1.0 / (1.0 + self.evidence_strength.mean())
         effective_alpha = effective_alpha * evidence_factor
         new_weight = (1 - effective_alpha) * mem_w.detach() + new_momentum

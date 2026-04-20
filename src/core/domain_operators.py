@@ -8,6 +8,7 @@ HDIM — Domain Operators.
   G_target = R_target ⊗ U_inv ⊗ R_target^{-1} — перенос в целевой домен
 """
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -107,3 +108,39 @@ def sandwich_transfer(
     step2 = algebra.geometric_product(R_tgt_n.expand(*U_inv.shape), U_inv)
     G_target = algebra.geometric_product(step2, R_target.get_inverse().expand(*U_inv.shape))
     return U_inv, G_target
+
+
+class DomainIndexEmbedding(nn.Module):
+    """Sinusoidal positional embedding over domain indices.
+
+    Each domain (e.g. math=0, language=1, code=2, science=3) gets a
+    distinct positional signal via sin/cos at different frequencies,
+    analogous to Transformer positional encodings but applied to the
+    discrete domain_id rather than sequence position.
+    """
+
+    def __init__(self, dim: int, max_domains: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.max_domains = max_domains
+        half_dim = dim // 2
+        freq = torch.exp(
+            -math.log(10000.0) * torch.arange(half_dim, dtype=torch.float32) / half_dim
+        )
+        positions = torch.arange(max_domains, dtype=torch.float32).unsqueeze(1)
+        angles = positions * freq.unsqueeze(0)
+        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+        if dim % 2 == 1:
+            emb = torch.cat([emb, torch.zeros(max_domains, 1)], dim=1)
+        self.register_buffer("embedding", emb)
+
+    def forward(self, domain_id: torch.Tensor) -> torch.Tensor:
+        """Look up sinusoidal embedding for each domain_id in the batch.
+
+        Args:
+            domain_id: (B,) long tensor of domain indices.
+
+        Returns:
+            (B, dim) sinusoidal embedding tensor.
+        """
+        return self.embedding[domain_id]

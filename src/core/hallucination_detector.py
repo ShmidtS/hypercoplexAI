@@ -142,6 +142,17 @@ class HallucinationDetector(nn.Module):
 
         return eigen_score
 
+    @staticmethod
+    def _simplex_projection(w: torch.Tensor) -> torch.Tensor:
+        """Project w onto probability simplex: sum=1, all>=0."""
+        K = w.shape[0]
+        sorted_w, _ = torch.sort(w, descending=True)
+        cumsum = torch.cumsum(sorted_w, dim=0)
+        rho = (1 + torch.arange(1, K + 1, device=w.device, dtype=w.dtype) * sorted_w - cumsum) > 0
+        rho_idx = rho.nonzero()[-1].item() if rho.any() else 0
+        theta = (cumsum[rho_idx] - 1) / (rho_idx + 1)
+        return torch.clamp(w - theta, min=0)
+
     @torch.no_grad()
     def compute_hallucination_risk(
         self,
@@ -196,11 +207,10 @@ class HallucinationDetector(nn.Module):
         norm_eigen = torch.sigmoid(eigen_score - 1.0)
 
         # Combined risk via 5-signal weighted sum with simplex projection
-        raw_weights = F.relu(torch.stack([
+        weights = self._simplex_projection(torch.stack([
             self.weight_entropy, self.weight_confidence, self.weight_mismatch,
             self.weight_semantic, self.weight_eigen,
         ]))
-        weights = raw_weights / (raw_weights.sum(dim=0) + 1e-8)
         risk = (
             weights[0] * norm_entropy
             + weights[1] * inv_confidence

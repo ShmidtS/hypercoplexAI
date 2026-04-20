@@ -91,6 +91,7 @@ class HDIMPipeline(nn.Module):
         memory_type: str = 'titans',
         msa_config: Optional[dict] = None,
         z_loss_weight: float = 0.0,
+        n_shared_experts: int = 0,
     ):
         super().__init__()
 
@@ -155,6 +156,7 @@ class HDIMPipeline(nn.Module):
             num_experts=num_experts,
             top_k=top_k,
             z_loss_weight=z_loss_weight,
+            n_shared_experts=n_shared_experts,
         )
 
         # Backward compatibility aliases

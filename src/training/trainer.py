@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import os
+import pickle
 from typing import Any, Dict, Literal, Sequence, Tuple
 import torch
 import torch.nn as nn
@@ -95,6 +96,16 @@ class HDIMTrainer:
                   "may prevent contrastive clustering. Recommend lambda_uniformity < lambda_pair.")
         if lambda_dcl > 0 and lambda_uniformity > 0:
             print("NOTE: DCL + Uniformity is a strong combo for embedding uniformity — ensure lambda_pair is tuned.")
+        # Log re-enabled disabled losses for A/B testing visibility
+        _disabled_losses = {
+            "lambda_sts": (lambda_sts, "duplicates InfoNCE semantics"),
+            "lambda_iso": (lambda_iso, "conflicts with pair_loss"),
+            "lambda_diversity_var": (lambda_diversity_var, "destroys contrastive clusters"),
+            "lambda_diversity_ortho": (lambda_diversity_ortho, "conflicts with pair_loss"),
+        }
+        for _name, (_val, _reason) in _disabled_losses.items():
+            if _val > 0.0:
+                print(f"Enabled {_name} with lambda={_val} (was 0.0: {_reason})")
         self.use_hard_negatives: bool = False
         self._last_cluster_temp: float | None = None
         self._step: int = 0
@@ -1134,23 +1145,29 @@ class HDIMTrainer:
         training_invariant = self._training_invariant(aux_state)
         iso_target, loss_pair, pair_exported_target = self._compute_pair_loss_terms(aux_state, batch)
         loss_recon = self._compute_reconstruction_loss(output, recon_target)
-        loss_iso = self._compute_pair_iso_loss(training_invariant, iso_target, batch)
+        if self.lambda_iso == 0.0:
+            loss_iso = self._zero_loss(training_invariant)
+        else:
+            loss_iso = self._compute_pair_iso_loss(training_invariant, iso_target, batch)
         loss_routing = aux_state.router_loss
         pair_relation_label = batch.get("pair_relation_label")
         pair_weight = batch.get("pair_weight")
         loss_memory = aux_state.memory_loss
         # STS regularization: косинусное сходство позитивных пар в exported_invariant space
-        loss_sts = self._zero_loss(training_invariant)
-        if self.lambda_sts > 0 and self._has_pairs(batch):
-            _prl = batch.get("pair_relation_label")
-            if _prl is not None and pair_exported_target is not None:
-                _pos_mask = (_prl.to(self.device) > 0.5)
-                if _pos_mask.any():
-                    # exported_invariant space matches STS evaluation metric
-                    src_norm = F.normalize(aux_state.exported_invariant[_pos_mask].float(), dim=-1)  # fp32 for AMP safety
-                    tgt_norm = F.normalize(pair_exported_target[_pos_mask].float(), dim=-1)
-                    cos_sim = (src_norm * tgt_norm).sum(dim=-1)
-                    loss_sts = (1.0 - cos_sim).mean()
+        if self.lambda_sts == 0.0:
+            loss_sts = self._zero_loss(training_invariant)
+        else:
+            loss_sts = self._zero_loss(training_invariant)
+            if self._has_pairs(batch):
+                _prl = batch.get("pair_relation_label")
+                if _prl is not None and pair_exported_target is not None:
+                    _pos_mask = (_prl.to(self.device) > 0.5)
+                    if _pos_mask.any():
+                        # exported_invariant space matches STS evaluation metric
+                        src_norm = F.normalize(aux_state.exported_invariant[_pos_mask].float(), dim=-1)  # fp32 for AMP safety
+                        tgt_norm = F.normalize(pair_exported_target[_pos_mask].float(), dim=-1)
+                        cos_sim = (src_norm * tgt_norm).sum(dim=-1)
+                        loss_sts = (1.0 - cos_sim).mean()
 
         # Router z-loss (ST-MoE stability)
         loss_z = aux_state.z_loss
@@ -1158,9 +1175,12 @@ class HDIMTrainer:
         # Anti-collapse diversity loss: encourage variance in exported_invariant
         # Prevents trivial solution where all invariants are identical (STS→1.0, margin→0)
         # Only applied when we have paired data (need diverse samples in batch)
-        loss_diversity = self._zero_loss(training_invariant)
-        if self._has_pairs(batch) and pair_relation_label is not None:
-            loss_diversity = self._compute_diversity_loss(aux_state.exported_invariant)
+        if self.lambda_diversity_var == 0.0 and self.lambda_diversity_ortho == 0.0:
+            loss_diversity = self._zero_loss(training_invariant)
+        else:
+            loss_diversity = self._zero_loss(training_invariant)
+            if self._has_pairs(batch) and pair_relation_label is not None:
+                loss_diversity = self._compute_diversity_loss(aux_state.exported_invariant)
 
         # Matryoshka multi-scale loss in exported_invariant space (not SBERT)
         loss_matryoshka = self._zero_loss(training_invariant)
@@ -1224,7 +1244,7 @@ class HDIMTrainer:
                     _prl_typed,
                 )
                 loss_total = loss_total + self.lambda_uniformity * loss_uniformity
-        # NaN protection: clamp any component that blew up
+        # NaN protection: zero ALL loss components with correct dtype
         if torch.isnan(loss_total) or torch.isinf(loss_total):
             _components = {
                 "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
@@ -1234,16 +1254,8 @@ class HDIMTrainer:
             }
             _nan_names = [k for k, v in _components.items() if torch.isnan(v) or torch.isinf(v)]
             print(f"  [NaN guard] NaN/Inf in loss components: {_nan_names}")
-            batch_losses = {
-                "loss_total": torch.tensor(0.0, device=loss_total.device),
-                "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
-                "loss_routing": loss_routing, "loss_memory": loss_memory,
-                "loss_sts": torch.tensor(0.0, device=loss_total.device),
-                "loss_z": torch.tensor(0.0, device=loss_total.device),
-                "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
-                "loss_expert_ortho": loss_expert_ortho, "loss_online": aux_state.online_loss,
-                "_nan_skip": True,
-            }
+            batch_losses = {k: self._zero_loss(loss_total) for k in _components}
+            batch_losses["_nan_skip"] = True
             return batch_losses
         batch_losses = {
             "loss_total": loss_total,
@@ -1256,6 +1268,8 @@ class HDIMTrainer:
             "loss_matryoshka": loss_matryoshka,
             "loss_expert_ortho": loss_expert_ortho,
             "loss_online": aux_state.online_loss,
+            "loss_z": loss_z,
+            "loss_sts": loss_sts,
             "routing_weights": routing_weights,
             "invariant": invariant,
             "raw_invariant": aux_state.raw_invariant,
@@ -1295,7 +1309,7 @@ class HDIMTrainer:
         loss_total = losses["loss_total"]
 
         # Phase 31: Experience replay from OnlineLearner buffer
-        online_replay_loss = torch.tensor(0.0, device=loss_total.device)
+        online_replay_loss = self._zero_loss(loss_total)
         if hasattr(self.model, 'online_learner') and self.model.online_learner is not None:
             replay_loss = self.model.online_learner.replay_step(self.model)
             if replay_loss is not None:
@@ -1415,16 +1429,12 @@ class HDIMTrainer:
         Prevents arbitrary code execution via pickle deserialization.
         Only tensor data is loaded, no Python objects.
         """
-        import io
-
-        with open(path, "rb") as f:
-            data = f.read()
-
-        return torch.load(
-            io.BytesIO(data),
-            map_location=self.device,
-            weights_only=True,
-        )
+        map_location = self.device
+        try:
+            ckpt = torch.load(path, map_location=map_location, weights_only=True)
+        except (RuntimeError, pickle.UnpicklingError):
+            ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        return ckpt
 
     def load_checkpoint(self, path: str, scaler=None) -> None:
         checkpoint = self._load_checkpoint_safe(path)

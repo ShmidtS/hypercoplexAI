@@ -54,14 +54,15 @@ class ExperimentConfig:
     # ------------------------------------------------------------------ #
     # Phase-2 loss coefficients
     # ------------------------------------------------------------------ #
-    lambda_iso: float = 0.0  # DISABLED: conflicts with pair_loss, suppresses margin
-    lambda_pair: float = 0.5  # InfoNCE contrastive (boosted for margin signal)
+    lambda_iso: float = 0.0  # DISABLED: conflicted with pair_loss. Try 0.005 max for A/B test.
+    lambda_pair: float = 0.4  # InfoNCE contrastive (optimal from best-score run)
+    lambda_sts: float = 0.0  # DISABLED: duplicated InfoNCE. Try 0.01-0.02 for A/B test.
     lambda_routing: float = 0.05
     lambda_memory: float = 0.05  # memory regularization (EMA stability)
     lambda_dcl: float = 0.05  # DCL loss — decorrelation (Yeh et al. 2022)
     lambda_uniformity: float = 0.02  # uniformity on hypersphere (Wang & Isola 2020)
-    lambda_diversity_var: float = 0.0  # DISABLED: anti-collapse variance
-    lambda_diversity_ortho: float = 0.0  # DISABLED: anti-collapse orthogonality
+    lambda_diversity_var: float = 0.0  # DISABLED: destroyed clusters. Try 0.005 max for A/B test.
+    lambda_diversity_ortho: float = 0.0  # DISABLED: conflicted with pair_loss. Try 0.005 max for A/B test.
     lambda_matryoshka: float = 0.15  # Matryoshka multi-scale loss
 
     # ------------------------------------------------------------------ #
@@ -69,7 +70,7 @@ class ExperimentConfig:
     # ------------------------------------------------------------------ #
     warmup_epochs: int = 3
     early_stopping_patience: int = 8
-    infonce_temperature: float = 0.15  # InfoNCE temperature (0.07 too sharp, 0.15 balanced)
+    infonce_temperature: float = 0.10  # InfoNCE temperature (optimal from best-score run)
     scheduler: str = "onecycle"  # LR scheduler type
     # Optional wall-clock budget in seconds; None means no limit.
     time_budget_s: Optional[float] = None
@@ -80,12 +81,18 @@ class ExperimentConfig:
     pretrained_encoder: bool = False
     z_loss_weight: float = 0.0
     soft_router: bool = False
+    moe_kernel: bool = False
+    moe_kernel_expert_names: Optional[list] = None
+    n_shared_experts: int = 0
     modernbert_encoder: bool = False
     modernbert_model_name: str = "answerdotai/ModernBERT-base"
     freeze_modernbert: bool = True
     modernbert_use_cls_pooling: bool = True
     modernbert_max_length: int = 512
     matryoshka_dims: Optional[list] = None
+    use_domain_embedding: bool = False
+    use_domain_lora: bool = False
+    domain_lora_rank: int = 4
 
     # ------------------------------------------------------------------ #
     # Misc extras
@@ -127,4 +134,11 @@ class ExperimentConfig:
             kwargs["expert_names"] = self.expert_names
         elif self.num_experts is not None:
             kwargs["num_experts"] = self.num_experts
+        if self.n_shared_experts > 0:
+            kwargs["n_shared_experts"] = self.n_shared_experts
+        if self.use_domain_embedding:
+            kwargs["use_domain_embedding"] = self.use_domain_embedding
+        if self.use_domain_lora:
+            kwargs["use_domain_lora"] = self.use_domain_lora
+            kwargs["domain_lora_rank"] = self.domain_lora_rank
         return kwargs

@@ -85,6 +85,7 @@ class MoEKernelAdapter(MoERouter):
             "top_expert_idx": state.top_expert_idx,
             "total_loss": state.total_loss(),
             "dominant_expert_names": state.dominant_expert_names(),
+            "slot_outputs": state.slot_outputs,
         }
 
         # Alias keys expected by _forward_core
