@@ -1325,9 +1325,7 @@ class HDIMTrainer:
             if torch.isnan(loss_total) or torch.isinf(loss_total):
                 # Force scale reduction for stability
                 new_scale = max(scaler.get_scale() * 0.5, 1.0)
-                # TODO: PyTorch private API
-                scaler._scale = torch.tensor(new_scale, device=scaler._scale.device, dtype=scaler._scale.dtype)
-                scaler.update()
+                scaler.update(new_scale)
                 self._last_grad_norm = float('inf')
                 return loss_total.detach()
 
@@ -1345,9 +1343,7 @@ class HDIMTrainer:
                 # NaN grads found — skip step and reduce scale to prevent
                 # permanent scaler corruption from non-finite gradients.
                 new_scale = max(scaler.get_scale() * 0.5, 1.0)
-                # TODO: PyTorch private API
-                scaler._scale = torch.tensor(new_scale, device=scaler._scale.device, dtype=scaler._scale.dtype)
-                scaler.update()
+                scaler.update(new_scale)
             else:
                 scaler.step(self.optimizer)
                 scaler.update()

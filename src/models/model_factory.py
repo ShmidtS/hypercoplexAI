@@ -306,6 +306,8 @@ def model_from_experiment_config(
             core_model,
             expert_names=getattr(exp, "moe_kernel_expert_names", None),
             z_loss_weight=z_loss_weight,
+            ortho_loss_weight=getattr(exp, "lambda_expert_ortho", 0.01),
+            use_can_experts=getattr(exp, "use_can_experts", False),
         )
 
     return model
