@@ -748,13 +748,17 @@ class MoEKernel(nn.Module):
         """
         Switch Transformer load balance loss:
             L_lb = E * Σ_e f_e.detach() * mean_usage_e
+
+        Normalized by log(num_experts) for scale-invariance across expert counts.
         """
         T = combine.shape[0]
         # (T, E)
         expert_w = combine.reshape(T, self.num_experts, self.slots_per_expert).mean(-1)
         f_e = expert_w.mean(0).detach()  # (E,) — stop-gradient
         mean_usage = expert_w.mean(0)  # (E,) — gradient flows
-        return self.num_experts * (f_e * mean_usage).sum()
+        raw_loss = self.num_experts * (f_e * mean_usage).sum()
+        norm = math.log(self.num_experts) if self.num_experts > 1 else 1.0
+        return raw_loss / norm
 
     # ----------------------------------------------------------
     # Expert Orthogonalization loss

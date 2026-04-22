@@ -85,8 +85,8 @@ SOTA_SEEDS = [
     # Phase 26c рекорд + MSA defaults
     {
         "lr": 3e-4, "batch_size": 48, "augment_factor": 5,
-        "lambda_pair": 0.5, "lambda_sts": 0.3, "lambda_dcl": 0.2,
-        "lambda_uniformity": 0.1, "lambda_iso": 0.1, "lambda_routing": 0.02,
+        "lambda_pair": 0.4, "lambda_sts": 0.3, "lambda_dcl": 0.05,
+        "lambda_uniformity": 0.02, "lambda_iso": 0.1, "lambda_routing": 0.01,
         "lambda_memory": 0.01, "lambda_z": 0.01, "lambda_expert_ortho": 0.02,
         "focal_gamma": 1.0, "warmup_epochs": 20, "t_mult": 2,
         "msa_num_prototypes": 256, "msa_top_k": 16,
@@ -96,8 +96,8 @@ SOTA_SEEDS = [
     # Phase 26b рекорд + MSA defaults
     {
         "lr": 3e-4, "batch_size": 48, "augment_factor": 5,
-        "lambda_pair": 0.5, "lambda_sts": 0.15, "lambda_dcl": 0.2,
-        "lambda_uniformity": 0.0, "lambda_iso": 0.1, "lambda_routing": 0.02,
+        "lambda_pair": 0.4, "lambda_sts": 0.15, "lambda_dcl": 0.05,
+        "lambda_uniformity": 0.02, "lambda_iso": 0.1, "lambda_routing": 0.01,
         "lambda_memory": 0.01, "lambda_z": 0.01, "lambda_expert_ortho": 0.02,
         "focal_gamma": 1.0, "warmup_epochs": 20, "t_mult": 2,
         "msa_num_prototypes": 256, "msa_top_k": 16,

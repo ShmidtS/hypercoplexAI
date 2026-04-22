@@ -304,8 +304,8 @@ class CliffordInteractionLayer(nn.Module):
                 output = output + global_context
             
             # Numerical stability
-            output = torch.nan_to_num(output, nan=0.0, posinf=1e4, neginf=-1e4)
-            output = torch.clamp(output, min=-1e4, max=1e4)
+            output = torch.nan_to_num(output, nan=0.0, posinf=1e3, neginf=-1e3)
+            output = torch.clamp(output, min=-1e3, max=1e3)
             
             # Apply dropout
             output = self.dropout(output)
@@ -385,8 +385,8 @@ class CliffordInteractionLayer(nn.Module):
                 wedge_all = (ab - ba) / 2.0  # (num_shifts, B, T, D)
 
                 # Numerical stability
-                wedge_all = torch.nan_to_num(wedge_all, nan=0.0, posinf=1e4, neginf=-1e4)
-                wedge_all = torch.clamp(wedge_all, min=-1e4, max=1e4)
+                wedge_all = torch.nan_to_num(wedge_all, nan=0.0, posinf=1e3, neginf=-1e3)
+                wedge_all = torch.clamp(wedge_all, min=-1e3, max=1e3)
 
                 # Sum over shifts
                 wedge_sum = wedge_all.sum(dim=0)  # (B, T, D)
@@ -400,9 +400,9 @@ class CliffordInteractionLayer(nn.Module):
 
         # Numerical stability: clamp and nan_to_num
         interaction_output = torch.nan_to_num(
-            interaction_output, nan=0.0, posinf=1e4, neginf=-1e4
+            interaction_output, nan=0.0, posinf=1e3, neginf=-1e3
         )
-        interaction_output = torch.clamp(interaction_output, min=-1e4, max=1e4)
+        interaction_output = torch.clamp(interaction_output, min=-1e3, max=1e3)
 
         # Gated combination: SiLU(x) + gate * interaction_output
         gate = torch.sigmoid(self.gate_fc(x))
@@ -458,8 +458,8 @@ class CliffordInteractionLayer(nn.Module):
                 ba = self.clifford.geometric_product(C_local, x)  # (B, T, D)
                 wedge = (ab - ba) / 2.0
                 # Numerical stability
-                wedge = torch.nan_to_num(wedge, nan=0.0, posinf=1e4, neginf=-1e4)
-                wedge = torch.clamp(wedge, min=-1e4, max=1e4)
+                wedge = torch.nan_to_num(wedge, nan=0.0, posinf=1e3, neginf=-1e3)
+                wedge = torch.clamp(wedge, min=-1e3, max=1e3)
                 wedge = torch.sigmoid(self.wedge_weight) * wedge
                 interaction_output = interaction_output + wedge
 
@@ -472,9 +472,9 @@ class CliffordInteractionLayer(nn.Module):
 
         # Numerical stability: clamp and nan_to_num
         interaction_output = torch.nan_to_num(
-            interaction_output, nan=0.0, posinf=1e4, neginf=-1e4
+            interaction_output, nan=0.0, posinf=1e3, neginf=-1e3
         )
-        interaction_output = torch.clamp(interaction_output, min=-1e4, max=1e4)
+        interaction_output = torch.clamp(interaction_output, min=-1e3, max=1e3)
 
         # Gated combination: SiLU(x) + gate * interaction_output
         gate = torch.sigmoid(self.gate_fc(x))
@@ -515,7 +515,7 @@ class CliffordInteractionLayer(nn.Module):
         wedge = (ab - ba) / 2.0
 
         # Numerical stability
-        wedge = torch.nan_to_num(wedge, nan=0.0, posinf=1e4, neginf=-1e4)
-        wedge = torch.clamp(wedge, min=-1e4, max=1e4)
+        wedge = torch.nan_to_num(wedge, nan=0.0, posinf=1e3, neginf=-1e3)
+        wedge = torch.clamp(wedge, min=-1e3, max=1e3)
 
         return wedge

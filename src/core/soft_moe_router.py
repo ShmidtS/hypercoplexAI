@@ -286,14 +286,19 @@ class SoftMoERouter(MoERouter):
         Uses runtime expert fraction f_e (not static weight-based p).
         L_lb = E * Σ_e f_e.detach() * mean_usage_e
         Gradient flows only through mean_usage (not f_e) — standard Switch Transformer.
+
+        Normalized by log(num_experts) for scale-invariance across expert counts.
         """
+        import math
         T = combine.shape[0]
         expert_weights = combine.reshape(T, self.num_experts, self.slots_per_expert).mean(-1)
         # f_e: fraction of tokens dispatched to each expert (detached — no gradient)
         dispatch_per_expert = expert_weights  # (T, E) — combine weights proxy for dispatch
         f_e = dispatch_per_expert.mean(0).detach()  # (E,) — stop-gradient on fraction
         mean_usage = expert_weights.mean(0)  # (E,) — gradient flows here
-        return self.num_experts * (f_e * mean_usage).sum()
+        raw_loss = self.num_experts * (f_e * mean_usage).sum()
+        norm = math.log(self.num_experts) if self.num_experts > 1 else 1.0
+        return raw_loss / norm
 
     def expert_orthogonalization_loss(self) -> torch.Tensor:
         """Phase 26: Expert Orthogonalization loss (arXiv:2505.22323).

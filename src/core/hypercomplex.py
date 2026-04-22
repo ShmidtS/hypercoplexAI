@@ -163,8 +163,8 @@ class CliffordAlgebra(nn.Module):
         flat_indices = indices.reshape(D * D)
         result.scatter_add_(-1, flat_indices.expand(*a.shape[:-1], D * D), flat_weighted)
         # nan_to_num prevents NaN propagation; clamp prevents gradient explosion
-        result = torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
-        result = torch.clamp(result, min=-1e4, max=1e4)
+        result = torch.nan_to_num(result, nan=0.0, posinf=1e3, neginf=-1e3)
+        result = torch.clamp(result, min=-1e3, max=1e3)
 
         # Learnable metric scaling (CliffordNet, 2026) — Phase 22
         if self.use_learnable_metric:
@@ -228,8 +228,8 @@ class CliffordAlgebra(nn.Module):
         result.scatter_add_(-1, flat_indices.expand(*b.shape[:-1], D * D), flat_weighted)
 
         # Numerical stability
-        result = torch.nan_to_num(result, nan=0.0, posinf=1e4, neginf=-1e4)
-        result = torch.clamp(result, min=-1e4, max=1e4)
+        result = torch.nan_to_num(result, nan=0.0, posinf=1e3, neginf=-1e3)
+        result = torch.clamp(result, min=-1e3, max=1e3)
 
         # Learnable metric scaling
         if self.use_learnable_metric:

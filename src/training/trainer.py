@@ -29,7 +29,7 @@ class HDIMTrainer:
         optimizer: Optimizer,
         device: str | torch.device = "cpu",
         lambda_iso: float = 0.0,  # DISABLED: conflicts with pair_loss, suppresses margin
-        lambda_routing: float = 0.05,  # MoE load balance (SoftMoERouter aux loss)
+        lambda_routing: float = 0.01,  # MoE load balance (reduced: routing loss normalized by log(E))
         lambda_pair: float = 0.4,  # InfoNCE contrastive (optimal from Run 18)
         lambda_memory: float = 0.05,  # memory regularization (EMA stability)
         negative_margin: float = 1.0,
@@ -43,12 +43,12 @@ class HDIMTrainer:
         lambda_expert_ortho: float = 0.01,  # expert orthogonalization (Phase 26)
         lambda_online: float = 0.01,  # online self-evolution loss (Phase 31)
         learnable_temperature: bool = False,
-        lambda_dcl: float = 0.0,
-        lambda_uniformity: float = 0.0,
+        lambda_dcl: float = 0.05,
+        lambda_uniformity: float = 0.02,
         lambda_diversity_var: float = 0.0,  # DISABLED: destroys contrastive clusters
         lambda_diversity_ortho: float = 0.0,  # DISABLED: conflicts with pair_loss
         use_sc_temperature: bool = False,
-        lambda_matryoshka: float = 0.1,  # multi-scale embedding loss (optional)
+        lambda_matryoshka: float = 0.15,  # multi-scale embedding loss (optional)
         # Temperature scheduling parameters (exposed for configurability)
         temp_schedule: str = "none",
         tau_max: float = 0.1,
@@ -1417,7 +1417,9 @@ class HDIMTrainer:
 
         if scaler is not None:
             checkpoint["scaler_state_dict"] = scaler.state_dict()
-        torch.save(checkpoint, path)
+        tmp_path = path + ".tmp"
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, path)
 
     def _load_checkpoint_safe(self, path: str) -> dict:
         """Safely load checkpoint with weights_only=True (OWASP A08 fix).
@@ -1428,8 +1430,13 @@ class HDIMTrainer:
         map_location = self.device
         try:
             ckpt = torch.load(path, map_location=map_location, weights_only=True)
-        except (RuntimeError, pickle.UnpicklingError):
-            ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        except (RuntimeError, pickle.UnpicklingError) as exc:
+            raise RuntimeError(
+                f"Failed to load checkpoint with weights_only=True: {exc}. "
+                f"Checkpoint at '{path}' contains non-tensor objects and cannot be "
+                f"loaded safely. Re-save the checkpoint with the current code version "
+                f"or remove incompatible objects from it."
+            ) from exc
         return ckpt
 
     def load_checkpoint(self, path: str, scaler=None) -> None:

@@ -195,6 +195,16 @@ def query_llm(user_text: str, expert_info: str, model: str = "") -> str | None:
 CHECKPOINT_CANDIDATES = [
     Path(__file__).resolve().parents[1]
     / "runs"
+    / "autopilot_best"
+    / "checkpoints"
+    / "best.pt",
+    Path(__file__).resolve().parents[1]
+    / "artifacts"
+    / "run_018"
+    / "checkpoints"
+    / "best.pt",
+    Path(__file__).resolve().parents[1]
+    / "runs"
     / "autopilot_2026_04_21"
     / "checkpoints"
     / "best.pt",
@@ -221,11 +231,6 @@ CHECKPOINT_CANDIDATES = [
     Path(__file__).resolve().parents[1]
     / "artifacts"
     / "gpu_training"
-    / "checkpoints"
-    / "best.pt",
-    Path(__file__).resolve().parents[1]
-    / "artifacts"
-    / "run_018"
     / "checkpoints"
     / "best.pt",
 ]

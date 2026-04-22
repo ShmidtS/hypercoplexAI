@@ -69,6 +69,29 @@ def compute_primary_score(quality: dict) -> float:
     )
 
 
+GLOBAL_BEST_FILENAME = ".global_best_score.json"
+
+
+def update_global_best(runs_dir: str, current_score: float, run_dir: str) -> None:
+    """Track the best score across all runs in a shared JSON file."""
+    global_best_path = os.path.join(runs_dir, GLOBAL_BEST_FILENAME)
+    best = {"score": -float("inf"), "run_dir": ""}
+    if os.path.exists(global_best_path):
+        try:
+            with open(global_best_path, encoding="utf-8") as f:
+                best = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            best = {"score": -float("inf"), "run_dir": ""}
+    if current_score > best["score"]:
+        prev_score = best["score"]
+        best = {"score": current_score, "run_dir": run_dir}
+        tmp_path = global_best_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(best, f, indent=2)
+        os.replace(tmp_path, global_best_path)
+        print(f"New global best: score={current_score:.4f} (previous: {prev_score:.4f})")
+
+
 def check_run_validity(results: dict) -> tuple[bool, str]:
     """Проверяет валидность завершённого прогона.
 
@@ -453,18 +476,18 @@ def run_gpu_training(
         lambda_memory=args.lambda_memory,
         ranking_margin=args.ranking_margin,
         use_infonce=getattr(args, 'use_infonce', True),
-        infonce_temperature=getattr(args, 'infonce_temperature', 0.15),
+        infonce_temperature=getattr(args, 'infonce_temperature', ExperimentConfig.infonce_temperature),
         lambda_sts=getattr(args, 'lambda_sts', 0.0),
         lambda_angle=getattr(args, 'lambda_angle', 0.0),
         lambda_supcon=getattr(args, 'lambda_supcon', 0.0),
         lambda_z=getattr(args, 'lambda_z', 0.0),
         lambda_expert_ortho=getattr(args, 'lambda_expert_ortho', 0.0),
         learnable_temperature=getattr(args, 'learnable_temperature', False),
-        lambda_dcl=getattr(args, 'lambda_dcl', 0.0),
-        lambda_uniformity=getattr(args, 'lambda_uniformity', 0.0),
+        lambda_dcl=getattr(args, 'lambda_dcl', ExperimentConfig.lambda_dcl),
+        lambda_uniformity=getattr(args, 'lambda_uniformity', ExperimentConfig.lambda_uniformity),
         lambda_diversity_var=getattr(args, 'lambda_diversity_var', 0.0),
         lambda_diversity_ortho=getattr(args, 'lambda_diversity_ortho', 0.0),
-        lambda_matryoshka=getattr(args, 'lambda_matryoshka', 0.1),
+        lambda_matryoshka=getattr(args, 'lambda_matryoshka', ExperimentConfig.lambda_matryoshka),
         aug_noise_std=getattr(args, 'aug_noise_std', 0.0),
         aug_mixup_alpha=getattr(args, 'aug_mixup_alpha', 0.0),
     )
@@ -735,6 +758,8 @@ def run_gpu_training(
                 best_score = score
                 best_score_epoch = epoch
                 trainer.save_checkpoint(str(best_checkpoint), scaler=scaler)
+                runs_dir = str(Path(__file__).resolve().parents[1] / "runs")
+                update_global_best(runs_dir, score, str(output_dir))
 
             # Early stopping
             early_stop_patience = getattr(args, 'early_stopping_patience', 0)
@@ -837,8 +862,10 @@ def main() -> None:
                         help="Clifford algebra nilpotent bases (default=0)")
     # Loss weights
     parser.add_argument("--lambda_iso", type=float, default=0.0)
-    parser.add_argument("--lambda_pair", type=float, default=0.5)
-    parser.add_argument("--lambda_routing", type=float, default=0.05)
+    parser.add_argument("--lambda_pair", type=float,
+                        default=getattr(ExperimentConfig, 'lambda_pair', 0.4))
+    parser.add_argument("--lambda_routing", type=float,
+                        default=getattr(ExperimentConfig, 'lambda_routing', 0.01))
     parser.add_argument("--lambda_z", type=float, default=0.0,
                         help="Router z-loss weight (ST-MoE stability, default=0=disabled)")
     parser.add_argument("--lambda_dcl", type=float, default=0.05,
@@ -894,8 +921,9 @@ def main() -> None:
     parser.add_argument("--use_infonce", action="store_true", default=True,
                         help="Use InfoNCE loss instead of ranking margin (default: True)")
     parser.add_argument("--no_infonce", dest="use_infonce", action="store_false")
-    parser.add_argument("--infonce_temperature", type=float, default=0.15,
-                        help="InfoNCE temperature (default: 0.07)")
+    parser.add_argument("--infonce_temperature", type=float,
+                        default=getattr(ExperimentConfig, 'infonce_temperature', 0.10),
+                        help="InfoNCE temperature (default: 0.10)")
     # Real data
     parser.add_argument("--real_pairs", type=str, default=None,
                         help="Path to real_pairs.json for training on real cross-domain pairs")
@@ -986,7 +1014,6 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.config is not None:
-        from src.training.experiment_config import ExperimentConfig
         exp = ExperimentConfig.from_json(args.config)
         for key, val in exp.to_dict().items():
             if hasattr(args, key) and key != "config":

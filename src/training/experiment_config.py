@@ -57,7 +57,7 @@ class ExperimentConfig:
     lambda_iso: float = 0.0  # DISABLED: conflicted with pair_loss. Try 0.005 max for A/B test.
     lambda_pair: float = 0.4  # InfoNCE contrastive (optimal from best-score run)
     lambda_sts: float = 0.0  # DISABLED: duplicated InfoNCE. Try 0.01-0.02 for A/B test.
-    lambda_routing: float = 0.05
+    lambda_routing: float = 0.01  # MoE load balance (reduced: routing loss normalized by log(E))
     lambda_memory: float = 0.05  # memory regularization (EMA stability)
     lambda_dcl: float = 0.05  # DCL loss — decorrelation (Yeh et al. 2022)
     lambda_uniformity: float = 0.02  # uniformity on hypersphere (Wang & Isola 2020)

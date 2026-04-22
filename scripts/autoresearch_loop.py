@@ -30,7 +30,10 @@ from typing import Any, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Canonical score formula — импортируется из gpu_train для согласованности
-from scripts.gpu_train import PRIMARY_SCORE_WEIGHTS, compute_primary_score, check_run_validity
+from scripts import gpu_train as _gpu_train_mod
+PRIMARY_SCORE_WEIGHTS = _gpu_train_mod.PRIMARY_SCORE_WEIGHTS
+compute_primary_score = _gpu_train_mod.compute_primary_score
+check_run_validity = _gpu_train_mod.check_run_validity
 
 # ---------------------------------------------------------------------------
 # Search spaces
@@ -290,8 +293,8 @@ class HDIMAutoResearchLoop:
             "--hidden_dim", str(cfg.get("hidden_dim", 128)),
             "--num_experts", str(cfg.get("num_experts", 4)),
             "--lambda_iso", str(cfg.get("lambda_iso", 0.1)),
-            "--lambda_pair", str(cfg.get("lambda_pair", 0.2)),
-            "--lambda_routing", str(cfg.get("lambda_routing", 0.05)),
+            "--lambda_pair", str(cfg.get("lambda_pair", 0.4)),
+            "--lambda_routing", str(cfg.get("lambda_routing", 0.01)),
             "--lambda_memory", str(cfg.get("lambda_memory", 0.01)),
             "--ranking_margin", str(cfg.get("ranking_margin", 0.3)),
             "--negative_ratio", "0.4",
