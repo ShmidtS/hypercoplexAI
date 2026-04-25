@@ -585,7 +585,7 @@ class SemanticMemory(nn.Module):
                 self.proto_age[align_idx] = 0
                 updated = (self.ema_momentum * self.prototypes[align_idx]
                            + (1 - self.ema_momentum) * centroids[align_idx])
-                self.prototypes[align_idx].copy_(F.normalize(updated, dim=-1))
+                self.prototypes.index_copy_(0, align_idx, F.normalize(updated, dim=-1))
 
     def _activation_spreading(self, attn: torch.Tensor, p_norm: torch.Tensor) -> torch.Tensor:
         """S3.2: NARS-inspired activation spreading.

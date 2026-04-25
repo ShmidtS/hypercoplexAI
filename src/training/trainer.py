@@ -376,22 +376,27 @@ class HDIMTrainer:
         pair_domain_id: torch.Tensor,
     ) -> torch.Tensor:
         batch_size = pair_group_id.shape[0]
-        batch_indices = torch.arange(batch_size, device=self.device)
-        negative_indices = torch.full(
-            (batch_size,), -1, dtype=torch.long, device=self.device
-        )
-        for idx in range(batch_size):
-            valid_candidates = batch_indices[pair_group_id != pair_group_id[idx]]
-            if valid_candidates.numel() == 0:
-                continue
-            cross_domain_candidates = valid_candidates[
-                pair_domain_id[valid_candidates] != domain_id[idx]
-            ]
-            negative_indices[idx] = (
-                cross_domain_candidates[0]
-                if cross_domain_candidates.numel() > 0
-                else valid_candidates[0]
-            )
+        # (B, B) mask: True where candidate j is from a different group than anchor i
+        diff_group = pair_group_id.unsqueeze(0) != pair_group_id.unsqueeze(1)  # (B, B)
+        # (B, B) mask: True where candidate j's pair_domain differs from anchor i's domain
+        cross_domain = pair_domain_id.unsqueeze(0) != domain_id.unsqueeze(1)  # (B, B)
+        # Prefer cross-domain negatives; fall back to any different-group negative
+        valid_cross = diff_group & cross_domain  # (B, B)
+        # For rows with no cross-domain candidate, fall back to diff_group only
+        has_cross = valid_cross.any(dim=1)  # (B,)
+        valid_mask = torch.where(
+            has_cross.unsqueeze(1), valid_cross, diff_group
+        )  # (B, B)
+        # Set invalid entries to -1 so argmax picks the first valid candidate
+        # We want the *first* valid candidate per row, so build a ranking where
+        # valid positions get their column index and invalid ones get batch_size
+        col_indices = torch.arange(batch_size, device=self.device).unsqueeze(0).expand(batch_size, -1)  # (B, B)
+        # For invalid entries, set a large value so argmin won't pick them
+        ranked = torch.where(valid_mask, col_indices.float(), float(batch_size))
+        negative_indices = ranked.argmin(dim=1)  # (B,)
+        # Mark rows with no valid candidate at all
+        no_valid = ~valid_mask.any(dim=1)
+        negative_indices[no_valid] = -1
         return negative_indices
     def set_epoch(self, epoch: int) -> None:
         """Set current epoch for temperature scheduling.
@@ -645,7 +650,7 @@ class HDIMTrainer:
             elif positive_mask.sum() > 1:
                 pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
                 sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
-            pos_mask = (pair_relation_label > 0.5)  # (B,)
+            pos_mask = (pair_relation_label > 0.5).to(dev)  # (B,)
             focal_matrix = torch.where(
                 pos_mask.unsqueeze(1),
                 sim_matrix,
@@ -697,7 +702,7 @@ class HDIMTrainer:
         masked_sim = sim_matrix.clone()
         masked_sim.masked_fill_(diag_mask, -torch.finfo(torch.float32).max)
         log_denom = torch.logsumexp(masked_sim, dim=1)  # (B,)
-        pos_mask = (pair_relation_label > 0.5).float()  # (B,)
+        pos_mask = (pair_relation_label > 0.5).to(pair_relation_label.device).float()  # (B,)
         s_pos = (sim_matrix * pos_mask.unsqueeze(1)).sum(dim=1) / pos_mask.unsqueeze(1).sum(dim=1).clamp(min=1)
         loss_per_sample = -(s_pos - log_denom)  # (B,)
         # Apply weights only to positive samples
@@ -1129,7 +1134,7 @@ class HDIMTrainer:
                 # For positive pairs: recon_target = pair_encoding (cross-domain transfer)
                 pair_relation_label = batch.get("pair_relation_label")
                 if pair_relation_label is not None:
-                    pos_mask = (pair_relation_label > 0.5).unsqueeze(-1).expand_as(encoding)
+                    pos_mask = (pair_relation_label > 0.5).to(encoding.device).unsqueeze(-1).expand_as(encoding)
                     recon_target = torch.where(pos_mask, pair_encoding, encoding)
                 else:
                     recon_target = pair_encoding

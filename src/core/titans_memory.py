@@ -166,8 +166,9 @@ class TitansMemoryModule(nn.Module):
         mem_w = self.memory.weight.detach().float().requires_grad_(True)
         # Weighted aggregation: use sum instead of mean to preserve per-token magnitude.
         # mean() loses per-token information; sum() preserves total signal strength.
-        k_agg = k32.sum(0) if k32.dim() > 1 else k32
-        v_agg = v32.sum(0) if v32.dim() > 1 else v32
+        # Flatten all leading dims so both 2D (B, D) and 3D (B, T, D) reduce to (D,).
+        k_agg = k32.reshape(-1, k32.shape[-1]).sum(0) if k32.dim() > 1 else k32
+        v_agg = v32.reshape(-1, v32.shape[-1]).sum(0) if v32.dim() > 1 else v32
         kv_agg = torch.cat([k_agg, v_agg], dim=-1)
         gates = torch.sigmoid(self.gate_proj(kv_agg.to(self.gate_proj[0].weight.dtype)))
         alpha = gates[..., 0].float()
@@ -272,7 +273,7 @@ class TitansMemoryModule(nn.Module):
             elif strategy == 'geometric':
                 # Экспоненциальное затухание — сохраняет паттерны, убирает шум
                 # decay_factor ≈ 0.607 при decay_window=50 (медленное забывание)
-                decay = torch.exp(torch.tensor(-1.0 / max(decay_window, 1.0)).clamp(max=80))
+                decay = torch.exp(torch.tensor(-1.0 / max(decay_window, 1.0)))
                 self.memory.weight.mul_(decay)
                 self.momentum_S.mul_(decay * 0.5)  # momentum затухает быстрее
             elif strategy == 'stabilize':

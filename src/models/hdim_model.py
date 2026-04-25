@@ -302,6 +302,7 @@ class HDIMModel(nn.Module):
             from src.core.hallucination_detector import HallucinationDetector
             self.hallucination_detector = HallucinationDetector(
                 num_experts=config.num_experts or 4,
+                hidden_dim=clifford_dim,
                 risk_threshold=config.hallucination_risk_threshold,
             )
 
@@ -711,9 +712,33 @@ class HDIMModel(nn.Module):
             
             # Update expert hallucination history
             self.hallucination_feedback_loop.update_expert_hallucination_history(
-                current_expert, 
+                current_expert,
                 hallucination_risk > 0.5
             )
+
+            # Wire feedback action to MoE output: boost selected expert, dim others
+            if feedback_action in ("reroute", "full_correction"):
+                _slot_out = torch.cat(all_slot_outputs, dim=0) if all_slot_outputs else None
+                if _slot_out is not None and _slot_out.shape[0] == routing_weights.shape[1]:
+                    _enames = (self.pipeline.moe.expert_names
+                               if hasattr(self.pipeline.moe, 'expert_names')
+                               else [f'expert_{i}' for i in range(self.config.num_experts or 4)])
+                    _sel = feedback_result.selected_expert
+                    if _sel in _enames:
+                        _sel_idx = _enames.index(_sel)
+                        _nexp = len(_enames)
+                        _spe = getattr(self.pipeline.moe, 'slots_per_expert', 1)
+                        _boost = torch.full((_nexp,), 0.5, device=device, dtype=dtype)
+                        _boost[_sel_idx] = 2.0
+                        if _spe > 1:
+                            _boost = _boost.repeat_interleave(_spe)
+                        routing_weights.mul_(_boost.unsqueeze(0))
+                        routing_weights.div_(routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8))
+                        u_route = (routing_weights @ _slot_out).to(dtype=dtype)
+                        _step2 = pipeline.algebra.geometric_product(R_transfer, u_route)
+                        _g_target = pipeline.algebra.geometric_product(_step2, R_transfer_inv)
+                        output[:] = pipeline.decoder(_g_target)
+                        exported_invariant[:] = u_route.to(dtype=dtype)
 
         # Concatenate slot_outputs if available
         slot_outputs_tensor = torch.cat(all_slot_outputs, dim=0) if all_slot_outputs else None

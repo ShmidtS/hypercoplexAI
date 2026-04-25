@@ -85,6 +85,7 @@ def update_global_best(runs_dir: str, current_score: float, run_dir: str) -> Non
     if current_score > best["score"]:
         prev_score = best["score"]
         best = {"score": current_score, "run_dir": run_dir}
+        os.makedirs(os.path.dirname(global_best_path), exist_ok=True)
         tmp_path = global_best_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(best, f, indent=2)

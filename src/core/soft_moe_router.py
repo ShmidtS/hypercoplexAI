@@ -217,8 +217,8 @@ class SoftMoERouter(MoERouter):
 
         output = combine @ slot_outputs  # (T, D)
         # NaN/Inf protection: clamp to prevent overflow, preserve gradients
-        output = torch.nan_to_num(output, nan=0.0, posinf=100.0, neginf=-100.0)
-        output = torch.clamp(output, min=-100.0, max=100.0)
+        output = torch.where(torch.isnan(output), torch.zeros_like(output), output)
+        output = torch.clamp(output, min=-1e4, max=1e4)
 
         # Phase 26: Shared Expert (DeepSeek-V3) — always-on FFN
         if self.shared_experts is not None:

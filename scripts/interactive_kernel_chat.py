@@ -43,8 +43,9 @@ class HDIMKernelChat:
 			num_domains=4,
 			memory_type="titans",
 			top_k=2,
-			clifford_p=3,
+			clifford_p=4,
 			clifford_q=1,
+			clifford_r=0,
 		)
 
 		print("Building HDIM model...")
@@ -167,14 +168,30 @@ class HDIMKernelChat:
 		else:
 			hidden_dim = 768
 
+		# Auto-detect clifford signature from rotor dimensions
+		rotor_key = None
+		for prefix in ["pipeline.domain_rotors.domain_0.R", "pipeline.domain_encoder.domain_rotors.domain_0.R"]:
+			if prefix in checkpoint["model_state_dict"]:
+				rotor_key = prefix
+				break
+		if rotor_key is not None:
+			clifford_dim = checkpoint["model_state_dict"][rotor_key].shape[0]
+			import math as _math
+			n_gen = int(_math.log2(clifford_dim))
+			clifford_p, clifford_q, clifford_r = n_gen - 1, 1, 0
+			print(f"Detected Cl({clifford_p},{clifford_q},{clifford_r}) dim={clifford_dim} from checkpoint")
+		else:
+			clifford_p, clifford_q, clifford_r = 3, 1, 0
+
 		config = HDIMConfig(
 			hidden_dim=hidden_dim,
 			num_experts=4,
 			num_domains=4,
 			memory_type="titans",
 			top_k=2,
-			clifford_p=3,
-			clifford_q=1,
+			clifford_p=clifford_p,
+			clifford_q=clifford_q,
+			clifford_r=clifford_r,
 		)
 
 		model = build_sbert_hdim_model(config, soft_router=True)
@@ -185,7 +202,10 @@ class HDIMKernelChat:
 			ortho_loss_weight=0.01,
 		)
 		print("Loading weights...")
-		model.load_state_dict(checkpoint["model_state_dict"])
+		sd = checkpoint["model_state_dict"]
+		if not any(k.startswith("core_model.") for k in sd.keys()):
+			sd = {"core_model." + k if not k.startswith("text_encoder.") and not k.startswith("_log_temp") else k: v for k, v in sd.items()}
+		model.load_state_dict(sd, strict=False)
 		self.config = config
 		return model
 

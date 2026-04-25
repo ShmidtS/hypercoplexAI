@@ -182,7 +182,7 @@ def quadForm {sig : CliffordSignature}
     Precondition: h ≠ 0 (quadForm ≠ 0) prevents division by zero. -/
 def sandwich {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
-    (R x : Multivector sig) (h : quadForm R ≠ 0.0) : Multivector sig :=
+    (R x : Multivector sig) (_h : quadForm R ≠ 0.0) : Multivector sig :=
   let inv_scale := 1.0 / quadForm R
   let R_inv : Multivector sig := fun i => HasReverse.reverse R i * inv_scale
   geom_prod (geom_prod R x) R_inv
@@ -211,9 +211,8 @@ theorem sandwich_norm_preservation {sig : CliffordSignature}
     cliffordNorm (sandwich R x h_nonzero) = cliffordNorm x := by
   sorry
 
-/-- If cliffordNorm R = 1 then quadForm R ≠ 0
-    (since |quadForm R| = (cliffordNorm R)² = 1) -/
-lemma quadForm_nonzero_of_unit {sig : CliffordSignature}
+/-- If cliffordNorm R = 1 then quadForm R ≠ 0. -/
+theorem quadForm_nonzero_of_unit {sig : CliffordSignature}
     [CliffordAlgebra sig] [HasReverse (Multivector sig)]
     (R : Multivector sig) (h_unit : cliffordNorm R = 1.0) :
     quadForm R ≠ 0.0 := by sorry

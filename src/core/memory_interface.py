@@ -89,7 +89,7 @@ class TitansAdapter(MemoryInterface):
             nn.ReLU(),
             nn.Linear(clifford_dim // 4, 1),
         )
-        self.register_buffer("_last_loss", torch.tensor(float("inf")))
+        self.register_buffer("_last_loss", torch.tensor(0.0))
 
     def forward(
         self,

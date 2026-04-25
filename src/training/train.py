@@ -281,7 +281,7 @@ def main() -> None:
 
     cfg = _build_config(args)
     model = _build_model(cfg, args)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     trainer = _build_trainer(model, optimizer, args)
 
     dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
@@ -299,6 +299,16 @@ def main() -> None:
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = args.epochs * steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr * 3,
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy="cos",
+    )
+
     val_metrics: dict | None = None
     for epoch in range(args.epochs):
         trainer.set_epoch(epoch + 1)
@@ -306,6 +316,7 @@ def main() -> None:
         for batch in train_loader:
             loss = trainer.train_step(batch)
             total_loss += loss.item()
+            scheduler.step()
         avg_loss = total_loss / len(train_loader)
         val_metrics = trainer.validate(val_loader)
         print(
