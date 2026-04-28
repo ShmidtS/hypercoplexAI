@@ -46,7 +46,7 @@ class ExperimentConfig:
     # ------------------------------------------------------------------ #
     # Phase-2 model hyper-parameters
     # ------------------------------------------------------------------ #
-    hidden_dim: int = 128
+    hidden_dim: int = 64
     num_experts: Optional[int] = None  # None -> from expert_names or default
     expert_names: Optional[list] = None  # Dynamic expert names
     num_domains: int = 4

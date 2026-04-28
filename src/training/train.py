@@ -18,6 +18,7 @@ from src.training.dataset import (
     create_group_aware_split,
     create_paired_demo_dataset,
 )
+from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
 from src.training.experiment_config import ExperimentConfig
 from src.training.results_logger import append_ledger_row
 from src.training.trainer import HDIMTrainer
@@ -80,37 +81,37 @@ def _apply_experiment_defaults(
     args.trainer_override.extend(
         f"{key}={value}" for key, value in experiment.trainer_overrides.items()
     )
+    trainer_override_keys = {
+        item.split("=", 1)[0] for item in args.trainer_override if "=" in item
+    }
+    for key in (
+        "lambda_pair",
+        "lambda_routing",
+        "lambda_memory",
+        "lambda_dcl",
+        "lambda_uniformity",
+        "lambda_matryoshka",
+    ):
+        if key not in trainer_override_keys:
+            args.trainer_override.append(f"{key}={getattr(experiment, key)}")
 
     # Phase-2 advanced component flags from manifest
     if experiment.soft_router:
         args.soft_router = True
 
-    # Phase-2 HDIMConfig overrides from manifest (only when not already
-    # present as explicit CLI args -- we check for non-default values).
-    if experiment.hidden_dim != 128:   # non-default -> forward as model_override
-        args.model_override.append(f"hidden_dim={experiment.hidden_dim}")
-    if experiment.num_experts is not None and experiment.num_experts != 4:
-        args.model_override.append(f"num_experts={experiment.num_experts}")
-    if experiment.expert_names is not None:
-        args.model_override.append(f"expert_names={experiment.expert_names}")
-
     return args
 
 
-def _build_config(args: argparse.Namespace) -> HDIMConfig:
-    cfg = HDIMConfig()
-    # Apply hidden_dim / num_experts from CLI flags first (take precedence
-    # over model_override strings for these two well-known knobs).
+def _build_config(args: argparse.Namespace, experiment: ExperimentConfig | None = None) -> HDIMConfig:
+    cfg_kwargs = experiment.to_hdim_config_kwargs() if experiment is not None else {}
     if getattr(args, "hidden_dim", None) is not None:
-        cfg.hidden_dim = args.hidden_dim
+        cfg_kwargs["hidden_dim"] = args.hidden_dim
     if getattr(args, "num_experts", None) is not None:
-        cfg.num_experts = args.num_experts
+        cfg_kwargs.pop("expert_names", None)
+        cfg_kwargs["num_experts"] = args.num_experts
 
-    for key, value in _parse_overrides(args.model_override).items():
-        if not hasattr(cfg, key):
-            raise ValueError(f"Unknown model override: {key}")
-        setattr(cfg, key, value)
-    return cfg
+    cfg_kwargs.update(_parse_overrides(args.model_override))
+    return HDIMConfig(**cfg_kwargs)
 
 
 def _build_model(
@@ -257,6 +258,18 @@ def main() -> None:
         "--ledger_path", type=Path, default=None,
         help="Optional JSONL ledger path for keep/discard style logging.",
     )
+    parser.add_argument(
+        "--resume", type=Path, default=None,
+        help="Optional checkpoint path to resume from.",
+    )
+    parser.add_argument(
+        "--real_pairs_json", type=Path, default=None,
+        help="Optional real pairs JSON dataset path.",
+    )
+    parser.add_argument(
+        "--amp", action="store_true",
+        help="Enable CUDA automatic mixed precision training.",
+    )
 
     # ------------------------------------------------------------------ #
     # Phase-2 advanced component flags                                    #
@@ -279,23 +292,34 @@ def main() -> None:
     experiment = _load_experiment_config(args.config)
     args = _apply_experiment_defaults(args, experiment)
 
-    cfg = _build_config(args)
+    cfg = _build_config(args, experiment)
     model = _build_model(cfg, args)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     trainer = _build_trainer(model, optimizer, args)
 
-    dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
-    dataset_kwargs: dict[str, Any] = {
-        "n_samples": args.num_samples,
-        "embed_dim": cfg.hidden_dim,
-        "seed": args.seed,
-    }
-    if args.use_pairs:
-        dataset_kwargs["negative_ratio"] = args.negative_ratio
-    dataset = dataset_factory(**dataset_kwargs)
-    train_ds, val_ds = create_group_aware_split(
-        dataset, train_fraction=args.train_fraction, seed=args.seed
-    )
+    if args.real_pairs_json is not None:
+        dataset = load_real_pairs_dataset(
+            args.real_pairs_json,
+            seed=args.seed,
+            add_negatives=True,
+            negative_ratio=args.negative_ratio,
+        )
+        train_ds, val_ds = split_real_pairs(
+            dataset, train_fraction=args.train_fraction, seed=args.seed
+        )
+    else:
+        dataset_factory = create_paired_demo_dataset if args.use_pairs else create_demo_dataset
+        dataset_kwargs: dict[str, Any] = {
+            "n_samples": args.num_samples,
+            "embed_dim": cfg.hidden_dim,
+            "seed": args.seed,
+        }
+        if args.use_pairs:
+            dataset_kwargs["negative_ratio"] = args.negative_ratio
+        dataset = dataset_factory(**dataset_kwargs)
+        train_ds, val_ds = create_group_aware_split(
+            dataset, train_fraction=args.train_fraction, seed=args.seed
+        )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
@@ -308,13 +332,16 @@ def main() -> None:
         pct_start=0.1,
         anneal_strategy="cos",
     )
+    scaler = torch.amp.GradScaler("cuda") if args.amp and torch.cuda.is_available() else None
+    if args.resume is not None:
+        trainer.load_checkpoint(str(args.resume), scaler=scaler, scheduler=scheduler)
 
     val_metrics: dict | None = None
     for epoch in range(args.epochs):
         trainer.set_epoch(epoch + 1)
         total_loss = 0.0
         for batch in train_loader:
-            loss = trainer.train_step(batch)
+            loss = trainer.train_step(batch, scaler=scaler)
             total_loss += loss.item()
             scheduler.step()
         avg_loss = total_loss / len(train_loader)
@@ -341,7 +368,7 @@ def main() -> None:
     run_id = _resolve_run_id(experiment)
     checkpoint_path = _resolve_checkpoint_path(args, experiment, run_id)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    trainer.save_checkpoint(str(checkpoint_path))
+    trainer.save_checkpoint(str(checkpoint_path), scaler=scaler, scheduler=scheduler)
 
     config_hash = experiment.config_hash() if experiment is not None else None
     status = "keep"

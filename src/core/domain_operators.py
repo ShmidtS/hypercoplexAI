@@ -40,26 +40,36 @@ class DomainRotationOperator(nn.Module):
         super().__init__()
         self.algebra = algebra
         self.domain_name = domain_name
-        self.R = nn.Parameter(torch.zeros(algebra.dim))
-        if init_identity:
-            self.R.data[0] = 1.0
+        bivector_indices = [i for i in range(algebra.dim) if i.bit_count() == 2]
+        self.register_buffer("bivector_indices", torch.tensor(bivector_indices, dtype=torch.long))
+        self.R = nn.Parameter(torch.zeros(len(bivector_indices)))
+
+    def _bivector(self) -> torch.Tensor:
+        B = torch.zeros(self.algebra.dim, dtype=self.R.dtype, device=self.R.device)
+        B.scatter_(0, self.bivector_indices.to(device=self.R.device), self.R)
+        return B
 
     def _normalized_R(self) -> torch.Tensor:
-        """Нормализация R → R/||R|| (epsilon только для защиты от ||R||=0).
-        Результат: ||_normalized_R()|| ≈ 1."""
-        norm = self.algebra.norm(self.R)
-        return self.R / (norm + 1e-8)
+        """Construct unit rotor R = exp(-B/2) from trainable bivector B."""
+        B = -0.5 * self._bivector()
+        B_sq = self.algebra.geometric_product(B, B)[..., 0]
+        B_norm = torch.sqrt(torch.clamp(B_sq.abs(), min=1e-12))
+        sin_over_norm = torch.where(
+            B_norm > 1e-6,
+            torch.sin(B_norm) / B_norm,
+            1.0 - (B_norm * B_norm) / 6.0,
+        )
+        R = sin_over_norm * B
+        R = R.clone()
+        R[0] = torch.cos(B_norm)
+        R_rev = self.algebra.reverse(R)
+        quad_form = self.algebra.geometric_product(R, R_rev)[..., 0]
+        norm = torch.sqrt(torch.clamp(quad_form.abs(), min=1e-12))
+        return R / norm
 
     def get_inverse(self) -> torch.Tensor:
-        """Обратный ротор: R⁻¹ = ~R / <R*~R>_0.
-        Использует скалярную часть геометрического произведения R*~R
-        напрямую (с сохранением знака), а не norm()², которая теряет
-        знак для timelike-роторов в Cl(p,q) с q>0."""
-        eps = 1e-8
-        R_n = self._normalized_R()
-        R_rev = self.algebra.reverse(R_n)
-        quad_form = self.algebra.geometric_product(R_n, R_rev)[..., 0]
-        return R_rev / (quad_form + eps)
+        """Обратный ротор для unit rotor: R⁻¹ = ~R."""
+        return self.algebra.reverse(self._normalized_R())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # unit=False: epsilon для численной стабильности под AMP (fp16 optimizer

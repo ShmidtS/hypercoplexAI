@@ -262,7 +262,8 @@ class TestGradientFlow:
 
         x = torch.randn(4, 64, requires_grad=True)
         out = mem(x)
-        loss = out.sum()
+        weights = torch.linspace(0.1, 1.0, out.numel(), device=out.device, dtype=out.dtype).view_as(out)
+        loss = (out * weights).sum()
         loss.backward()
 
         has_grad = any(

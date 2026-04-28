@@ -1307,7 +1307,10 @@ class HDIMTrainer:
         """
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        losses = self._compute_batch_losses(batch)
+        with torch.amp.autocast(
+            "cuda", enabled=scaler is not None and self.device.type == "cuda"
+        ):
+            losses = self._compute_batch_losses(batch)
         if losses.get("_nan_skip"):
             self.optimizer.zero_grad(set_to_none=True)
             return losses["loss_total"]
@@ -1402,7 +1405,7 @@ class HDIMTrainer:
             for key in totals:
                 totals[key] /= n_batches
         return totals
-    def save_checkpoint(self, path: str, scaler=None) -> None:
+    def save_checkpoint(self, path: str, scaler=None, scheduler=None) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         checkpoint = {
             "step": self._step,
@@ -1422,6 +1425,8 @@ class HDIMTrainer:
 
         if scaler is not None:
             checkpoint["scaler_state_dict"] = scaler.state_dict()
+        if scheduler is not None:
+            checkpoint["scheduler_state_dict"] = scheduler.state_dict()
         tmp_path = path + ".tmp"
         torch.save(checkpoint, tmp_path)
         os.replace(tmp_path, path)
@@ -1444,7 +1449,7 @@ class HDIMTrainer:
             ) from exc
         return ckpt
 
-    def load_checkpoint(self, path: str, scaler=None) -> None:
+    def load_checkpoint(self, path: str, scaler=None, scheduler=None) -> None:
         checkpoint = self._load_checkpoint_safe(path)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -1463,3 +1468,5 @@ class HDIMTrainer:
 
         if scaler is not None and "scaler_state_dict" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])

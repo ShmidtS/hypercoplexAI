@@ -14,6 +14,7 @@
  - TransferEngine: инкапсулирует MoE routing + decoder + sandwich_transfer
 """
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -109,6 +110,17 @@ class HDIMPipeline(nn.Module):
         elif num_experts is None:
             num_experts = 4
 
+        valid_memory_types = ("titans", "hippocampus", "neocortex", "cls", "hbma", "msa", "prototype")
+        if memory_type == "hippocampus":
+            logging.warning("memory_type='hippocampus' is an alias for 'hbma'.")
+            memory_type = "hbma"
+        elif memory_type == "neocortex":
+            logging.warning("memory_type='neocortex' is an alias for 'cls'.")
+            memory_type = "cls"
+        elif memory_type not in valid_memory_types:
+            raise ValueError(
+                f"Unsupported memory_type {memory_type!r}. Valid memory types: {list(valid_memory_types)}"
+            )
         self.memory_type = memory_type
 
         # === Component 1: DomainEncoder ===

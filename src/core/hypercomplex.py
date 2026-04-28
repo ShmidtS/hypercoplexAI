@@ -120,13 +120,14 @@ class CliffordAlgebra(nn.Module):
         self.register_buffer('cayley_signs', signs)    # (D, D)
         self.register_buffer('cayley_indices', indices)  # (D, D)
 
-    def geometric_product(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    def geometric_product(self, a: torch.Tensor, b: torch.Tensor, *, safe: bool = False) -> torch.Tensor:
         """
         Геометрическое произведение двух мультивекторов.
 
         Args:
             a: (..., dim) — мультивектор
             b: (..., dim) — мультивектор
+            safe: если True, применяет nan_to_num и clamp к результату
         Returns:
             result: (..., dim)
 
@@ -162,9 +163,9 @@ class CliffordAlgebra(nn.Module):
         flat_weighted = weighted.reshape(*a.shape[:-1], D * D)
         flat_indices = indices.reshape(D * D)
         result.scatter_add_(-1, flat_indices.expand(*a.shape[:-1], D * D), flat_weighted)
-        # nan_to_num prevents NaN propagation; clamp prevents gradient explosion
-        result = torch.where(torch.isnan(result), torch.zeros_like(result), result)
-        result = torch.clamp(result, min=-1e8, max=1e8)
+        if safe:
+            result = torch.nan_to_num(result, nan=0.0, posinf=1e8, neginf=-1e8)
+            result = torch.clamp(result, min=-1e8, max=1e8)
 
         # Learnable metric scaling (CliffordNet, 2026) — Phase 22
         if self.use_learnable_metric:
@@ -293,11 +294,25 @@ class CliffordAlgebra(nn.Module):
         unit=False: epsilon 1e-8 добавляется для численной стабильности.
           Для обучаемых/ненормализованных роторов, <R*~R>_0 может быть ≈0.
         """
+        odd_mask = self._involute_signs.to(device=R.device) < 0
+        if torch.any(R[..., odd_mask].abs() > 1e-6):
+            import warnings
+            warnings.warn(
+                "sandwich() expected an even-grade rotor (scalar+bivector+...), got odd-grade components",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         R_rev = self.reverse(R)
         R_R_rev = self.geometric_product(R, R_rev)
         quad_form = R_R_rev[..., 0:1]  # <R * ~R>_0, shape (..., 1)
-        eps = 0.0 if unit else 1e-8
-        R_inv = R_rev / (quad_form + eps)
+        if unit:
+            denom = quad_form
+        else:
+            eps = torch.as_tensor(1e-8, dtype=quad_form.dtype, device=quad_form.device)
+            denom = torch.sign(quad_form) * torch.clamp(quad_form.abs(), min=eps)
+            denom = torch.where(quad_form == 0, eps, denom)
+        R_inv = R_rev / denom
         Rx = self.geometric_product(R, x)
         result = self.geometric_product(Rx, R_inv)
         return result

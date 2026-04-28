@@ -188,6 +188,8 @@ def compute_num_experts(
     """
     if expert_names is not None:
         computed = len(expert_names)
+        if computed < 1:
+            raise ValueError("expert_names must contain at least one expert")
         if explicit_num is not None and explicit_num != computed:
             raise ValueError(
                 f"num_experts={explicit_num} conflicts with "
@@ -240,7 +242,12 @@ def get_encoder_dim(
             f"For custom encoders, set encoder_type='custom' and specify hidden_dim explicitly."
         )
     
-    return DEFAULT_ENCODER_DIMS.get(encoder_type, 768)
+    if encoder_type not in DEFAULT_ENCODER_DIMS:
+        raise ValueError(
+            f"Unknown encoder_type '{encoder_type}'. "
+            f"Known encoder types: {sorted(DEFAULT_ENCODER_DIMS.keys())}."
+        )
+    return DEFAULT_ENCODER_DIMS[encoder_type]
 
 
 def validate_quaternion_dim(dim: int, context: str = "hidden_dim") -> List[str]:
@@ -428,7 +435,7 @@ class AutoConfig:
         # For encoders like ModernBERT (768), clifford_dim can be smaller - this is OK
         # Only warn if hidden_dim > clifford_dim * 16 (very aggressive projection)
         if self._hidden_dim_resolved > self.clifford_dim * 16:
-            recommended_n = max(4, int(math.log2(self._hidden_dim_resolved)))
+            recommended_n = max(4, math.ceil(math.log2(self._hidden_dim_resolved / 16)))
             errors.append(
                 f"hidden_dim={self._hidden_dim_resolved} >> clifford_dim={self.clifford_dim}: "
                 "aggressive projection may lose information. "

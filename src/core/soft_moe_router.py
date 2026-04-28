@@ -160,10 +160,9 @@ class SoftMoERouter(MoERouter):
             z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
 
         T = x.shape[0]
-        # C1 FIX: guard for T=1 — dim=0 softmax with single row returns all-ones
-        # For T=1, dispatch should be uniform over slots: each slot gets equal weight
+        # C1 FIX: guard for T=1 — each slot receives the only token with weight 1
         if T == 1:
-            dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype) / self.num_slots
+            dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype)
         else:
             # dispatch: нормализация по токенам (каждый слот получает mix токенов)
             dispatch = F.softmax(logits.float(), dim=0).to(logits.dtype)   # (T, num_slots)
@@ -229,7 +228,7 @@ class SoftMoERouter(MoERouter):
             output = output + shared_out
 
         combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
-        expert_weights = combine_reshaped.mean(-1)  # (T, E) — computed once
+        expert_weights = combine_reshaped.sum(-1)  # (T, E) — computed once
 
         # Update EMA train scores (для R3 совместимости)
         if self.training:

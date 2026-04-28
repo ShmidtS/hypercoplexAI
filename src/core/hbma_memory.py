@@ -203,11 +203,12 @@ class WorkingMemory(nn.Module):
         v = self.v_proj(buf_snap)                    # [N, D]
 
         # Attention
-        scale = math.sqrt(self.hidden_dim)
-        sim   = (F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).T) / max(scale, 1e-8)  # [B, N]
+        sim   = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).T  # [B, N]
         sal   = self._salience.score(sim, age_snap, freq_snap, imp_snap,
                                      type_weight=1.0)
         attn  = F.softmax(sal.float(), dim=-1).to(sal.dtype)               # [B, N]
+        with torch.no_grad():
+            self.buf_freq[:n].add_(attn.detach().sum(dim=0))
         retrieved = attn @ v                         # [B, D]
 
         combined = torch.cat([x, retrieved], dim=-1)
@@ -320,11 +321,11 @@ class EpisodicMemory(nn.Module):
         if not write_mask.any():
             return
         wr = torch.sigmoid(self.write_rate)
-        # Forgetting: exponential decay of values
+        # Forgetting: per-write exponential decay, not accumulated-age compounding
         self.mem_age += 1
-        decay_rate = self.mem_durability if self.use_per_slot_durability else self.forgetting_rate
-        decay = torch.exp((-decay_rate * self.mem_age).clamp(max=80))
-        self.mem_vals.mul_(decay.unsqueeze(-1))
+        decay_rate = self.mem_durability if self.use_per_slot_durability else torch.as_tensor(self.forgetting_rate, device=self.mem_vals.device)
+        decay = torch.exp(-decay_rate).clamp_min(torch.exp(torch.tensor(-80.0, device=self.mem_vals.device)))
+        self.mem_vals.mul_(decay.unsqueeze(-1) if decay.ndim > 0 else decay)
         # Confidence decay
         self.mem_conf.mul_(0.99)
 
@@ -370,7 +371,7 @@ class EpisodicMemory(nn.Module):
         keys_with_pos = F.normalize(keys_snap + 0.1 * pos_emb, dim=-1)
         query_norm    = F.normalize(query_k, dim=-1)
 
-        sim  = query_norm @ keys_with_pos.T / max(math.sqrt(self.key_dim), 1e-8)  # [B, S]
+        sim  = query_norm @ keys_with_pos.T  # [B, S]
         sal  = self._salience.score(sim, age_snap, age_snap.clamp(min=1),
                                     conf_snap, type_weight=0.8)
         attn = F.softmax(sal.float(), dim=-1).to(sal.dtype)
@@ -398,10 +399,10 @@ class EpisodicMemory(nn.Module):
             with torch.no_grad():
                 matched_slot = attn.detach().argmax(dim=-1)
                 if self.use_per_slot_durability:
-                    # Vectorized durability update via scatter_add_
-                    counts = torch.bincount(matched_slot, minlength=self.num_slots).float()
+                    # Accessed memories become more durable by reducing their forgetting rate.
+                    counts = torch.bincount(matched_slot, minlength=self.num_slots).to(self.mem_durability.dtype)
                     update = counts * 0.005
-                    self.mem_durability.copy_((self.mem_durability + update).clamp(max=0.2))
+                    self.mem_durability.copy_((self.mem_durability - update).clamp(min=0.0, max=0.2))
 
         return out
 

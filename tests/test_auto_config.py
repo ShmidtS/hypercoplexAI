@@ -433,10 +433,9 @@ class TestAutoConfigEdgeCases:
         assert cfg.expert_hidden_dim_resolved == 512
     
     def test_empty_expert_names(self):
-        """Test empty expert_names list."""
-        # Empty list should work (0 experts, though unusual)
-        cfg = AutoConfig(expert_names=[], strict_validation=False)
-        assert cfg.num_experts_resolved == 0
+        """Test empty expert_names list raises ValueError."""
+        with pytest.raises(ValueError, match="at least one expert"):
+            AutoConfig(expert_names=[], strict_validation=False)
     
     def test_very_small_hidden_dim(self):
         """Test minimal hidden dimensions."""

@@ -488,15 +488,14 @@ class MoEKernel(nn.Module):
 
         # Z-loss (ST-MoE): штраф за большие логиты
         if self.z_loss_weight > 0:
-            lse = torch.logsumexp(logits.float(), dim=-1)  # (T,)
-            z_loss = torch.clamp(lse, max=10.0).pow(2).mean()
+            z_loss = torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
         else:
             z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
 
         T = x.shape[0]
         if T == 1:
-            # Граничный случай: единственный токен → равномерный dispatch
-            dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype) / self.num_slots
+            # Граничный случай: единственный токен → каждый слот получает его с весом 1
+            dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype)
         else:
             dispatch = F.softmax(logits.float(), dim=0).to(logits.dtype)  # нормализация по токенам
         # Budget threshold: zero out small dispatch weights, then renormalize
@@ -651,6 +650,8 @@ class MoEKernel(nn.Module):
         for expert in self.experts:
             if not isinstance(expert, MLPExpert) or expert.use_can:
                 return False
+            if getattr(expert, "_pre_norm", False):
+                return False
             if expert.architecture == "bottleneck":
                 return False
 
@@ -752,11 +753,11 @@ class MoEKernel(nn.Module):
         Normalized by log(num_experts) for scale-invariance across expert counts.
         """
         T = combine.shape[0]
-        # (T, E)
-        expert_w = combine.reshape(T, self.num_experts, self.slots_per_expert).mean(-1)
-        f_e = expert_w.mean(0).detach()  # (E,) — stop-gradient
-        mean_usage = expert_w.mean(0)  # (E,) — gradient flows
-        raw_loss = self.num_experts * (f_e * mean_usage).sum()
+        expert_w = combine.reshape(T, self.num_experts, self.slots_per_expert).sum(-1)  # (T, E)
+        routed_expert = expert_w.argmax(dim=-1)
+        f_e = F.one_hot(routed_expert, num_classes=self.num_experts).to(expert_w.dtype).mean(0)
+        p_e = expert_w.mean(0)
+        raw_loss = self.num_experts * (f_e.detach() * p_e).sum()
         norm = math.log(self.num_experts) if self.num_experts > 1 else 1.0
         return raw_loss / norm
 
@@ -863,7 +864,7 @@ class MoEKernel(nn.Module):
 
         # 7. Метрики нагрузки
         combine_reshaped = combine.reshape(T, self.num_experts, self.slots_per_expert)
-        expert_weights_per_token = combine_reshaped.mean(-1)  # (T, E)
+        expert_weights_per_token = combine_reshaped.sum(-1)  # (T, E)
         expert_usage = expert_weights_per_token.mean(0).detach()  # (E,)
         routing_entropy = -(expert_weights_per_token * (expert_weights_per_token + 1e-8).log()).sum(-1).mean()
         # top-k expert indices: (T, top_k) instead of just argmax (T,)

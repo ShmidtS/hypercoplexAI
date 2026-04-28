@@ -74,6 +74,7 @@ class HDIMAuxState:
             "update_memory": self.update_memory,
             "hallucination_risk": self.hallucination_risk,
             "memory_surprise": self.memory_surprise,
+            "feedback_action": self.feedback_action,
             "online_loss": self.online_loss,
             "online_updated": self.online_updated,
         }
@@ -181,6 +182,26 @@ class HDIMConfig:
     msa_diversity_loss_weight: float = 1.0
 
     def __post_init__(self):
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {self.hidden_dim}")
+        if self.num_domains <= 0:
+            raise ValueError(f"num_domains must be > 0, got {self.num_domains}")
+        if not 0 <= self.dropout < 1:
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+        if self.memory_key_dim <= 0:
+            raise ValueError(f"memory_key_dim must be > 0, got {self.memory_key_dim}")
+        valid_memory_types = {"titans", "hippocampus", "neocortex", "cls", "hbma", "msa", "prototype"}
+        if self.memory_type not in valid_memory_types:
+            raise ValueError(
+                f"memory_type must be one of {sorted(valid_memory_types)}, got {self.memory_type!r}"
+            )
+        if self.domain_names is not None and len(self.domain_names) != self.num_domains:
+            raise ValueError(
+                f"len(domain_names)={len(self.domain_names)} must equal num_domains={self.num_domains}"
+            )
+        if self.expert_names is not None and len(set(self.expert_names)) != len(self.expert_names):
+            raise ValueError("expert_names must be unique")
+
         # Backward compat: auto-migrate msa_* fields to msa sub-config
         if self.msa is None:
             self.msa = MSAConfig(
@@ -196,6 +217,10 @@ class HDIMConfig:
                 compression_threshold=self.msa_compression_threshold,
                 diversity_loss_weight=self.msa_diversity_loss_weight,
             )
+        if self.msa.top_k > self.msa.num_prototypes:
+            raise ValueError(
+                f"msa.top_k={self.msa.top_k} must be <= msa.num_prototypes={self.msa.num_prototypes}"
+            )
         # Compute num_experts from expert_names if provided
         if self.expert_names is not None:
             computed = len(self.expert_names)
@@ -207,6 +232,10 @@ class HDIMConfig:
             self.num_experts = computed
         elif self.num_experts is None:
             self.num_experts = 4  # sensible default
+        if self.num_experts <= 0:
+            raise ValueError(f"num_experts must be > 0, got {self.num_experts}")
+        if self.top_k > self.num_experts:
+            raise ValueError(f"top_k={self.top_k} must be <= num_experts={self.num_experts}")
 
     def get_domain_names(self) -> List[str]:
         """Return the resolved list of domain names."""
@@ -777,7 +806,17 @@ class HDIMModel(nn.Module):
     ) -> ForwardResult:
         """Run the HDIM forward pass for same-domain reconstruction batches."""
         x = self.dropout(x)
+        if domain_id.ndim != 1:
+            raise ValueError(f"domain_id must be 1D, got shape {tuple(domain_id.shape)}")
+        if domain_id.numel() != x.shape[0]:
+            raise ValueError(
+                f"domain_id length {domain_id.numel()} must match batch size {x.shape[0]}"
+            )
         domain_id = domain_id.to(device=x.device, dtype=torch.long)
+        if domain_id.numel() > 0 and ((domain_id < 0).any() or (domain_id >= self.config.num_domains).any()):
+            raise IndexError(
+                f"domain_id values must be in [0, {self.config.num_domains})"
+            )
         runtime = self._resolve_runtime_config(
             update_memory=update_memory,
             memory_mode=memory_mode,
@@ -902,12 +941,32 @@ class HDIMModel(nn.Module):
         memory_mode: str = "update",
     ) -> ForwardResult:
         """Run explicit paired transfer for mixed-domain batches."""
+        if source_domain_id.ndim != 1:
+            raise ValueError(f"source_domain_id must be 1D, got shape {tuple(source_domain_id.shape)}")
+        if target_domain_id.ndim != 1:
+            raise ValueError(f"target_domain_id must be 1D, got shape {tuple(target_domain_id.shape)}")
+        if source_domain_id.numel() != source_encoding.shape[0]:
+            raise ValueError(
+                f"source_domain_id length {source_domain_id.numel()} must match batch size {source_encoding.shape[0]}"
+            )
+        if target_domain_id.numel() != source_encoding.shape[0]:
+            raise ValueError(
+                f"target_domain_id length {target_domain_id.numel()} must match batch size {source_encoding.shape[0]}"
+            )
         source_domain_id = source_domain_id.to(
             device=source_encoding.device, dtype=torch.long
         )
         target_domain_id = target_domain_id.to(
             device=source_encoding.device, dtype=torch.long
         )
+        if source_domain_id.numel() > 0 and ((source_domain_id < 0).any() or (source_domain_id >= self.config.num_domains).any()):
+            raise IndexError(
+                f"source_domain_id values must be in [0, {self.config.num_domains})"
+            )
+        if target_domain_id.numel() > 0 and ((target_domain_id < 0).any() or (target_domain_id >= self.config.num_domains).any()):
+            raise IndexError(
+                f"target_domain_id values must be in [0, {self.config.num_domains})"
+            )
         runtime = self._resolve_runtime_config(
             update_memory=update_memory,
             memory_mode=memory_mode,

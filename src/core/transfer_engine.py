@@ -96,6 +96,12 @@ class TransferEngine(nn.Module):
         """Disable gradient checkpointing."""
         self._use_gradient_checkpointing = False
 
+    def _rotor_quality(self, rotor: DomainRotationOperator) -> torch.Tensor:
+        R = rotor._normalized_R()
+        R_rev = rotor.get_inverse()
+        quad = self.algebra.geometric_product(R, R_rev)[..., 0]
+        return (1.0 / (1.0 + (quad.abs() - 1.0).abs())).clamp(0.0, 1.0)
+
     def transfer(
         self,
         u_mem: torch.Tensor,
@@ -127,35 +133,44 @@ class TransferEngine(nn.Module):
         else:
             u_route, router_state = self.moe(u_mem)
 
-        # Sandwich transfer through domain rotors with true structural invariant
-        _, g_target = sandwich_transfer(
-            self.algebra,
-            u_mem,
-            source_rotor,
-            target_rotor,
-        )
+        if g_source is not None:
+            R_src_inv = source_rotor.get_inverse()
+            R_src_n = source_rotor._normalized_R()
+            step = self.algebra.geometric_product(R_src_inv.expand(*g_source.shape), g_source)
+            U_inv = self.algebra.geometric_product(step, R_src_n.expand(*g_source.shape))
+        elif input_is_invariant:
+            U_inv = u_mem
+        else:
+            U_inv, _ = sandwich_transfer(
+                self.algebra,
+                u_mem,
+                source_rotor,
+                target_rotor,
+            )
+
+        R_tgt_n = target_rotor._normalized_R()
+        R_tgt_inv = target_rotor.get_inverse()
+        step = self.algebra.geometric_product(R_tgt_n.expand(*U_inv.shape), U_inv)
+        g_target = self.algebra.geometric_product(step, R_tgt_inv.expand(*U_inv.shape))
 
         # MoE adaptation: residual applied separately after transfer
         moe_delta = u_route - u_mem
-        R_tgt_n = target_rotor._normalized_R()
-        R_tgt_inv = target_rotor.get_inverse()
         step = self.algebra.geometric_product(R_tgt_n.expand(*moe_delta.shape), moe_delta)
         moe_residual = self.algebra.geometric_product(step, R_tgt_inv.expand(*moe_delta.shape))
         g_target = g_target + moe_residual
 
-        # Compute alignment confidence from rotor normalization quality
+        # Compute alignment confidence from Clifford rotor quality
         if hasattr(source_rotor, '_normalized_R') and hasattr(target_rotor, '_normalized_R'):
-            source_norm = source_rotor._normalized_R().norm()
-            target_norm = target_rotor._normalized_R().norm()
-            alignment = (source_norm * target_norm).clamp(0.0, 1.0)
+            alignment = (self._rotor_quality(source_rotor) * self._rotor_quality(target_rotor)).clamp(0.0, 1.0)
         else:
-            alignment = 1.0
+            alignment = torch.tensor(1.0, device=u_mem.device)
 
         # Decode to output
         output = self.decoder(g_target)
 
         router_state = dict(router_state)
         router_state["u_route"] = u_route
+        router_state["u_invariant"] = U_inv
         router_state["g_target"] = g_target
         router_state["alignment"] = alignment
 
@@ -174,14 +189,16 @@ class TransferEngine(nn.Module):
         then project through source_rotor^{-1}.
         """
         inv_rotor = target_rotor.get_inverse()
-        u_source_estimated = self.algebra.sandwich(inv_rotor, u_target, unit=True)
+        U = self.algebra.sandwich(inv_rotor, u_target, unit=True)
+        R_src_n = source_rotor._normalized_R()
+        R_src_inv = source_rotor.get_inverse()
+        step = self.algebra.geometric_product(R_src_n.expand(*U.shape), U)
+        g_source = self.algebra.geometric_product(step, R_src_inv.expand(*U.shape))
 
-        # Compute alignment from inverse rotor quality
-        rotor_norm = self.algebra.norm(inv_rotor)
-        alignment = (1.0 / (1.0 + (rotor_norm - 1.0).abs())).clamp(0.0, 1.0)
+        alignment = (self._rotor_quality(source_rotor) * self._rotor_quality(target_rotor)).clamp(0.0, 1.0)
 
         conf_val = alignment.item() if isinstance(alignment, torch.Tensor) else alignment
-        return u_source_estimated, NarsTruth(freq=1.0, conf=conf_val)
+        return g_source, NarsTruth(freq=1.0, conf=conf_val)
 
     def forward(
         self,

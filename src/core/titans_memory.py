@@ -71,7 +71,7 @@ class TitansMemoryModule(nn.Module):
             nn.Linear(hidden_dim, 3, bias=True),
         )
         nn.init.zeros_(self.gate_proj[2].weight)
-        nn.init.constant_(self.gate_proj[2].bias, 0.5)  # начальные значения ~0.5
+        nn.init.constant_(self.gate_proj[2].bias, 0.0)  # sigmoid(0) = 0.5
 
         # Phase 22: gradient-based surprise + adaptive forgetting
         self.use_gradient_surprise: bool = False
@@ -164,11 +164,9 @@ class TitansMemoryModule(nn.Module):
         # Create fp32 leaf copy of memory weights (detached from main param)
         # TTT inner loop: detach creates a separate leaf tensor for local gradient updates. Gradient still flows through retrieve() path.
         mem_w = self.memory.weight.detach().float().requires_grad_(True)
-        # Weighted aggregation: use sum instead of mean to preserve per-token magnitude.
-        # mean() loses per-token information; sum() preserves total signal strength.
         # Flatten all leading dims so both 2D (B, D) and 3D (B, T, D) reduce to (D,).
-        k_agg = k32.reshape(-1, k32.shape[-1]).sum(0) if k32.dim() > 1 else k32
-        v_agg = v32.reshape(-1, v32.shape[-1]).sum(0) if v32.dim() > 1 else v32
+        k_agg = k32.reshape(-1, k32.shape[-1]).mean(0) if k32.dim() > 1 else k32
+        v_agg = v32.reshape(-1, v32.shape[-1]).mean(0) if v32.dim() > 1 else v32
         kv_agg = torch.cat([k_agg, v_agg], dim=-1)
         gates = torch.sigmoid(self.gate_proj(kv_agg.to(self.gate_proj[0].weight.dtype)))
         alpha = gates[..., 0].float()

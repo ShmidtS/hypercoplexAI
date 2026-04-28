@@ -53,6 +53,21 @@ class CliffordInteractionExpert(nn.Module):
         self.scalar_weight = nn.Parameter(torch.tensor(0.5))
         self.bivector_weight = nn.Parameter(torch.tensor(0.5))
 
+    def _grade_mask(self, grade: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.tensor(
+            [1.0 if i.bit_count() == grade else 0.0 for i in range(self.algebra.dim)],
+            device=device,
+            dtype=dtype,
+        )
+
+    def _pad_to_algebra_dim(self, x: torch.Tensor) -> tuple[torch.Tensor, int]:
+        D = x.shape[-1]
+        remainder = D % self.algebra.dim
+        if remainder == 0:
+            return x, D
+        pad = self.algebra.dim - remainder
+        return F.pad(x, (0, pad)), D
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -82,7 +97,8 @@ class CliffordInteractionExpert(nn.Module):
             bivector = self._wedge_product(x, C)  # (B, T, D)
 
             # Learnable mixing
-            scalar_part = torch.sigmoid(self.scalar_weight) * scalar.unsqueeze(-1)
+            scalar_part = torch.zeros_like(x)
+            scalar_part[..., 0] = torch.sigmoid(self.scalar_weight) * scalar
             bivector_part = torch.sigmoid(self.bivector_weight) * bivector
 
             if self.use_gate:
@@ -106,47 +122,44 @@ class CliffordInteractionExpert(nn.Module):
 
         Handles arbitrary input_dim by processing in chunks of algebra.dim.
         """
-        D = a.shape[-1]
+        a_padded, _ = self._pad_to_algebra_dim(a)
+        b_padded, _ = self._pad_to_algebra_dim(b)
+        D = a_padded.shape[-1]
         alg_dim = self.algebra.dim
         if D == alg_dim:
-            product = self.algebra.geometric_product(a, b)
+            product = self.algebra.geometric_product(a_padded, b_padded)
             return product[..., 0]
-        # Process in chunks of algebra.dim along last dimension
         n_chunks = D // alg_dim
-        if n_chunks == 0:
-            # Fallback: input smaller than algebra dim, use element-wise
-            return (a * b).sum(dim=-1)
-        a_chunks = a[..., :n_chunks * alg_dim].reshape(*a.shape[:-1], n_chunks, alg_dim)
-        b_chunks = b[..., :n_chunks * alg_dim].reshape(*b.shape[:-1], n_chunks, alg_dim)
+        a_chunks = a_padded.reshape(*a.shape[:-1], n_chunks, alg_dim)
+        b_chunks = b_padded.reshape(*b.shape[:-1], n_chunks, alg_dim)
         product = self.algebra.geometric_product(a_chunks, b_chunks)
         scalar_per_chunk = product[..., 0]  # (..., n_chunks)
         return scalar_per_chunk.sum(dim=-1)
 
     def _wedge_product(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Bivector part: a∧b = (a*b - b*a) / 2
+        """Bivector part from vector projections: <(a_1*b_1 - b_1*a_1)/2>_2.
 
-        Uses CliffordAlgebra.geometric_product for the correct
-        anticommutative part of the geometric product.
-
-        Handles arbitrary input_dim by processing in chunks of algebra.dim.
+        Handles arbitrary input_dim by padding to chunks of algebra.dim.
         """
-        D = a.shape[-1]
+        a_padded, original_D = self._pad_to_algebra_dim(a)
+        b_padded, _ = self._pad_to_algebra_dim(b)
+        D = a_padded.shape[-1]
         alg_dim = self.algebra.dim
+        vector_mask = self._grade_mask(1, device=a.device, dtype=a_padded.dtype)
+        bivector_mask = self._grade_mask(2, device=a.device, dtype=a_padded.dtype)
         if D == alg_dim:
-            ab = self.algebra.geometric_product(a, b)
-            ba = self.algebra.geometric_product(b, a)
-            return (ab - ba) / 2
-        # Process in chunks of algebra.dim along last dimension
+            a_vec = a_padded * vector_mask
+            b_vec = b_padded * vector_mask
+            ab = self.algebra.geometric_product(a_vec, b_vec)
+            ba = self.algebra.geometric_product(b_vec, a_vec)
+            return ((ab - ba) / 2) * bivector_mask
         n_chunks = D // alg_dim
-        if n_chunks == 0:
-            # Fallback: element-wise anticommutative part (will be 0 for commutative)
-            return (a * b - b * a) / 2
-        a_chunks = a[..., :n_chunks * alg_dim].reshape(*a.shape[:-1], n_chunks, alg_dim)
-        b_chunks = b[..., :n_chunks * alg_dim].reshape(*b.shape[:-1], n_chunks, alg_dim)
+        a_chunks = a_padded.reshape(*a.shape[:-1], n_chunks, alg_dim) * vector_mask
+        b_chunks = b_padded.reshape(*b.shape[:-1], n_chunks, alg_dim) * vector_mask
         ab = self.algebra.geometric_product(a_chunks, b_chunks)
         ba = self.algebra.geometric_product(b_chunks, a_chunks)
-        wedge_per_chunk = (ab - ba) / 2
-        return wedge_per_chunk.reshape(*a.shape[:-1], n_chunks * alg_dim)
+        wedge_per_chunk = ((ab - ba) / 2) * bivector_mask
+        return wedge_per_chunk.reshape(*a.shape[:-1], n_chunks * alg_dim)[..., :original_D]
 
 
 class CliffordFFN(nn.Module):
@@ -249,6 +262,15 @@ class CliffordInteractionLayer(nn.Module):
 
         # Gate for combining original and interaction output
         self.gate_fc = nn.Linear(dim, dim, bias=True)
+
+        self.register_buffer(
+            "vector_mask",
+            torch.tensor([1.0 if i.bit_count() == 1 else 0.0 for i in range(dim)]),
+        )
+        self.register_buffer(
+            "bivector_mask",
+            torch.tensor([1.0 if i.bit_count() == 2 else 0.0 for i in range(dim)]),
+        )
 
         # Global context pooling
         self.global_pool = nn.AdaptiveAvgPool1d(1)
@@ -365,24 +387,29 @@ class CliffordInteractionLayer(nn.Module):
                 # Extract scalar part (grade-0, index 0) and sum over shifts
                 scalar_parts = ab[..., 0:1]  # (num_shifts, B, T, 1)
                 inner_sum = scalar_parts.sum(dim=0)  # (B, T, 1)
-                inner_weighted = torch.sigmoid(self.inner_weight) * inner_sum
+                inner_weighted = torch.zeros_like(x)
+                inner_weighted[..., 0:1] = torch.sigmoid(self.inner_weight) * inner_sum
                 interaction_output = interaction_output + inner_weighted
 
             # Process wedge product if enabled (fully vectorized)
             if self.use_wedge:
                 # Reuse ab from above (already computed)
 
+                x_vec = x * self.vector_mask.to(device=x.device, dtype=x.dtype)
+                C_vec_all = C_all * self.vector_mask.to(device=x.device, dtype=x.dtype)
+                ab = self.clifford.geometric_product_batch(x_vec, C_vec_all)
+
                 # ba: C_all * x for each shift
                 # Reshape for batch processing
-                C_flat = C_all.reshape(-1, T, D)  # (num_shifts * B, T, D)
-                x_repeat = x.unsqueeze(0).expand(len(valid_shifts), -1, -1, -1).reshape(-1, T, D)
+                C_flat = C_vec_all.reshape(-1, T, D)  # (num_shifts * B, T, D)
+                x_repeat = x_vec.unsqueeze(0).expand(len(valid_shifts), -1, -1, -1).reshape(-1, T, D)
 
                 # Compute ba: C_all * x for all
                 ba_flat = self.clifford.geometric_product(C_flat, x_repeat)  # (num_shifts * B, T, D)
                 ba = ba_flat.reshape(len(valid_shifts), B, T, D)  # (num_shifts, B, T, D)
 
-                # Wedge = (ab - ba) / 2
-                wedge_all = (ab - ba) / 2.0  # (num_shifts, B, T, D)
+                # Wedge = grade-2 projection of (ab - ba) / 2
+                wedge_all = ((ab - ba) / 2.0) * self.bivector_mask.to(device=x.device, dtype=ab.dtype)  # (num_shifts, B, T, D)
 
                 # Numerical stability
                 wedge_all = torch.nan_to_num(wedge_all, nan=0.0, posinf=1e3, neginf=-1e3)
@@ -450,13 +477,17 @@ class CliffordInteractionLayer(nn.Module):
             if needs_inner:
                 # Inner product: scalar part <x*C>_0
                 inner = ab[..., 0:1]  # (B, T, 1)
-                inner = torch.sigmoid(self.inner_weight) * inner
-                interaction_output = interaction_output + inner
+                inner_part = torch.zeros_like(x)
+                inner_part[..., 0:1] = torch.sigmoid(self.inner_weight) * inner
+                interaction_output = interaction_output + inner_part
 
             if needs_wedge:
-                # Wedge product: bivector part (x∧C) = (ab - ba) / 2
-                ba = self.clifford.geometric_product(C_local, x)  # (B, T, D)
-                wedge = (ab - ba) / 2.0
+                # Wedge product: grade-2 part of vector-projected exterior product
+                x_vec = x * self.vector_mask.to(device=x.device, dtype=x.dtype)
+                C_vec = C_local * self.vector_mask.to(device=x.device, dtype=x.dtype)
+                ab_vec = self.clifford.geometric_product(x_vec, C_vec)  # (B, T, D)
+                ba = self.clifford.geometric_product(C_vec, x_vec)  # (B, T, D)
+                wedge = ((ab_vec - ba) / 2.0) * self.bivector_mask.to(device=x.device, dtype=ab_vec.dtype)
                 # Numerical stability
                 wedge = torch.nan_to_num(wedge, nan=0.0, posinf=1e3, neginf=-1e3)
                 wedge = torch.clamp(wedge, min=-1e3, max=1e3)
@@ -507,12 +538,13 @@ class CliffordInteractionLayer(nn.Module):
         The wedge product is the antisymmetric part: a∧b = (a*b - b*a) / 2
         This preserves multivector structure unlike element-wise operations.
         """
-        # Geometric products
-        ab = self.clifford.geometric_product(a, b)  # (B, T, D)
-        ba = self.clifford.geometric_product(b, a)  # (B, T, D)
+        a_vec = a * self.vector_mask.to(device=a.device, dtype=a.dtype)
+        b_vec = b * self.vector_mask.to(device=b.device, dtype=b.dtype)
+        ab = self.clifford.geometric_product(a_vec, b_vec)  # (B, T, D)
+        ba = self.clifford.geometric_product(b_vec, a_vec)  # (B, T, D)
 
-        # Anticommutative part (wedge product)
-        wedge = (ab - ba) / 2.0
+        # Grade-2 projection of anticommutative part
+        wedge = ((ab - ba) / 2.0) * self.bivector_mask.to(device=a.device, dtype=ab.dtype)
 
         # Numerical stability
         wedge = torch.nan_to_num(wedge, nan=0.0, posinf=1e3, neginf=-1e3)
