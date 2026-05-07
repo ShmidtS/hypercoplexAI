@@ -59,6 +59,7 @@ class MoEKernelConfig:
     dropout: float = 0.1
     expert_names: Optional[List[str]] = None
     use_can_experts: bool = False  # Использовать CliffordInteractionLayer вместо FFN
+    # Deprecated: auto-dispatch is always enabled; kept for backward compatibility with tests
     use_batched_experts: bool = True
     batched_fallback: bool = True
     expert_homogeneity_check: bool = True  # Batched execution via torch.bmm (requires homogeneous DomainExpert)
@@ -404,6 +405,9 @@ class MoEKernel(nn.Module):
             for i in range(config.num_experts) # type: ignore[arg-type]
         ])
 
+        # Cache batched availability (experts are frozen after init)
+        self._batched_available = self._can_use_batched()
+
         # --- Shared Expert (DeepSeek-V3 стиль) ---
         if config.use_shared_expert:
             self.shared_expert = nn.Sequential(
@@ -446,9 +450,9 @@ class MoEKernel(nn.Module):
         self.ortho_loss_weight = config.ortho_loss_weight
         self.use_expert_ortho = config.use_expert_ortho
 
-        # --- Heterogeneous expert warning ---
-        if config.expert_homogeneity_check and config.use_batched_experts:
-            if not self._can_use_batched():
+        # --- Heterogeneous expert warning (backward-compatible) ---
+        if config.use_batched_experts and config.expert_homogeneity_check:
+            if not self._batched_available:
                 logger.warning(
                     "MoEKernel: use_batched_experts=True but experts are heterogeneous. "
                     "Batched execution requires homogeneous DomainExpert instances. "
@@ -516,23 +520,29 @@ class MoEKernel(nn.Module):
     # ----------------------------------------------------------
 
     def _run_experts(self, slot_inputs: torch.Tensor) -> torch.Tensor:
+        """Auto-dispatch: use batched if enabled and possible, else sequential."""
+        if self.config.use_batched_experts and self._batched_available:
+            start = time.perf_counter_ns()
+            outputs = self._run_experts_batched(slot_inputs)
+            end = time.perf_counter_ns()
+            if self._profiling_enabled:
+                self._batched_time_ns += end - start
+                self._batched_call_count += 1
+            return outputs
+        return self._run_experts_sequential(slot_inputs, profile=True)
+
+    def _run_experts_sequential(self, slot_inputs: torch.Tensor, profile: bool = True) -> torch.Tensor:
         """
-        Запускает каждый эксперт на соответствующих слотах.
+        Запускает каждый эксперт на соответствующих слотах (sequential loop).
 
         Args:
             slot_inputs: (num_slots, D)
+            profile: If True, accumulate profiling counters when enabled.
         Returns:
             slot_outputs: (num_slots, D)
-
-        Performance:
-            Sequential loop over experts. For homogeneous experts (all DomainExpert
-            with same hidden_dim), consider using _run_experts_batched() which
-            achieves ~2-3x speedup via torch.bmm.
-
-            Benchmark (4 experts, slots_per_expert=1, D=128):
-                Sequential: ~0.8ms per forward
-                Batched:    ~0.3ms per forward
         """
+        if profile:
+            t0 = time.perf_counter_ns()
         num_slots = slot_inputs.shape[0]
         D = slot_inputs.shape[1]
         outputs = torch.empty(num_slots, D, device=slot_inputs.device, dtype=slot_inputs.dtype)
@@ -544,6 +554,9 @@ class MoEKernel(nn.Module):
             # Защита от NaN/Inf (±100 — CliffordInteractionLayer с Cl(3,1,0) может выдавать >>10)
             expert_output = torch.nan_to_num(expert_output, nan=0.0)
             outputs[start:end] = expert_output
+        if profile and self._profiling_enabled:
+            self._sequential_time_ns += time.perf_counter_ns() - t0
+            self._sequential_call_count += 1
         return outputs
 
     def _run_experts_batched(self, slot_inputs: torch.Tensor) -> torch.Tensor:
@@ -736,7 +749,7 @@ class MoEKernel(nn.Module):
                 self._batched_call_count += 1
         else:
             start = time.perf_counter_ns()
-            outputs = self._run_experts(slot_inputs)
+            outputs = self._run_experts_sequential(slot_inputs, profile=False)
             end = time.perf_counter_ns()
             if self._profiling_enabled:
                 self._sequential_time_ns += end - start
@@ -839,22 +852,8 @@ class MoEKernel(nn.Module):
         # 2. Агрегация токенов в слоты: X̃ = dispatch^T @ X
         slot_inputs = dispatch.T @ x_flat  # (S, D)
 
-        # 3. Запуск экспертов (batched для homogeneous DomainExpert)
-        use_batched = self.config.use_batched_experts and self._can_use_batched()
-        if use_batched:
-            start = time.perf_counter_ns()
-            slot_outputs = self._run_experts_batched(slot_inputs)
-            end = time.perf_counter_ns()
-            if self._profiling_enabled:
-                self._batched_time_ns += end - start
-                self._batched_call_count += 1
-        else:
-            start = time.perf_counter_ns()
-            slot_outputs = self._run_experts(slot_inputs)
-            end = time.perf_counter_ns()
-            if self._profiling_enabled:
-                self._sequential_time_ns += end - start
-                self._sequential_call_count += 1
+        # 3. Запуск экспертов (auto-dispatch: batched if homogeneous, else sequential)
+        slot_outputs = self._run_experts(slot_inputs)
 
         # 4. Combine: Y = combine @ slot_outputs
         output = combine @ slot_outputs  # (T, D)

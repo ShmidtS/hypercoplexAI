@@ -11,9 +11,12 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional, Sequence
 
 import torch
+
+logger = logging.getLogger(__name__)
 import torch.nn as nn
 
 
@@ -122,13 +125,13 @@ class SBERTEncoder(nn.Module):
 						auto_model = module
 						break
 				if auto_model is None:
-					print("[WARN] Could not find transformer layers in SBERT model, skipping freeze_bottom_frac")
+					logger.warning("Could not find transformer layers in SBERT model, skipping freeze_bottom_frac")
 					return 0
 
 		# Get encoder layers — works for BERT, RoBERTa, MPNet, etc.
 		encoder = getattr(auto_model, 'encoder', None)
 		if encoder is None:
-			print("[WARN] Could not find encoder in auto_model, skipping freeze_bottom_frac")
+			logger.warning("Could not find encoder in auto_model, skipping freeze_bottom_frac")
 			return 0
 
 		layers = getattr(encoder, 'layer', None)
@@ -136,7 +139,7 @@ class SBERTEncoder(nn.Module):
 			# RoBERTa uses 'layer' too, but some models might differ
 			layers = getattr(encoder, 'layers', None)
 			if layers is None:
-				print("[WARN] Could not find encoder layers, skipping freeze_bottom_frac")
+				logger.warning("Could not find encoder layers, skipping freeze_bottom_frac")
 				return 0
 
 		num_layers = len(layers)
@@ -161,7 +164,7 @@ class SBERTEncoder(nn.Module):
 			for param in embeddings.parameters():
 				param.requires_grad = False
 
-		print(f"SBERT freeze_bottom_frac={frac}: froze {frozen_count}/{num_layers} layers + embeddings, unfroze top {unfrozen_count} layers")
+		logger.info("SBERT freeze_bottom_frac=%s: froze %s/%s layers + embeddings, unfroze top %s layers", frac, frozen_count, num_layers, unfrozen_count)
 		return frozen_count
 
 	def _encode_with_sbert(
@@ -301,17 +304,14 @@ class SBERTEncoder(nn.Module):
 
 	def precompute_cache(self, texts: Sequence[str], batch_size: int = 256) -> None:
 		"""Pre-encode all texts with SBERT and store in cache."""
-		import sys
 		if not self._sbert_on_cpu:
 			return
 		# Filter already cached
 		unique_texts = [t for t in set(texts) if t not in self._embedding_cache]
 		if not unique_texts:
-			print(f"SBERT cache: {len(self._embedding_cache)} embeddings (all cached)")
-			sys.stdout.flush()
+			logger.info("SBERT cache: %s embeddings (all cached)", len(self._embedding_cache))
 			return
-		print(f"SBERT cache: encoding {len(unique_texts)} unique texts...")
-		sys.stdout.flush()
+		logger.info("SBERT cache: encoding %s unique texts...", len(unique_texts))
 		with torch.no_grad():
 			embs = self._sbert.encode(
 				unique_texts,
@@ -323,5 +323,4 @@ class SBERTEncoder(nn.Module):
 			)
 		for text, emb in zip(unique_texts, embs):
 			self._embedding_cache[text] = emb.cpu()
-		print(f"SBERT cache: {len(self._embedding_cache)} embeddings precomputed")
-		sys.stdout.flush()
+		logger.info("SBERT cache: %s embeddings precomputed", len(self._embedding_cache))

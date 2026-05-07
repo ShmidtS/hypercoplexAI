@@ -282,6 +282,26 @@ def validate_quaternion_dim(dim: int, context: str = "hidden_dim") -> List[str]:
 
 
 # ============================================================
+# TrainingDefaults dataclass
+# ============================================================
+
+@dataclass(frozen=True)
+class TrainingDefaults:
+    """Single source of truth for training hyperparameter defaults."""
+    epochs: int = 10
+    batch_size: int = 32
+    learning_rate: float = 5e-4
+    seed: int = 42
+    accum_steps: int = 2
+    device: str = "cpu"
+    negative_ratio: float = 0.0
+    train_fraction: float = 0.8
+    description: str = "baseline"
+
+TRAINING_DEFAULTS = TrainingDefaults()
+
+
+# ============================================================
 # AutoConfig dataclass
 # ============================================================
 
@@ -723,4 +743,7 @@ __all__ = [
     "validate_quaternion_dim",
     # Main class
     "AutoConfig",
+    # Training defaults
+    "TrainingDefaults",
+    "TRAINING_DEFAULTS",
 ]

@@ -9,6 +9,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+import sys
 import torch
 from torch.utils.data import DataLoader
 
@@ -22,6 +23,7 @@ from src.training.dataset import (
     create_paired_demo_dataset,
 )
 from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
+from src.core.auto_config import TRAINING_DEFAULTS
 from src.training.experiment_config import ExperimentConfig
 from src.training.results_logger import append_ledger_row
 from src.training.trainer import HDIMTrainer
@@ -226,28 +228,34 @@ def _resolve_checkpoint_path(
 
 
 def main() -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            stream=sys.stdout,
+        )
     parser = argparse.ArgumentParser(description="Train HDIM model")
     parser.add_argument(
         "--config", type=Path, default=None,
         help="Optional experiment manifest JSON path.",
     )
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--epochs", type=int, default=TRAINING_DEFAULTS.epochs)
+    parser.add_argument("--batch_size", type=int, default=TRAINING_DEFAULTS.batch_size)
+    parser.add_argument("--lr", type=float, default=TRAINING_DEFAULTS.learning_rate)
+    parser.add_argument("--device", default=TRAINING_DEFAULTS.device)
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument(
         "--use_pairs", action="store_true",
         help="Use paired cross-domain supervision dataset",
     )
-    parser.add_argument("--negative_ratio", type=float, default=0.0)
-    parser.add_argument("--train_fraction", type=float, default=0.8)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--negative_ratio", type=float, default=TRAINING_DEFAULTS.negative_ratio)
+    parser.add_argument("--train_fraction", type=float, default=TRAINING_DEFAULTS.train_fraction)
+    parser.add_argument("--seed", type=int, default=TRAINING_DEFAULTS.seed)
     parser.add_argument(
         "--text_mode", action="store_true",
         help="Train through TextHDIMModel wrapper",
     )
-    parser.add_argument("--description", default="baseline")
+    parser.add_argument("--description", default=TRAINING_DEFAULTS.description)
     parser.add_argument(
         "--model_override", action="append", default=[],
         help="Model override in key=value format",
@@ -281,7 +289,7 @@ def main() -> None:
         help="Explicitly disable AMP even on CUDA.",
     )
     parser.add_argument(
-        "--accum_steps", type=int, default=2,
+        "--accum_steps", type=int, default=TRAINING_DEFAULTS.accum_steps,
         help="Gradient accumulation steps (effective batch = batch_size * accum_steps).",
     )
     parser.add_argument(
