@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import torch
 from torch.utils.data import DataLoader
@@ -141,6 +144,7 @@ def _build_trainer(
 ) -> HDIMTrainer:
     trainer_kwargs: dict[str, Any] = {
         "device": args.device,
+        "accum_steps": args.accum_steps,
     }
     for key, value in _parse_overrides(args.trainer_override).items():
         trainer_kwargs[key] = value
@@ -185,6 +189,8 @@ def _build_run_summary(
             "text_mode": args.text_mode,
             "description": args.description,
             "soft_router": getattr(args, "soft_router", False),
+            "accum_steps": args.accum_steps,
+            "gradient_checkpointing": args.gradient_checkpointing,
         },
         "validation": val_metrics,
         "quality": quality_metrics,
@@ -226,8 +232,8 @@ def main() -> None:
         help="Optional experiment manifest JSON path.",
     )
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument(
@@ -267,8 +273,20 @@ def main() -> None:
         help="Optional real pairs JSON dataset path.",
     )
     parser.add_argument(
-        "--amp", action="store_true",
-        help="Enable CUDA automatic mixed precision training.",
+        "--amp", action="store_true", default=False,
+        help="Enable CUDA automatic mixed precision training. Auto-enabled on CUDA unless --no_amp is set.",
+    )
+    parser.add_argument(
+        "--no_amp", action="store_true",
+        help="Explicitly disable AMP even on CUDA.",
+    )
+    parser.add_argument(
+        "--accum_steps", type=int, default=2,
+        help="Gradient accumulation steps (effective batch = batch_size * accum_steps).",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing", action="store_true",
+        help="Enable gradient checkpointing to reduce memory at the cost of compute.",
     )
 
     # ------------------------------------------------------------------ #
@@ -288,12 +306,21 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    args.accum_steps = max(1, min(args.accum_steps, 256))
+
+    # Auto-detect AMP: enable on CUDA unless explicitly disabled
+    device = torch.device(args.device)
+    if not args.no_amp and torch.cuda.is_available() and device.type == "cuda":
+        args.amp = True
 
     experiment = _load_experiment_config(args.config)
     args = _apply_experiment_defaults(args, experiment)
 
     cfg = _build_config(args, experiment)
     model = _build_model(cfg, args)
+
+    if args.gradient_checkpointing:
+        model.enable_gradient_checkpointing()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     trainer = _build_trainer(model, optimizer, args)
 
@@ -320,10 +347,25 @@ def main() -> None:
         train_ds, val_ds = create_group_aware_split(
             dataset, train_fraction=args.train_fraction, seed=args.seed
         )
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
+    num_workers = 2 if device.type == "cuda" else 0
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        **({"persistent_workers": True, "prefetch_factor": 2} if num_workers > 0 else {}),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        **({"persistent_workers": True, "prefetch_factor": 2} if num_workers > 0 else {}),
+    )
 
-    steps_per_epoch = max(1, len(train_loader))
+    accum_steps = args.accum_steps
+    steps_per_epoch = max(1, len(train_loader) // accum_steps)
     total_steps = args.epochs * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -340,13 +382,14 @@ def main() -> None:
     for epoch in range(args.epochs):
         trainer.set_epoch(epoch + 1)
         total_loss = 0.0
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             loss = trainer.train_step(batch, scaler=scaler)
             total_loss += loss.item()
-            scheduler.step()
+            if (batch_idx + 1) % accum_steps == 0:
+                scheduler.step()
         avg_loss = total_loss / len(train_loader)
         val_metrics = trainer.validate(val_loader)
-        print(
+        logger.info(
             f"Epoch {epoch + 1}/{args.epochs} "
             f"| train_loss={avg_loss:.4f} "
             f'| val_loss={val_metrics["loss_total"]:.4f}'
@@ -356,7 +399,7 @@ def main() -> None:
         val_metrics = trainer.validate(val_loader)
 
     quality_metrics = compute_all_metrics(model, val_loader)
-    print(
+    logger.info(
         "Quality metrics | "
         f'STS_exported={quality_metrics["STS_exported"]:.4f} | '
         f'STS_training={quality_metrics["STS_training"]:.4f} | '
@@ -387,7 +430,7 @@ def main() -> None:
         args.results_json.write_text(
             json.dumps(run_summary, indent=2), encoding="utf-8"
         )
-        print(f"Wrote run summary to {args.results_json}")
+        logger.info(f"Wrote run summary to {args.results_json}")
         if args.ledger_path is not None:
             append_ledger_row(
                 args.ledger_path,
@@ -402,9 +445,9 @@ def main() -> None:
                     "description": args.description,
                 },
             )
-            print(f"Appended run ledger row to {args.ledger_path}")
+            logger.info(f"Appended run ledger row to {args.ledger_path}")
 
-    print("Training complete.")
+    logger.info("Training complete.")
 
 
 if __name__ == "__main__":

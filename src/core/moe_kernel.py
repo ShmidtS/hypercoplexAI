@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -492,18 +492,22 @@ class MoEKernel(nn.Module):
         else:
             z_loss = torch.zeros((), device=x.device, dtype=x.dtype)
 
+        # Upcast for softmax only when needed (AMP autocast handles upcast internally)
+        if logits.dtype == torch.float16 and not torch.is_autocast_enabled():
+            logits = logits.float()
+
         T = x.shape[0]
         if T == 1:
             # Граничный случай: единственный токен → каждый слот получает его с весом 1
             dispatch = torch.ones(1, self.num_slots, device=x.device, dtype=x.dtype)
         else:
-            dispatch = F.softmax(logits.float(), dim=0).to(logits.dtype)  # нормализация по токенам
+            dispatch = F.softmax(logits, dim=0)  # нормализация по токенам
         # Budget threshold: zero out small dispatch weights, then renormalize
         if self.dispatch_budget_threshold > 0.0:
             mask = (dispatch >= self.dispatch_budget_threshold).float()
             dispatch = dispatch * mask
             dispatch = dispatch / (dispatch.sum(dim=0, keepdim=True) + 1e-8)
-        combine = F.softmax(logits.float(), dim=-1).to(logits.dtype)  # нормализация по слотам
+        combine = F.softmax(logits, dim=-1)  # нормализация по слотам
 
         return dispatch, combine, z_loss
 
@@ -538,8 +542,7 @@ class MoEKernel(nn.Module):
             expert_input = slot_inputs[start:end]  # (slots_per_expert, D)
             expert_output = expert(expert_input)  # (slots_per_expert, D)
             # Защита от NaN/Inf (±100 — CliffordInteractionLayer с Cl(3,1,0) может выдавать >>10)
-            expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=100.0, neginf=-100.0)
-            expert_output = torch.clamp(expert_output, -100.0, 100.0)
+            expert_output = torch.nan_to_num(expert_output, nan=0.0)
             outputs[start:end] = expert_output
         return outputs
 
@@ -631,8 +634,7 @@ class MoEKernel(nn.Module):
         outputs = y.view(E * S, D)
 
         # Protection against NaN/Inf (±100 — CliffordInteractionLayer с Cl(3,1,0) может выдавать >>10)
-        outputs = torch.nan_to_num(outputs, nan=0.0, posinf=100.0, neginf=-100.0)
-        outputs = torch.clamp(outputs, -100.0, 100.0)
+        outputs = torch.nan_to_num(outputs, nan=0.0)
 
         return outputs
 
@@ -839,17 +841,29 @@ class MoEKernel(nn.Module):
 
         # 3. Запуск экспертов (batched для homogeneous DomainExpert)
         use_batched = self.config.use_batched_experts and self._can_use_batched()
-        slot_outputs = self._profile_expert_execution(slot_inputs, use_batched)
+        if use_batched:
+            start = time.perf_counter_ns()
+            slot_outputs = self._run_experts_batched(slot_inputs)
+            end = time.perf_counter_ns()
+            if self._profiling_enabled:
+                self._batched_time_ns += end - start
+                self._batched_call_count += 1
+        else:
+            start = time.perf_counter_ns()
+            slot_outputs = self._run_experts(slot_inputs)
+            end = time.perf_counter_ns()
+            if self._profiling_enabled:
+                self._sequential_time_ns += end - start
+                self._sequential_call_count += 1
 
         # 4. Combine: Y = combine @ slot_outputs
         output = combine @ slot_outputs  # (T, D)
-        output = torch.nan_to_num(output, nan=0.0, posinf=100.0, neginf=-100.0)
-        output = torch.clamp(output, -100.0, 100.0)
+        output = torch.nan_to_num(output, nan=0.0)
 
         # 5. Shared Expert residual
         if self.shared_expert is not None:
             shared_out = self.shared_expert(x_flat)
-            shared_out = torch.nan_to_num(shared_out, nan=0.0, posinf=100.0, neginf=-100.0)
+            shared_out = torch.nan_to_num(shared_out, nan=0.0)
             output = output + shared_out
 
         # 6. Лоссы
@@ -894,7 +908,7 @@ class MoEKernel(nn.Module):
             combine_weights=combine.reshape(*orig_shape[:-1], self.num_slots),
             expert_names=self.expert_names,
             top_expert_idx=top_expert_idx.reshape(*orig_shape[:-1], _top_k),
-            expert_reliability=self.expert_accuracy.clone(),
+            expert_reliability=self.expert_accuracy.detach(),
  slot_outputs=slot_outputs,
         )
         return output.reshape(orig_shape), state

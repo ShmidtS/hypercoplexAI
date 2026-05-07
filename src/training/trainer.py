@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
+import logging
 import math
 import os
 import pickle
+
+logger = logging.getLogger(__name__)
 from typing import Any, Dict, Literal, Sequence, Tuple
 import torch
 import torch.nn as nn
@@ -28,7 +31,6 @@ class HDIMTrainer:
         model: HDIMModel,
         optimizer: Optimizer,
         device: str | torch.device = "cpu",
-        lambda_iso: float = 0.0,  # DISABLED: conflicts with pair_loss, suppresses margin
         lambda_routing: float = 0.01,  # MoE load balance (reduced: routing loss normalized by log(E))
         lambda_pair: float = 0.4,  # InfoNCE contrastive (optimal from Run 18)
         lambda_memory: float = 0.05,  # memory regularization (EMA stability)
@@ -36,17 +38,14 @@ class HDIMTrainer:
         ranking_margin: float = 0.2,
         use_infonce: bool = True,
         infonce_temperature: float = 0.10,
-        lambda_sts: float = 0.0,  # DISABLED: duplicates InfoNCE semantics
-        lambda_angle: float = 0.0,
-        lambda_supcon: float = 0.0,
         lambda_z: float = 0.01,  # MoE z-loss (prevents router collapse)
         lambda_expert_ortho: float = 0.01,  # expert orthogonalization (Phase 26)
         lambda_online: float = 0.01,  # online self-evolution loss (Phase 31)
         learnable_temperature: bool = False,
         lambda_dcl: float = 0.05,
         lambda_uniformity: float = 0.02,
-        lambda_diversity_var: float = 0.0,  # DISABLED: destroys contrastive clusters
-        lambda_diversity_ortho: float = 0.0,  # DISABLED: conflicts with pair_loss
+        lambda_diversity_var: float = 0.0,  # DEPRECATED: destroys contrastive clusters, kept for verify_lean4_numerical.py
+        lambda_diversity_ortho: float = 0.0,  # DEPRECATED: conflicts with pair_loss, kept for verify_lean4_numerical.py
         use_sc_temperature: bool = False,
         lambda_matryoshka: float = 0.15,  # multi-scale embedding loss (optional)
         # Temperature scheduling parameters (exposed for configurability)
@@ -58,12 +57,13 @@ class HDIMTrainer:
         # Embedding augmentation
         aug_noise_std: float = 0.0,
         aug_mixup_alpha: float = 0.0,
+        # Gradient accumulation
+        accum_steps: int = 1,
     ) -> None:
         self.model = model.to(device)
         self._sbert_encoder = self._get_sbert_encoder()
         self.optimizer = optimizer
         self.device = torch.device(device)
-        self.lambda_iso = lambda_iso
         self.lambda_routing = lambda_routing
         self.lambda_pair = lambda_pair
         self.lambda_memory = lambda_memory
@@ -71,9 +71,6 @@ class HDIMTrainer:
         self.ranking_margin = ranking_margin
         self.use_infonce = use_infonce
         self.infonce_temperature = infonce_temperature
-        self.lambda_sts = lambda_sts
-        self.lambda_angle = lambda_angle
-        self.lambda_supcon = lambda_supcon
         self.lambda_z = lambda_z
         self.lambda_expert_ortho = lambda_expert_ortho
         self.lambda_online = lambda_online
@@ -83,29 +80,26 @@ class HDIMTrainer:
         self.lambda_diversity_ortho = lambda_diversity_ortho
         self.lambda_matryoshka = lambda_matryoshka
         self.use_sc_temperature = use_sc_temperature
+        self.accum_steps = max(1, accum_steps)
+        self._accum_counter = 0
+        self._last_grad_norm: float = 0.0
+        self._grad_norm_ema: float = 0.0
+        self._last_batch_size: int = 1
 
         # Warn about conflicting loss combinations
         if focal_gamma < 1.0 and lambda_dcl > 0:
-            print("WARNING: Focal-InfoNCE + DCL simultaneously — DCL already removes positive from denominator, "
-                  "focal modulation is redundant. Consider using DCL alone or InfoNCE+Focal alone.")
-        if use_infonce and lambda_supcon > 0:
-            print("WARNING: InfoNCE + SupCon simultaneously — SupCon generalizes InfoNCE, running both wastes compute. "
-                  "SupCon overrides InfoNCE when group_id is present.")
+            logger.warning("Focal-InfoNCE + DCL simultaneously — DCL already removes positive from denominator, "
+                           "focal modulation is redundant. Consider using DCL alone or InfoNCE+Focal alone.")
         if lambda_uniformity > lambda_pair * 2:
-            print("WARNING: lambda_uniformity >> lambda_pair — uniformity pushes points apart, "
-                  "may prevent contrastive clustering. Recommend lambda_uniformity < lambda_pair.")
+            logger.warning("lambda_uniformity >> lambda_pair — uniformity pushes points apart, "
+                           "may prevent contrastive clustering. Recommend lambda_uniformity < lambda_pair.")
         if lambda_dcl > 0 and lambda_uniformity > 0:
-            print("NOTE: DCL + Uniformity is a strong combo for embedding uniformity — ensure lambda_pair is tuned.")
-        # Log re-enabled disabled losses for A/B testing visibility
-        _disabled_losses = {
-            "lambda_sts": (lambda_sts, "duplicates InfoNCE semantics"),
-            "lambda_iso": (lambda_iso, "conflicts with pair_loss"),
-            "lambda_diversity_var": (lambda_diversity_var, "destroys contrastive clusters"),
-            "lambda_diversity_ortho": (lambda_diversity_ortho, "conflicts with pair_loss"),
-        }
-        for _name, (_val, _reason) in _disabled_losses.items():
-            if _val > 0.0:
-                print(f"Enabled {_name} with lambda={_val} (was 0.0: {_reason})")
+            logger.info("DCL + Uniformity is a strong combo for embedding uniformity — ensure lambda_pair is tuned.")
+        # Log re-enabled deprecated diversity losses for visibility
+        if lambda_diversity_var > 0.0:
+            logger.warning("Enabled lambda_diversity_var=%s (DEPRECATED: destroys contrastive clusters)", lambda_diversity_var)
+        if lambda_diversity_ortho > 0.0:
+            logger.warning("Enabled lambda_diversity_ortho=%s (DEPRECATED: conflicts with pair_loss)", lambda_diversity_ortho)
         self.use_hard_negatives: bool = False
         self._last_cluster_temp: float | None = None
         self._step: int = 0
@@ -410,6 +404,7 @@ class HDIMTrainer:
         LR restart in gpu_train.py calls stabilize() for momentum normalization.
         """
         self._current_epoch = epoch
+        self._accum_counter = 0
         if epoch == 1 and hasattr(self.model, "reset_memory"):
             self.model.reset_memory(strategy="hard")
 
@@ -438,38 +433,6 @@ class HDIMTrainer:
         scaled = base_temp * scale.clamp(0.5, 2.0)
         self._last_cluster_temp = float(scaled.item())
         return self._last_cluster_temp
-
-    def _compute_angle_loss(
-        self,
-        source_inv: torch.Tensor,
-        target_inv: torch.Tensor,
-        pair_relation_label: torch.Tensor,
-        pair_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """AnglE Loss: работает в угловом пространстве, избегает насыщения косинуса.
-
-        Li & Li (2023) — AnglE-optimized Text Embeddings.
-        Для позитивных пар: angle → 0 (cos → 1).
-        Для негативных пар: angle → π/2 (cos → 0).
-        """
-        import math
-        B = source_inv.shape[0]
-        if B < 2:
-            return self._zero_loss(source_inv)
-
-        src = F.normalize(source_inv.float(), dim=-1)  # fp32 for AMP safety
-        tgt = F.normalize(target_inv.float(), dim=-1)
-        cos_sim = (src * tgt).sum(dim=-1).clamp(-1 + 1e-6, 1 - 1e-6)  # [B]
-
-        # Угол в [0, 1]: 0=идентичные, 1=ортогональные
-        angle = torch.acos(cos_sim) * 2 / math.pi  # [B]
-
-        # Позитивные: angle → 0, негативные: angle → 1
-        target_angle = 1.0 - pair_relation_label  # [B]
-
-        loss_per_sample = (angle - target_angle).pow(2)
-        weights = pair_weight.to(source_inv.device, dtype=source_inv.dtype)
-        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
 
     def _mine_hard_negatives(
         self,
@@ -760,68 +723,6 @@ class HDIMTrainer:
 
         return (lambda_align * loss_align + lambda_uniform * loss_uniform).clamp(min=0)
 
-    def _compute_supcon_loss(
-        self,
-        source_inv: torch.Tensor,
-        target_inv: torch.Tensor,
-        pair_relation_label: torch.Tensor,
-        pair_weight: torch.Tensor,
-        pair_group_id: torch.Tensor,
-    ) -> torch.Tensor:
-        """Supervised Contrastive Loss (Khosla et al., NeurIPS 2020).
-
-        Для каждого anchor i множество позитивов P(i) = все j из того же
-        family (pair_group_id[i]==pair_group_id[j]) с label>0.5.
-        L_SupCon_i = -1/|P(i)| * Σ_{p∈P(i)} log[ exp(sim(i,p)/T) / Σ_{a≠i} exp(sim(i,a)/T) ]
-
-        Преимущества перед InfoNCE: использует ВСЕ позитивы из семейства,
-        не только диагональный, что эффективнее при аугментации.
-        """
-        B = source_inv.shape[0]
-        if B < 2:
-            return self._zero_loss(source_inv)
-
-        positive_mask = pair_relation_label > 0.5
-        if not positive_mask.any():
-            return self._zero_loss(source_inv)
-
-        temp = self._effective_temperature()
-        src = F.normalize(source_inv.float(), dim=-1)   # (B, D) — fp32 to avoid AMP fp16 precision loss
-        tgt = F.normalize(target_inv.float(), dim=-1)   # (B, D)
-        sim_matrix = (src @ tgt.T / temp).float()  # force fp32 for AMP safety
-
-        # Маска позитивов: same group AND positive label
-        group_match = (pair_group_id.unsqueeze(0) == pair_group_id.unsqueeze(1))  # (B, B)
-        label_pos   = positive_mask.unsqueeze(1).expand(B, B)                     # (B, B)
-        pos_mask    = group_match & label_pos                                       # (B, B)
-        # Исключаем диагональ (anchor = себя)
-        pos_mask.fill_diagonal_(False)
-
-        # Знаменатель: все a ≠ i, excluding same-group positives (false negatives)
-        eye = torch.eye(B, dtype=torch.bool, device=self.device)
-        if pair_group_id is not None:
-            group_match = pair_group_id.unsqueeze(0) == pair_group_id.unsqueeze(1)
-            label_pos = (pair_relation_label > 0.5)
-            fn_mask = ~(group_match & label_pos.unsqueeze(0))
-            denom_mask = ~eye & fn_mask
-        else:
-            denom_mask = ~eye
-
-        log_denom = torch.logsumexp(sim_matrix.masked_fill(~denom_mask, -torch.finfo(torch.float32).max), dim=-1)
-
-        # Vectorized: for each sample, average over positive similarities
-        num_pos = pos_mask.sum(dim=1).clamp(min=1)  # (B,) — at least 1 to avoid div by 0
-        # Mask non-positives to 0, sum per row, divide by count
-        pos_sim_sum = (sim_matrix * pos_mask.float()).sum(dim=1)  # (B,)
-        loss_per_sample = -((pos_sim_sum / num_pos) - log_denom)  # (B,)
-        # Zero out samples with no positives
-        has_pos = pos_mask.any(dim=1).float()
-        loss_per_sample = loss_per_sample * has_pos
-        weights = pair_weight * has_pos
-        if weights.sum() == 0:
-            return self._zero_loss(source_inv)
-        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
-
     def _compute_pair_ranking_loss(
         self,
         exported_invariant: torch.Tensor,
@@ -1088,10 +989,10 @@ class HDIMTrainer:
                     _exported_dim = _exported.shape[-1]
                     _matryoshka_dims = [d for d in sorted(_src_scales.keys()) if d < _exported_dim]
                     if _matryoshka_dims:
-                        batch["matryoshka_source"] = {d: _exported[..., :d].clone() for d in _matryoshka_dims}
+                        batch["matryoshka_source"] = {d: _exported[..., :d].contiguous() for d in _matryoshka_dims}
                         # For target, use pair_exported_target if available
                         _pair_tgt = batch.get("pair_exported_target", _exported.detach())
-                        batch["matryoshka_target"] = {d: _pair_tgt[..., :d].clone() for d in _matryoshka_dims}
+                        batch["matryoshka_target"] = {d: _pair_tgt[..., :d].contiguous() for d in _matryoshka_dims}
                     else:
                         batch["matryoshka_source"] = _src_scales
                         batch["matryoshka_target"] = _tgt_scales
@@ -1150,29 +1051,12 @@ class HDIMTrainer:
         training_invariant = self._training_invariant(aux_state)
         iso_target, loss_pair, pair_exported_target = self._compute_pair_loss_terms(aux_state, batch)
         loss_recon = self._compute_reconstruction_loss(output, recon_target)
-        if self.lambda_iso == 0.0:
-            loss_iso = self._zero_loss(training_invariant)
-        else:
-            loss_iso = self._compute_pair_iso_loss(training_invariant, iso_target, batch)
+        loss_iso = self._zero_loss(training_invariant)
         loss_routing = aux_state.router_loss
         pair_relation_label = batch.get("pair_relation_label")
         pair_weight = batch.get("pair_weight")
         loss_memory = aux_state.memory_loss
-        # STS regularization: косинусное сходство позитивных пар в exported_invariant space
-        if self.lambda_sts == 0.0:
-            loss_sts = self._zero_loss(training_invariant)
-        else:
-            loss_sts = self._zero_loss(training_invariant)
-            if self._has_pairs(batch):
-                _prl = batch.get("pair_relation_label")
-                if _prl is not None and pair_exported_target is not None:
-                    _pos_mask = (_prl.to(self.device) > 0.5)
-                    if _pos_mask.any():
-                        # exported_invariant space matches STS evaluation metric
-                        src_norm = F.normalize(aux_state.exported_invariant[_pos_mask].float(), dim=-1)  # fp32 for AMP safety
-                        tgt_norm = F.normalize(pair_exported_target[_pos_mask].float(), dim=-1)
-                        cos_sim = (src_norm * tgt_norm).sum(dim=-1)
-                        loss_sts = (1.0 - cos_sim).mean()
+        loss_sts = self._zero_loss(training_invariant)
 
         # Router z-loss (ST-MoE stability)
         loss_z = aux_state.z_loss
@@ -1195,8 +1079,8 @@ class HDIMTrainer:
             _exported_dim = _exported_src.shape[-1]
             _m_dims = [d for d in sorted(matryoshka_embs.keys()) if d < _exported_dim]
             if _m_dims and pair_exported_target is not None:
-                batch["matryoshka_source"] = {d: _exported_src[..., :d].clone() for d in _m_dims}
-                batch["matryoshka_target"] = {d: pair_exported_target[..., :d].clone() for d in _m_dims}
+                batch["matryoshka_source"] = {d: _exported_src[..., :d].contiguous() for d in _m_dims}
+                batch["matryoshka_target"] = {d: pair_exported_target[..., :d].contiguous() for d in _m_dims}
                 matryoshka_embs = batch["matryoshka_source"]
             loss_matryoshka = self._compute_matryoshka_loss(matryoshka_embs, batch)
         
@@ -1207,11 +1091,9 @@ class HDIMTrainer:
 
         loss_total = (
             loss_recon
-            + self.lambda_iso * loss_iso
             + self.lambda_pair * loss_pair
             + self.lambda_routing * loss_routing
             + self.lambda_memory * loss_memory
-            + self.lambda_sts * loss_sts
             + self.lambda_z * loss_z
             + loss_diversity  # already scaled by lambdas inside _compute_diversity_loss
             + self.lambda_matryoshka * loss_matryoshka
@@ -1224,18 +1106,6 @@ class HDIMTrainer:
         if pair_relation_label is not None and pair_weight is not None and pair_exported_target is not None:
             _prl_typed = pair_relation_label.to(self.device, dtype=training_invariant.dtype)
             _pw_typed = pair_weight.to(self.device, dtype=training_invariant.dtype)
-            if self.lambda_angle > 0:
-                loss_angle = self._compute_angle_loss(
-                    aux_state.exported_invariant, pair_exported_target,
-                    _prl_typed, _pw_typed,
-                )
-                loss_total = loss_total + self.lambda_angle * loss_angle
-            if self.lambda_supcon > 0 and pair_group_id is not None:
-                loss_supcon = self._compute_supcon_loss(
-                    aux_state.exported_invariant, pair_exported_target,
-                    _prl_typed, _pw_typed, pair_group_id,
-                )
-                loss_total = loss_total + self.lambda_supcon * loss_supcon
             if self.lambda_dcl > 0:
                 loss_dcl = self._compute_dcl_loss(
                     aux_state.exported_invariant, pair_exported_target,
@@ -1258,7 +1128,7 @@ class HDIMTrainer:
                 "loss_expert_ortho": loss_expert_ortho, "loss_online": aux_state.online_loss,
             }
             _nan_names = [k for k, v in _components.items() if torch.isnan(v) or torch.isinf(v)]
-            print(f"  [NaN guard] NaN/Inf in loss components: {_nan_names}")
+            logger.warning("[NaN guard] NaN/Inf in loss components: %s", _nan_names)
             batch_losses = {k: self._zero_loss(loss_total) for k in _components}
             batch_losses["_nan_skip"] = True
             return batch_losses
@@ -1304,17 +1174,30 @@ class HDIMTrainer:
         """Execute one training step with optional AMP scaler support.
 
         Phase 31: Includes OnlineLearner replay_step for experience replay.
+        Supports gradient accumulation via self.accum_steps.
         """
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
+        is_accum_boundary = (self._accum_counter == 0)
+        if is_accum_boundary:
+            self.optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(
             "cuda", enabled=scaler is not None and self.device.type == "cuda"
         ):
             losses = self._compute_batch_losses(batch)
+        # Track batch size for effective_temperature instrumentation
+        _domain_id = batch.get("domain_id")
+        if _domain_id is not None and isinstance(_domain_id, torch.Tensor):
+            self._last_batch_size = _domain_id.shape[0]
         if losses.get("_nan_skip"):
             self.optimizer.zero_grad(set_to_none=True)
+            self._accum_counter = 0
             return losses["loss_total"]
         loss_total = losses["loss_total"]
+        unscaled_loss = loss_total.detach().clone()
+
+        # Scale loss for gradient accumulation
+        if self.accum_steps > 1:
+            loss_total = loss_total / self.accum_steps
 
         # Phase 31: Experience replay from OnlineLearner buffer
         online_replay_loss = self._zero_loss(loss_total)
@@ -1322,52 +1205,65 @@ class HDIMTrainer:
             replay_loss = self.model.online_learner.replay_step(self.model)
             if replay_loss is not None:
                 online_replay_loss = replay_loss
-                loss_total = loss_total + replay_loss
+                loss_total = loss_total + (replay_loss / self.accum_steps if self.accum_steps > 1 else replay_loss)
+
+        self._accum_counter += 1
+        should_step = (self._accum_counter % self.accum_steps == 0)
 
         if scaler is not None:
             # NaN/Inf loss: skip step entirely and force scale reduction.
-            # Without this, backward() produces NaN grads → scaler.step()
-            # considers the step "successful" (no exception) → scaler.update()
-            # keeps the high scale → next normal batch overflows → permanent
-            # loss explosion (7 → 2414 → 18M over 3 epochs).
+            # Without this, backward() produces NaN grads -> scaler.step()
+            # considers the step "successful" (no exception) -> scaler.update()
+            # keeps the high scale -> next normal batch overflows -> permanent
+            # loss explosion (7 -> 2414 -> 18M over 3 epochs).
             if torch.isnan(loss_total) or torch.isinf(loss_total):
                 # Force scale reduction for stability
                 new_scale = max(scaler.get_scale() * 0.5, 1.0)
-                scaler.update(new_scale)
+                scaler._scale.fill_(new_scale)
+                scaler.update()
                 self._last_grad_norm = float('inf')
+                if should_step:
+                    self._accum_counter = 0
                 return loss_total.detach()
 
             scaler.scale(loss_total).backward()
-            scaler.unscale_(self.optimizer)
-            # Zero NaN/Inf gradients from uninitialized memory/MoE state
-            has_nan_grad = False
-            for p in self._all_trainable_params():
-                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                    p.grad.zero_()
-                    has_nan_grad = True
-            grad_norm = nn.utils.clip_grad_norm_(self._all_trainable_params(), max_norm=1.0)
-            self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
-            if has_nan_grad:
-                # NaN grads found — skip step and reduce scale to prevent
-                # permanent scaler corruption from non-finite gradients.
-                new_scale = max(scaler.get_scale() * 0.5, 1.0)
-                scaler.update(new_scale)
-            else:
-                scaler.step(self.optimizer)
-                scaler.update()
-                self._step += 1
+            if should_step:
+                scaler.unscale_(self.optimizer)
+                # Zero NaN/Inf gradients from uninitialized memory/MoE state
+                has_nan_grad = False
+                for p in self._all_trainable_params():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        p.grad.zero_()
+                        has_nan_grad = True
+                grad_norm = nn.utils.clip_grad_norm_(self._all_trainable_params(), max_norm=1.0)
+                self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
+                self._grad_norm_ema = 0.9 * self._grad_norm_ema + 0.1 * self._last_grad_norm
+                if has_nan_grad:
+                    # NaN grads found -- skip step and reduce scale to prevent
+                    # permanent scaler corruption from non-finite gradients.
+                    new_scale = max(scaler.get_scale() * 0.5, 1.0)
+                    scaler._scale.fill_(new_scale)
+                    scaler.update()
+                else:
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                    self._step += 1
+                self._accum_counter = 0
         else:
             loss_total.backward()
-            has_nan_grad = False
-            for p in self._all_trainable_params():
-                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                    p.grad.zero_()
-                    has_nan_grad = True
-            grad_norm = nn.utils.clip_grad_norm_(self._all_trainable_params(), max_norm=1.0)
-            self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
-            if not has_nan_grad:
-                self.optimizer.step()
-                self._step += 1
+            if should_step:
+                has_nan_grad = False
+                for p in self._all_trainable_params():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        p.grad.zero_()
+                        has_nan_grad = True
+                grad_norm = nn.utils.clip_grad_norm_(self._all_trainable_params(), max_norm=1.0)
+                self._last_grad_norm = grad_norm.item() if grad_norm.numel() == 1 else grad_norm.max().item()
+                self._grad_norm_ema = 0.9 * self._grad_norm_ema + 0.1 * self._last_grad_norm
+                if not has_nan_grad:
+                    self.optimizer.step()
+                    self._step += 1
+                self._accum_counter = 0
         self._last_loss_components = {
             k: v.item() if isinstance(v, torch.Tensor) and v.dim() == 0 else v
             for k, v in losses.items()
@@ -1375,7 +1271,7 @@ class HDIMTrainer:
         }
         self._last_loss_components["grad_norm"] = self._last_grad_norm
         self._last_loss_components["online_replay_loss"] = online_replay_loss.item()
-        return loss_total.detach()
+        return unscaled_loss
 
     def compute_iso_loss(
         self, u_inv_source: torch.Tensor, u_inv_target: torch.Tensor
@@ -1404,6 +1300,13 @@ class HDIMTrainer:
         if n_batches > 0:
             for key in totals:
                 totals[key] /= n_batches
+        # Instrumentation for empirical laws
+        val_loss = totals.get("loss_total", 0.0)
+        train_loss = self._last_loss_components.get("loss_total", 0.0) if hasattr(self, '_last_loss_components') else 0.0
+        totals["grad_norm_ema"] = self._grad_norm_ema
+        lr = self.optimizer.param_groups[0]["lr"]
+        totals["effective_temperature"] = lr / (self._last_batch_size * self.accum_steps)
+        totals["loss_gap"] = val_loss - train_loss
         return totals
     def save_checkpoint(self, path: str, scaler=None, scheduler=None) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)

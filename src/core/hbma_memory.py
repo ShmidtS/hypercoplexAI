@@ -14,13 +14,12 @@ Extensible via MemorySubsystemPlugin for 5th+ subsystems.
 """
 from __future__ import annotations
 
-import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from src.models.hdim_model import MSAConfig
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn

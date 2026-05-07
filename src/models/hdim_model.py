@@ -8,11 +8,10 @@ batch training scenarios.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple, Union, Any
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 from src.core.domain_operators import DomainIndexEmbedding
 from src.core.hdim_pipeline import HDIMPipeline
@@ -621,17 +620,17 @@ class HDIMModel(nn.Module):
             with torch.no_grad():
                 u_mean = u_mem.mean(dim=0, keepdim=True).detach()
                 moe = pipeline.moe
+                num_experts = self.config.num_experts or 4
                 if hasattr(moe, 'dispatch_proj'):
                     gate_logits = moe.dispatch_proj(u_mean)
-                    slot_idx = int(gate_logits.argmax(dim=-1).item())
-                    dominant_expert = slot_idx // getattr(moe, 'slots_per_expert', 1)
+                    argmax_t = gate_logits.argmax(dim=-1)
+                    dominant_expert = (argmax_t // getattr(moe, 'slots_per_expert', 1)).item()
                 elif hasattr(moe, 'router_proj'):
                     gate_logits = moe.router_proj(u_mean)
-                    dominant_expert = int(gate_logits.argmax(dim=-1).item() % (self.config.num_experts or 4))
+                    dominant_expert = (gate_logits.argmax(dim=-1) % num_experts).item()
                 elif hasattr(moe, 'kernel') and hasattr(moe.kernel, 'router_proj'):
-                    # MoEKernelAdapter wraps MoEKernel as self.kernel
                     gate_logits = moe.kernel.router_proj(u_mean)
-                    dominant_expert = int(gate_logits.argmax(dim=-1).item() % (self.config.num_experts or 4))
+                    dominant_expert = (gate_logits.argmax(dim=-1) % num_experts).item()
                 else:
                     dominant_expert = 0
 
@@ -652,7 +651,7 @@ class HDIMModel(nn.Module):
         all_slot_outputs: List[torch.Tensor] = []
         for mask in group_masks:
             # Guard: skip groups with 0 elements to avoid empty MoE input
-            if mask.sum().item() == 0:
+            if not mask.any():
                 continue
             group_route, group_router_state = pipeline.moe(u_mem[mask])
             u_route[mask] = group_route.to(dtype=u_route.dtype)
@@ -685,7 +684,7 @@ class HDIMModel(nn.Module):
         if self.domain_lora is not None and domain_id is not None:
             for d_idx in range(self.config.num_domains):
                 mask = domain_id == d_idx
-                if mask.sum().item() > 0:
+                if mask.any():
                     u_route[mask] = self.domain_lora(u_route[mask], d_idx)
 
         # 5) Transfer
@@ -709,14 +708,17 @@ class HDIMModel(nn.Module):
         hallucination_risk = 0.0
         memory_surprise_val = None
         if self.hallucination_detector is not None:
-            memory_surprise_val = memory_state.surprise.mean().item() if hasattr(memory_state, 'surprise') and memory_state.surprise is not None else None
+            _surprise_tensor = None
+            if hasattr(memory_state, 'surprise') and memory_state.surprise is not None:
+                _surprise_tensor = memory_state.surprise.mean()
+                memory_surprise_val = _surprise_tensor.item()
             result = self.hallucination_detector.from_router_state(
             router_state={
             "routing_entropy": routing_entropy,
             "gate_weights": routing_weights,
             "topk_gate_weights": topk_gate_weights,
             },
-            memory_mismatch=torch.tensor(memory_surprise_val, device=device, dtype=dtype) if memory_surprise_val is not None else None,
+            memory_mismatch=_surprise_tensor.detach() if _surprise_tensor is not None else None,
             memory_loss=memory_loss,
             )
             hallucination_risk = float(result.hallucination_risk)

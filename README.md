@@ -7,9 +7,9 @@
 [![Project Status](https://img.shields.io/badge/status-active-success.svg)](https://github.com/hypercoplex/hdim/issues) • [Contributing](CONTRIBUTING.md)
 
 > **Best Score:** 1.1814 (Run 18, epoch 13, temp=0.10, lambda_pair=0.40) — `pair_margin=1.0224`, `STS=0.537`
-> **Phase 30+:** MoEKernel + Hallucination detection + Online learning + Memory persistence + MaxScore routing
+> **Phase 30+:** MoEKernel + Hallucination detection + Online learning
 > **Numerical validation:** pytest 754 PASS (10 skipped) | Lean4 161/163 PASS
-> **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + HallucinationDetector + OnlineLearner + OnlineLoRA + MaxScoreRouter + MemoryPersistence + MSAAttention
+> **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + HallucinationDetector + OnlineLearner + OnlineLoRA
 
 ---
 
@@ -261,7 +261,7 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 | **HBMAMemory**             | 4-system memory (Working, Episodic, Semantic, Procedural)    | `src/core/hbma_memory.py`           |
 | **SoftMoERouter**          | Soft MoE with SharedExpert + AuxLossFree                     | `src/core/soft_moe_router.py`       |
 | **MoEKernel**              | Full MoE kernel: math/language/code/science domain experts   | `src/core/moe_kernel.py`            |
-| **MaxScoreRouter**         | Wang et al. ACL 2025 max-score routing with soft top-k      | `src/core/maxscore_router.py`       |
+| **MaxScoreRouter**         | Module not yet implemented. See issue/placeholder.           | `src/core/maxscore_router.py`       |
 | **MoEKernelAdapter**       | Adapts MoEKernel to MoERouter interface                      | `src/core/moe_kernel_adapter.py`    |
 | **HDIMPipeline**           | End-to-end pipeline orchestrator                             | `src/core/hdim_pipeline.py`         |
 | **HallucinationDetector**  | 5-signal weighted risk detection (entropy, confidence, mismatch, semantic, eigen) | `src/core/hallucination_detector.py` |
@@ -269,9 +269,9 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 | **SemanticEntropyProbe**   | Linear probe for uncertainty quantification (Kossen ICLR 2024) | `src/core/semantic_entropy_probe.py` |
 | **OnlineLearner**          | Continual learning with gradient modes (detached/selective/full) | `src/core/online_learner.py`       |
 | **OnlineLoRA**             | Task-free low-rank adaptation (Wei et al. WACV 2025)         | `src/core/online_lora.py`          |
-| **ContinualNorm**          | Streaming normalization without task reset                    | `src/core/continual_norm.py`       |
-| **MemoryPersistence**      | Save/load/checkpoint with atomicity and backup rotation      | `src/core/memory_persistence.py`   |
-| **MSAAttention**           | Memory Sparse Attention: top-k + chunk compression            | `src/core/msa_attention.py`        |
+| **ContinualNorm**          | Module not yet implemented. See issue/placeholder.           | `src/core/continual_norm.py`       |
+| **MemoryPersistence**      | Module not yet implemented. See issue/placeholder.           | `src/core/memory_persistence.py`   |
+| **MSAAttention**           | Module not yet implemented. See issue/placeholder.           | `src/core/msa_attention.py`        |
 | **TransferEngine**         | MoE routing + sandwich transfer + decode                      | `src/core/transfer_engine.py`      |
 | **DomainEncoder**          | Encoder + rotors + invariant extraction                       | `src/core/domain_encoder.py`       |
 | **InvariantProcessor**     | Memory-based invariant processing through MemoryInterface     | `src/core/invariant_processor.py`  |
@@ -578,15 +578,15 @@ hypercoplexAI/
 │   │   ├── moe_kernel.py             # MoEKernel domain experts (Phase 28)
 │   │   ├── moe_kernel_adapter.py     # MoEKernelRouterAdapter drop-in
 │   │   ├── clifford_interaction.py   # CliffordInteractionLayer (CAN)
-│   │   ├── msa_attention.py          # MSA sparse attention
-│   │   ├── maxscore_router.py        # MaxScoreRouter (Wang ACL 2025)
+│   │   ├── msa_attention.py          # MSA sparse attention (not yet implemented)
+│   │   ├── maxscore_router.py        # MaxScoreRouter (Wang ACL 2025) (not yet implemented)
 │   │   ├── hallucination_detector.py # HallucinationDetector (5-signal)
 │   │   ├── hallucination_feedback.py # HallucinationFeedbackLoop
 │   │   ├── semantic_entropy_probe.py # SemanticEntropyProbe
 │   │   ├── online_learner.py         # OnlineLearner (continual learning)
 │   │   ├── online_lora.py            # OnlineLoRA (task-free LoRA)
-│   │   ├── continual_norm.py        # ContinualNorm (streaming norm)
-│   │   ├── memory_persistence.py     # MemoryPersistence (atomic checkpoint)
+│   │   ├── continual_norm.py        # ContinualNorm (streaming norm) (not yet implemented)
+│   │   ├── memory_persistence.py     # MemoryPersistence (atomic checkpoint) (not yet implemented)
 │   │   ├── memory_interface.py       # MemoryInterface ABC
 │   │   ├── transfer_engine.py        # TransferEngine
 │   │   ├── transfer_state.py         # TransferState dataclass
@@ -618,10 +618,10 @@ hypercoplexAI/
 │   ├── test_clifford_interaction.py  # CAN layer
 │   ├── test_can_integration.py       # CAN integration
 │   ├── test_hbma_plugin.py           # HBMA 4-system memory
-│   ├── test_msa_attention.py         # MSA sparse attention
+│   ├── test_msa_attention.py         # MSA sparse attention (tests prototype_memory, not msa_attention module)
 │   ├── test_memory_interface.py      # Memory ABC
 │   ├── test_memory_comparison.py     # Memory comparison
-│   ├── test_memory_persistence.py   # MemoryPersistence
+│   ├── test_memory_persistence.py   # MemoryPersistence (test file not yet created)
 │   ├── test_augmentation.py          # Embedding augmentations
 │   ├── test_auto_config.py           # AutoConfig
 │   ├── test_nan_inf_forward.py       # NaN/Inf protection
@@ -631,12 +631,12 @@ hypercoplexAI/
 │   ├── test_semantic_entropy_probe.py # SemanticEntropyProbe
 │   ├── test_online_learner_gradient.py # OnlineLearner
 │   ├── test_online_lora.py           # OnlineLoRA
-│   ├── test_continual_norm.py       # ContinualNorm
-│   ├── test_maxscore_router.py      # MaxScoreRouter
+│   ├── test_continual_norm.py       # ContinualNorm (test file not yet created)
+│   ├── test_maxscore_router.py      # MaxScoreRouter (test file not yet created)
 │   ├── test_production_benchmark.py  # Production benchmarks
 │   ├── test_multi_worker.py         # Multi-worker training
 │   ├── test_kernel_chat.py          # Interactive kernel chat
-│   ├── test_router.py               # Router variants
+│   ├── test_router.py               # Router variants (test file not yet created)
 │   ├── test_checkpoint_variants.py  # Checkpoint loading
 │   ├── test_all_modules.py          # Full module smoke test
 │   └── test_triton_performance.py    # Triton kernel benchmarks
@@ -756,9 +756,9 @@ training_config = {
 | HBMA Adapter         | `src/core/hbma_memory.py`             |
 | Hallucination Detect | `src/core/hallucination_detector.py`  |
 | Online Learning      | `src/core/online_learner.py`          |
-| Memory Persistence   | `src/core/memory_persistence.py`      |
-| MaxScore Router      | `src/core/maxscore_router.py`         |
-| MSA Attention        | `src/core/msa_attention.py`           |
+| Memory Persistence   | `src/core/memory_persistence.py` (not yet implemented) |
+| MaxScore Router      | `src/core/maxscore_router.py` (not yet implemented) |
+| MSA Attention        | `src/core/msa_attention.py` (not yet implemented) |
 
 
 ---
