@@ -26,7 +26,7 @@ import json
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.model_factory import build_sbert_hdim_model, _patch_moe_kernel
-from src.core.titans_memory import TitansMemoryModule
+from src.core.memory import TitansMemory
 
 
 class HDIMKernelChat:
@@ -68,10 +68,9 @@ class HDIMKernelChat:
 		self.model.to(self.device)
 		self.model.eval()
 
-		self.memory = TitansMemoryModule(
-			key_dim=self.config.hidden_dim,
-			val_dim=self.config.hidden_dim,
-			hidden_dim=self.config.hidden_dim,
+		self.memory = TitansMemory(
+			clifford_dim=self.config.hidden_dim,
+			memory_key_dim=self.config.hidden_dim,
 		).to(self.device)
 
 		self.expert_names = ["Math", "Language", "Code", "Science"]

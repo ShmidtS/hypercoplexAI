@@ -18,8 +18,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.core.hbma_memory import (
+from src.core.memory import (
     HBMAMemory,
+    MemoryResult,
     MemorySubsystemPlugin,
     ConsolidationContext,
     WorkingMemory,
@@ -170,27 +171,29 @@ class TestForwardWithPlugins:
     def test_forward_no_plugins_backward_compat(self):
         mem = HBMAMemory(hidden_dim=64)
         x = torch.randn(4, 64)
-        out = mem(x)
-        assert out.shape == (4, 64)
+        result = mem(x, update_memory=False)
+        assert isinstance(result, MemoryResult)
+        assert result.output.shape == (4, 64)
 
     def test_forward_with_plugin(self):
         mem = HBMAMemory(hidden_dim=64)
         mem.register_plugin(EmotionalMemoryPlugin(hidden_dim=64))
         x = torch.randn(4, 64)
-        out = mem(x)
-        assert out.shape == (4, 64)
+        result = mem(x, update_memory=False)
+        assert isinstance(result, MemoryResult)
+        assert result.output.shape == (4, 64)
 
     def test_forward_gate_shape_with_plugin(self):
         mem = HBMAMemory(hidden_dim=64)
         mem.register_plugin(EmotionalMemoryPlugin(hidden_dim=64))
         x = torch.randn(4, 64)
-        out, gate = mem(x, return_gate=True)
+        out, gate = mem._hbma_forward(x, return_gate=True)
         assert gate.shape == (4, 5)
 
     def test_forward_gate_shape_without_plugin(self):
         mem = HBMAMemory(hidden_dim=64)
         x = torch.randn(4, 64)
-        out, gate = mem(x, return_gate=True)
+        out, gate = mem._hbma_forward(x, return_gate=True)
         assert gate.shape == (4, 4)
 
 
@@ -246,7 +249,7 @@ class TestConsolidationHook:
         mem.train()
 
         x = torch.randn(4, 64)
-        mem(x)
+        mem(x, update_memory=True)
         assert plugin.consolidate_count == 1
 
 
@@ -261,7 +264,8 @@ class TestGradientFlow:
         mem.train()
 
         x = torch.randn(4, 64, requires_grad=True)
-        out = mem(x)
+        result = mem(x, update_memory=False)
+        out = result.output
         weights = torch.linspace(0.1, 1.0, out.numel(), device=out.device, dtype=out.dtype).view_as(out)
         loss = (out * weights).sum()
         loss.backward()
@@ -279,13 +283,13 @@ class TestZeroOverhead:
     def test_no_plugins_no_rebuild_flag(self):
         mem = HBMAMemory(hidden_dim=64)
         x = torch.randn(4, 64)
-        out = mem(x)
+        mem(x, update_memory=False)
         assert mem._needs_rebuild is False
 
     def test_output_same_shape_no_plugins(self):
         mem1 = HBMAMemory(hidden_dim=64)
         mem2 = HBMAMemory(hidden_dim=64)
         x = torch.randn(4, 64)
-        out1 = mem1(x)
-        out2 = mem2(x)
-        assert out1.shape == out2.shape == (4, 64)
+        result1 = mem1(x, update_memory=False)
+        result2 = mem2(x, update_memory=False)
+        assert result1.output.shape == result2.output.shape == (4, 64)

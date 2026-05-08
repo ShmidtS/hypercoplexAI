@@ -81,13 +81,12 @@ test(f'sandwich_transfer roundtrip diff={diff2:.2e}', diff2 < 0.1)
 
 # 4. Memory modules
 print('\n=== 4. Memory Modules ===')
-from src.core.titans_memory import TitansMemoryModule
-from src.core.hbma_memory import HBMAMemory
+from src.core.memory import TitansMemory, HBMAMemory
 
 u = torch.randn(4, 256)
-tm = TitansMemoryModule(key_dim=256, val_dim=256, hidden_dim=64)
-out, loss = tm(u, u)
-test('TitansMemoryModule', out.shape == u.shape)
+tm = TitansMemory(clifford_dim=256, memory_key_dim=256)
+result = tm(u, update_memory=True)
+test('TitansMemory', result.output.shape == u.shape)
 
 hm = HBMAMemory(hidden_dim=256)
 out = hm(u)
@@ -95,7 +94,7 @@ test('HBMAMemory', out.shape == u.shape)
 
 # 5. SoftMoERouter
 print('\n=== 5. SoftMoERouter ===')
-from src.core.soft_moe_router import SoftMoERouter
+from src.core.moe import SoftMoERouter
 router = SoftMoERouter(input_dim=256, num_experts=4, top_k=2)
 out, aux = router(u)
 test('SoftMoERouter', out.shape == u.shape)

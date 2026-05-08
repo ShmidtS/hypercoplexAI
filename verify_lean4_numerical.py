@@ -4,10 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from src.core.hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from src.core.domain_operators import DomainRotationOperator, sandwich_transfer, InvariantExtractor
-from src.core.memory_interface import TitansAdapter, HBMAMemoryAdapter
-from src.core.titans_memory import TitansMemoryModule
-from src.core.hbma_memory import HBMAMemory, WorkingMemory, SemanticMemory
-from src.core.soft_moe_router import SoftMoERouter
+from src.core.memory import TitansMemory, HBMAMemory, WorkingMemory, SemanticMemory, MemoryResult
+from src.core.moe import SoftMoERouter
 from src.models.hdim_model import HDIMPipeline
 
 def make_plane_rotor(ca, i, j, angle):
@@ -177,26 +175,24 @@ ep_zero = hm2.episodic.mem_vals.abs().sum() == 0
 print(f'  reset clears buffers: [{"PASS" if (wm_zero and ep_zero) else "FAIL"}]')
 results.append(('hbma_reset', 'PASS' if (wm_zero and ep_zero) else 'FAIL'))
 
-# ===== 8. MemoryInterface adapters =====
-print('\n--- 8. MemoryInterface adapters ---')
-titans_raw = TitansMemoryModule(key_dim=32, val_dim=64)
-titans_adp = TitansAdapter(titans_raw, clifford_dim=64, memory_key_dim=32)
-result_t = titans_adp(torch.randn(4, 64), update_memory=True)
+# ===== 8. MemoryInterface direct =====
+print('\n--- 8. MemoryInterface direct ---')
+titans_mem = TitansMemory(clifford_dim=64, memory_key_dim=32)
+result_t = titans_mem(torch.randn(4, 64), update_memory=True)
 t_ok = result_t.output.shape == (4, 64) and isinstance(result_t.loss, torch.Tensor)
-print(f'  TitansAdapter forward: [{"PASS" if t_ok else "FAIL"}]')
-results.append(('titans_adapter', 'PASS' if t_ok else 'FAIL'))
+print(f'  TitansMemory forward: [{"PASS" if t_ok else "FAIL"}]')
+results.append(('titans_memory', 'PASS' if t_ok else 'FAIL'))
 
-hbma_raw = HBMAMemory(hidden_dim=64)
-hbma_adp = HBMAMemoryAdapter(hbma_raw)
-result_h = hbma_adp(torch.randn(4, 64), update_memory=True)
+hbma_mem = HBMAMemory(hidden_dim=64)
+result_h = hbma_mem(torch.randn(4, 64), update_memory=True)
 h_ok = result_h.output.shape == (4, 64) and isinstance(result_h.loss, torch.Tensor)
-print(f'  HBMAMemoryAdapter forward: [{"PASS" if h_ok else "FAIL"}]')
-results.append(('hbma_adapter', 'PASS' if h_ok else 'FAIL'))
+print(f'  HBMAMemory forward: [{"PASS" if h_ok else "FAIL"}]')
+results.append(('hbma_memory', 'PASS' if h_ok else 'FAIL'))
 
-titans_adp.reset()
-hbma_adp.reset()
-print(f'  adapter reset: [PASS]')
-results.append(('adapter_reset', 'PASS'))
+titans_mem.reset()
+hbma_mem.reset()
+print(f'  memory reset: [PASS]')
+results.append(('memory_reset', 'PASS'))
 
 # ===== 9. DomainRotor norm preservation =====
 print('\n--- 9. DomainRotor built-in norm preservation ---')
@@ -668,7 +664,7 @@ results.append(('matryoshka_nesting', status))
 
 # ===== 35. HBMA forward shape preservation and gradient flow =====
 print('\n--- 35. hbma_forward_shape_and_grad ---')
-from src.core.hbma_memory import HBMAMemory
+from src.core.memory import HBMAMemory
 mem = HBMAMemory(hidden_dim=64, ep_slots=8, sem_prototypes=8, proc_patterns=4)
 mem.train()
 x = torch.randn(2, 64)
@@ -916,7 +912,7 @@ class _DummyModel(nn.Module):
 
 model = _DummyModel()
 opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-trainer = HDIMTrainer(model, opt, device='cpu', use_infonce=True, infonce_temperature=0.1, lambda_diversity_var=0.1, lambda_diversity_ortho=0.1)
+trainer = HDIMTrainer(model, opt, device='cpu', use_infonce=True, infonce_temperature=0.1)
 
 all_ok = True
 for _ in range(20):
@@ -1011,7 +1007,7 @@ results.append(('bivector_exp_general', status))
 
 # ===== 48. z_loss regularization: non-negative and differentiable =====
 print('\n--- 48. z_loss_regularization ---')
-from src.core.soft_moe_router import SoftMoERouter
+from src.core.moe import SoftMoERouter
 all_ok = True
 torch.manual_seed(42)
 router = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128, z_loss_weight=0.01)
@@ -1048,7 +1044,7 @@ results.append(('sandwich_norm_Cl310_hp', status))
 
 # ===== 50. HBMA memory_loss gradient flow =====
 print('\n--- 50. hbma_memory_loss_gradient_flow ---')
-from src.core.hbma_memory import HBMAMemory
+from src.core.memory import HBMAMemory
 all_ok = True
 for _ in range(5):
     mem = HBMAMemory(hidden_dim=64, ep_slots=8, sem_prototypes=8, proc_patterns=4)
@@ -1303,7 +1299,7 @@ results.append(('grade_projection_idempotent', status))
 
 # ===== 63. SoftMoE: dispatch/combine weight normalization =====
 print('\n--- 63. soft_moe_dispatch_combine_normalize ---')
-from src.core.soft_moe_router import SoftMoERouter
+from src.core.moe import SoftMoERouter
 moe = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128)
 x = torch.randn(8, 64)
 dispatch, combine, _z_loss = moe._compute_dispatch_combine(x)
@@ -1360,13 +1356,12 @@ results.append(('bivector_eiej_square_negative', status))
 
 # ===== 67. Titans memory: state update changes output =====
 print('\n--- 67. titans_memory_state_update ---')
-from src.core.titans_memory import TitansMemoryModule
-mem = TitansMemoryModule(key_dim=16, val_dim=32, hidden_dim=32)
-k1 = torch.randn(4, 16)
-v1 = torch.randn(4, 32)
-r1, _ = mem(k1, v1, update_memory=True)
-r2, _ = mem(k1, v1, update_memory=False)
-diff = (r1 - r2).abs().max().item()
+from src.core.memory import TitansMemory
+mem = TitansMemory(clifford_dim=32, memory_key_dim=16, hidden_dim=32)
+x = torch.randn(4, 32)
+r1 = mem(x, update_memory=True)
+r2 = mem(x, update_memory=False)
+diff = (r1.output - r2.output).abs().max().item()
 ok = diff > 1e-6
 status = 'PASS' if ok else 'FAIL'
 print(f'  Titans memory state update changes output: [{status}]')
@@ -1374,12 +1369,12 @@ results.append(('titans_memory_state_update', status))
 
 # ===== 68. Titans memory: no NaN after multiple updates =====
 print('\n--- 68. titans_memory_no_nan_multi_update ---')
-mem = TitansMemoryModule(key_dim=16, val_dim=32, hidden_dim=32)
+mem = TitansMemory(clifford_dim=32, memory_key_dim=16, hidden_dim=32)
 all_ok = True
 for i in range(50):
-    k = torch.randn(4, 16)
-    v = torch.randn(4, 32)
-    out, loss = mem(k, v, update_memory=True)
+    x = torch.randn(4, 32)
+    result = mem(x, update_memory=True)
+    out, loss = result.output, result.loss
     if torch.isnan(out).any() or torch.isinf(out).any() or torch.isnan(loss).any() or torch.isinf(loss).any():
         all_ok = False
         break
@@ -1432,7 +1427,7 @@ results.append(('matryoshka_nested_quality', status))
 
 # ===== 72. HBMA: working memory FIFO capacity =====
 print('\n--- 72. hbma_working_memory_capacity ---')
-from src.core.hbma_memory import HBMAMemory
+from src.core.memory import HBMAMemory
 mem = HBMAMemory(hidden_dim=32)
 x = torch.randn(1, 32)
 for i in range(20):
@@ -1641,7 +1636,7 @@ results.append(('infoNCE_lower_bound', status))
 # ===== 83. SoftMoE expert orthogonality loss >= 0 =====
 print('\n--- 83. soft_moe_orthogonality_bound ---')
 all_ok = True
-from src.core.soft_moe_router import SoftMoERouter
+from src.core.moe import SoftMoERouter
 for n_experts in [2, 4, 8]:
     router = SoftMoERouter(input_dim=64, num_experts=n_experts)
     for _ in range(10):
@@ -2376,7 +2371,7 @@ results.append(('hbma_working_slot_reuse', status))
 
 # ===== 116. MoEKernel: combine weights sum to 1 =====
 print('\n--- 116. moe_kernel_combine_sums_to_one ---')
-from src.core.moe_kernel import MoEKernel, MoEKernelConfig
+from src.core.moe import MoEKernel, MoEKernelConfig
 all_ok = True
 torch.manual_seed(1160)
 cfg116 = MoEKernelConfig(
@@ -2551,15 +2546,15 @@ results.append(('moe_kernel_seq_input', status))
 
 # ===== 126. MoEKernel: domain expert type consistency =====
 print('\n--- 126. moe_kernel_expert_types ---')
-from src.core.moe_kernel import MathExpert, LanguageExpert, CodeExpert, ScienceExpert as SE126
+from src.core.moe import MLPExpert as MLPExpert126
 all_ok = True
 torch.manual_seed(1260)
 k126 = MoEKernel(cfg116)
 type_ok = [
-    isinstance(k126.experts[0], MathExpert),
-    isinstance(k126.experts[1], LanguageExpert),
-    isinstance(k126.experts[2], CodeExpert),
-    isinstance(k126.experts[3], SE126),
+    isinstance(k126.experts[0], MLPExpert126),
+    isinstance(k126.experts[1], MLPExpert126),
+    isinstance(k126.experts[2], MLPExpert126),
+    isinstance(k126.experts[3], MLPExpert126),
 ]
 if not all(type_ok):
     all_ok = False

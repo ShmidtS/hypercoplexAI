@@ -37,7 +37,6 @@ from src.models.model_factory import (
     build_modernbert_hdim_model,
     build_hdim_model,
     _patch_moe_kernel,
-    _patch_soft_router,
 )
 from src.models.metrics import compute_all_metrics
 
@@ -122,7 +121,11 @@ def create_dataloader(texts_a: List[str], texts_b: List[str], labels: torch.Tens
 
 def build_standard_model(encoder_type: str, device: str, hidden_dim: int = 256):
     """Build standard HDIM model matching training config (soft_router, shared_expert, etc.)."""
-    cfg = HDIMConfig(hidden_dim=hidden_dim, num_experts=4, num_domains=4, top_k=2)
+    cfg = HDIMConfig(
+        hidden_dim=hidden_dim,
+        moe={"num_experts": 4, "top_k": 2, "n_shared_experts": 1, "use_aux_loss_free": True, "use_expert_ortho": True},
+        num_domains=4,
+    )
 
     if encoder_type == "modernbert":
         model = build_modernbert_hdim_model(
@@ -137,21 +140,17 @@ def build_standard_model(encoder_type: str, device: str, hidden_dim: int = 256):
             freeze_sbert=True,
         )
 
-    # Enable Phase 26 features (must match training config)
-    if hasattr(model, 'enable_shared_expert'):
-        model.enable_shared_expert()
-    if hasattr(model, 'enable_aux_loss_free'):
-        model.enable_aux_loss_free(aux_lr=0.001)
-    if hasattr(model, 'enable_expert_ortho'):
-        model.enable_expert_ortho()
-
     model.to(device)
     return model, "Standard HDIM (soft_router + shared_expert)"
 
 
 def build_moe_kernel_model(encoder_type: str, device: str, hidden_dim: int = 256):
     """Build model with MoE kernel."""
-    cfg = HDIMConfig(hidden_dim=hidden_dim, num_experts=4, num_domains=4, top_k=2)
+    cfg = HDIMConfig(
+        hidden_dim=hidden_dim,
+        moe={"num_experts": 4, "top_k": 2, "n_shared_experts": 1, "use_aux_loss_free": True, "use_expert_ortho": True},
+        num_domains=4,
+    )
 
     if encoder_type == "modernbert":
         model = build_modernbert_hdim_model(
@@ -180,7 +179,11 @@ def build_moe_kernel_model(encoder_type: str, device: str, hidden_dim: int = 256
 
 def build_soft_router_model(encoder_type: str, device: str, hidden_dim: int = 256):
     """Build model with SoftMoERouter (matching training config)."""
-    cfg = HDIMConfig(hidden_dim=hidden_dim, num_experts=4, num_domains=4, top_k=2)
+    cfg = HDIMConfig(
+        hidden_dim=hidden_dim,
+        moe={"num_experts": 4, "top_k": 2, "n_shared_experts": 1, "use_aux_loss_free": True, "use_expert_ortho": True},
+        num_domains=4,
+    )
 
     if encoder_type == "modernbert":
         model = build_modernbert_hdim_model(
@@ -194,14 +197,6 @@ def build_soft_router_model(encoder_type: str, device: str, hidden_dim: int = 25
             soft_router=True,
             freeze_sbert=True,
         )
-
-    # Enable Phase 26 features (must match training config)
-    if hasattr(model, 'enable_shared_expert'):
-        model.enable_shared_expert()
-    if hasattr(model, 'enable_aux_loss_free'):
-        model.enable_aux_loss_free(aux_lr=0.001)
-    if hasattr(model, 'enable_expert_ortho'):
-        model.enable_expert_ortho()
 
     model.to(device)
     return model, "HDIM + SoftMoERouter (Phase 26)"
@@ -229,14 +224,6 @@ def build_memory_variant(encoder_type: str, memory_type: str, device: str, hidde
             soft_router=True,
             freeze_sbert=True,
         )
-
-    # Enable Phase 26 features (must match training config)
-    if hasattr(model, 'enable_shared_expert'):
-        model.enable_shared_expert()
-    if hasattr(model, 'enable_aux_loss_free'):
-        model.enable_aux_loss_free(aux_lr=0.001)
-    if hasattr(model, 'enable_expert_ortho'):
-        model.enable_expert_ortho()
 
     model.to(device)
     return model, f"HDIM + {memory_type.upper()} memory"

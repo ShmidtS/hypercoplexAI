@@ -8,41 +8,52 @@ Architecture:
 - MoERouter (abstract base): defines contract for all routers
 - SoftMoERouter: soft routing without token dropping
 - MoEKernel: domain-specific experts with advanced features
-- MoEKernelAdapter: wraps MoEKernel to MoERouter interface
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Protocol, TypedDict, runtime_checkable
+from typing import Any, Dict, TypedDict
 
 import torch
 from torch import Tensor, nn
 
 
-@runtime_checkable
-class TextEncoder(Protocol):
-    """Protocol for text encoding components (SimpleTextEncoder, SBERTEncoder, ModernBertEncoder)."""
-
-    def forward(self, texts: list, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor: ...
-    def encode(self, texts: list) -> torch.Tensor: ...
-
-
 class RouterState(TypedDict, total=False):
-    """Structured routing state returned by MoE routers."""
+    """Structured routing state returned by MoE routers.
 
-    routing_weights: torch.Tensor
-    expert_indices: torch.Tensor
-    diversity_loss: torch.Tensor
+    Unified state format for both MoEKernel and SoftMoERouter.
+    All MoE implementations must populate at least the required fields.
+    """
+
+    # Required fields
+    router_loss: torch.Tensor
     z_loss: torch.Tensor
-    entropy: torch.Tensor
-    domain_logits: torch.Tensor
+    expert_usage: torch.Tensor
+    routing_entropy: torch.Tensor
+    gate_weights: torch.Tensor
+    topk_idx: torch.Tensor
+    topk_gate_weights: torch.Tensor
+    train_scores_snapshot: torch.Tensor
+    dispatch_weights: torch.Tensor
+    combine_weights: torch.Tensor
+
+    # Optional fields (present in MoEKernel, may be absent in SoftMoERouter)
+    expert_weights: torch.Tensor
+    ortho_loss: torch.Tensor
+    expert_names: list
+    top_expert_idx: torch.Tensor
+    expert_reliability: torch.Tensor
+    slot_outputs: torch.Tensor
+    alignment: torch.Tensor
+    u_route: torch.Tensor
+    g_target: torch.Tensor
 
 
 class MoERouter(nn.Module, ABC):
     """Abstract interface for Mixture-of-Experts routers.
 
-    All MoE implementations (SoftMoERouter, MoEKernel via adapter) must
+    All MoE implementations (SoftMoERouter, MoEKernel) must
     inherit from this class to ensure API compatibility.
 
     This enables:
@@ -84,18 +95,6 @@ class MoERouter(nn.Module, ABC):
         Returns:
             Tensor[num_experts]: EMA or current load for each expert.
             Values should sum to approximately 1.0 for balanced routing.
-        """
-        ...
-
-    @abstractmethod
-    def expert_orthogonalization_loss(self) -> Tensor:
-        """Return orthogonalization loss for expert diversity.
-
-        This loss encourages experts to learn different representations
-        by penalizing similarity between expert weight matrices.
-
-        Returns:
-            Tensor: Scalar loss value (0 if orthogonalization not enabled)
         """
         ...
 

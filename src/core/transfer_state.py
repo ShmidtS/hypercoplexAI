@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from .nars_truth import NarsTruth
+    from .memory import NarsTruth
 
 
 @dataclass

@@ -378,16 +378,13 @@ class TestSurpriseSignalIntegration:
 
     def test_surprise_in_memory_result_when_enabled(self):
         """When gradient surprise is enabled, MemoryResult should have surprise."""
-        from src.core.memory_interface import TitansAdapter
-        from src.core.titans_memory import TitansMemoryModule
+        from src.core.memory import TitansMemory
 
-        titans = TitansMemoryModule(key_dim=32, val_dim=64)
+        titans = TitansMemory(clifford_dim=64, memory_key_dim=32)
         titans.use_gradient_surprise = True
 
-        adapter = TitansAdapter(titans, clifford_dim=64, memory_key_dim=32)
-
         x = torch.randn(2, 64)
-        result = adapter(x, update_memory=True)
+        result = titans(x, update_memory=True)
 
         # After forward with gradient surprise enabled, surprise should be set
         assert result.surprise is not None
@@ -395,21 +392,16 @@ class TestSurpriseSignalIntegration:
 
     def test_surprise_none_when_disabled(self):
         """When gradient surprise is disabled, surprise should be None initially."""
-        from src.core.memory_interface import TitansAdapter
-        from src.core.titans_memory import TitansMemoryModule
+        from src.core.memory import TitansMemory
 
-        titans = TitansMemoryModule(key_dim=32, val_dim=64)
+        titans = TitansMemory(clifford_dim=64, memory_key_dim=32)
         # use_gradient_surprise is False by default
 
-        adapter = TitansAdapter(titans, clifford_dim=64, memory_key_dim=32)
-
         x = torch.randn(2, 64)
-        result = adapter(x, update_memory=True)
+        result = titans(x, update_memory=True)
 
-        # Without gradient surprise enabled, _last_surprise remains at initial 0.0
-        # but the adapter still exports it
-        assert result.surprise is not None
-        assert result.surprise.item() == 0.0
+        # Without gradient surprise enabled, surprise is None
+        assert result.surprise is None
 
     def test_hdim_model_surprise_in_aux_state(self):
         """Test HDIMModel exports memory_surprise in aux_state when hallucination detection enabled."""
@@ -425,8 +417,8 @@ class TestSurpriseSignalIntegration:
         model.eval()
 
         # Enable gradient surprise on the memory module
-        if hasattr(model.pipeline.memory, 'titans'):
-            model.pipeline.memory.titans.use_gradient_surprise = True
+        if hasattr(model.pipeline.memory, 'use_gradient_surprise'):
+            model.pipeline.memory.use_gradient_surprise = True
 
         x = torch.randn(2, 64)
         domain_id = torch.tensor([0, 1])
@@ -501,18 +493,15 @@ class TestSurpriseSignalIntegration:
 
     def test_end_to_end_surprise_signal_path(self):
         """End-to-end test: TitansMemory -> MemoryResult -> HallucinationDetector."""
-        from src.core.memory_interface import TitansAdapter
-        from src.core.titans_memory import TitansMemoryModule
+        from src.core.memory import TitansMemory
 
         # Setup: Titans memory with gradient surprise enabled
-        titans = TitansMemoryModule(key_dim=32, val_dim=64)
+        titans = TitansMemory(clifford_dim=64, memory_key_dim=32)
         titans.use_gradient_surprise = True
-
-        adapter = TitansAdapter(titans, clifford_dim=64, memory_key_dim=32)
 
         # Forward pass through memory
         x = torch.randn(4, 64)
-        result = adapter(x, update_memory=True)
+        result = titans(x, update_memory=True)
 
         # Verify surprise in MemoryResult
         assert result.surprise is not None, "MemoryResult should contain surprise signal"

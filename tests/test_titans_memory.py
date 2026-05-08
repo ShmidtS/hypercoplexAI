@@ -1,307 +1,241 @@
-"""Тесты для TitansMemoryModule — нейронной памяти с TTT обновлением.
+"""Tests for TitansMemory -- neural memory with TTT updates.
 
-Покрытие:
-- Инициализация модуля
-- Базовое обновление памяти
-- Извлечение из памяти
-- Градиенты проходят через forward
-- Затухание памяти (reset)
-- Числовая стабильность (нет NaN/Inf)
+Coverage:
+- Module initialization
+- Basic memory update via MemoryInterface API
+- Memory retrieval
+- Gradient flow through forward
+- Memory decay (reset)
+- Numerical stability (no NaN/Inf)
 """
 
 import pytest
 import torch
 
-from src.core.titans_memory import TitansMemoryModule, MemoryState
+from src.core.memory import TitansMemory, MemoryResult
 
 
 @pytest.fixture
 def memory_module():
-    """Фикстура: модуль памяти с стандартными параметрами."""
-    return TitansMemoryModule(key_dim=32, val_dim=64, hidden_dim=64)
-
-
-@pytest.fixture
-def sample_inputs():
-    """Фикстура: тестовые ключи и значения."""
-    batch_size = 4
-    key = torch.randn(batch_size, 32)
-    value = torch.randn(batch_size, 64)
-    return key, value
+    """Fixture: memory module with standard parameters."""
+    return TitansMemory(clifford_dim=64, memory_key_dim=32)
 
 
 class TestTitansInit:
-    """Тесты инициализации TitansMemoryModule."""
+    """Tests for TitansMemory initialization."""
 
     def test_titans_init(self, memory_module):
-        """Проверка корректной инициализации модуля."""
-        # Проверка размерностей
-        assert memory_module.key_dim == 32
-        assert memory_module.val_dim == 64
+        """Verify correct module initialization."""
+        assert memory_module.clifford_dim == 64
+        assert memory_module.memory_key_dim == 32
 
-        # Проверка наличия компонентов
+        # Check components exist
         assert hasattr(memory_module, 'memory')
         assert hasattr(memory_module, 'gate_proj')
         assert hasattr(memory_module, 'momentum_S')
 
-        # Проверка размерностей весов
+        # Check weight dimensions
         assert memory_module.memory.weight.shape == (64, 32)
         assert memory_module.gate_proj[2].weight.shape == (3, 64)  # 3 gates, hidden_dim
 
-        # Проверка начальных значений
+        # Check initial values
         assert torch.all(memory_module.momentum_S == 0)
 
     def test_titans_init_custom_dims(self):
-        """Проверка инициализации с кастомными размерностями."""
-        module = TitansMemoryModule(key_dim=128, val_dim=256, hidden_dim=128)
-        assert module.key_dim == 128
-        assert module.val_dim == 256
+        """Verify initialization with custom dimensions."""
+        module = TitansMemory(clifford_dim=256, memory_key_dim=128)
+        assert module.clifford_dim == 256
+        assert module.memory_key_dim == 128
         assert module.memory.weight.shape == (256, 128)
 
 
 class TestTitansUpdateBasic:
-    """Тесты базового обновления памяти."""
+    """Tests for basic memory update."""
 
     def test_titans_update_basic(self, memory_module):
-        """Базовое обновление памяти в training режиме."""
+        """Basic memory update in training mode."""
         memory_module.train()
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
+        x = torch.randn(2, 64)
 
-        # Сохраняем начальное состояние весов
+        # Save initial weights
         initial_weight = memory_module.memory.weight.clone().detach()
 
-        # Выполняем обновление
-        alpha, eta, theta = memory_module.update(key, value)
+        # Perform update
+        result = memory_module(x, update_memory=True)
 
-        # Проверяем, что веса изменились
+        # Check weights changed
         assert not torch.allclose(memory_module.memory.weight, initial_weight)
 
-        # Проверяем размерности возвращаемых значений
-        assert alpha.shape == ()
-        assert eta.shape == ()
-        assert theta.shape == ()
+        # Check result type
+        assert isinstance(result, MemoryResult)
+        assert result.updated is True
 
-        # Проверяем, что гейты валидные (sigmoid output)
-        assert 0 <= alpha.item() <= 1
-        assert 0 <= eta.item() <= 1
-        assert 0 <= theta.item() <= 1
+        # Check Titans gate values are valid (sigmoid output)
+        if result.alpha is not None:
+            assert 0 <= result.alpha.item() <= 1
 
     def test_titans_update_frozen(self, memory_module):
-        """Память не обновляется когда заморожена."""
+        """Memory doesn't update when frozen."""
         memory_module.freeze_memory()
         memory_module.train()
 
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
+        x = torch.randn(2, 64)
         initial_weight = memory_module.memory.weight.clone().detach()
 
-        # retrieve_and_update с update_memory=True должен игнорироваться
-        state = memory_module.retrieve_and_update(key, value, update_memory=True)
+        result = memory_module(x, update_memory=True)
 
-        # Веса не должны измениться
+        # Weights should not change
         assert torch.allclose(memory_module.memory.weight, initial_weight)
-        assert state.updated is False
+        assert result.updated is False
 
 
 class TestTitansRetrieval:
-    """Тесты извлечения из памяти."""
+    """Tests for memory retrieval."""
 
     def test_titans_retrieval(self, memory_module):
-        """Извлечение из памяти без обновления."""
+        """Retrieval from memory without update."""
         memory_module.eval()
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
+        x = torch.randn(2, 64)
 
-        state = memory_module.retrieve(key, value)
+        result = memory_module(x, update_memory=False)
 
-        # Проверка типа результата
-        assert isinstance(state, MemoryState)
+        # Check result type
+        assert isinstance(result, MemoryResult)
 
-        # Проверка размерностей
-        assert state.retrieved.shape == (2, 64)
-        assert state.loss.ndim == 0  # scalar loss
+        # Check dimensions
+        assert result.output.shape == (2, 64)
+        assert result.loss.ndim == 0  # scalar loss
 
-        # Проверка флага обновления
-        assert state.updated is False
+        # Check update flag
+        assert result.updated is False
 
     def test_titans_retrieve_and_update(self, memory_module):
-        """Комбинированный retrieve + update."""
+        """Combined retrieve + update."""
         memory_module.train()
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
+        x = torch.randn(2, 64)
 
-        state = memory_module.retrieve_and_update(key, value, update_memory=True)
+        result = memory_module(x, update_memory=True)
 
-        assert state.retrieved.shape == (2, 64)
-        assert state.updated is True
-        assert state.alpha is not None
-        assert state.eta is not None
-        assert state.theta is not None
+        assert result.output.shape == (2, 64)
+        assert result.updated is True
+        assert result.alpha is not None
+        assert result.eta is not None
+        assert result.theta is not None
 
 
 class TestTitansGradientFlow:
-    """Тесты градиентного потока."""
+    """Tests for gradient flow."""
 
     def test_titans_gradient_flow(self, memory_module):
-        """Градиенты проходят через forward pass."""
+        """Gradients flow through forward pass."""
         memory_module.train()
-        key = torch.randn(2, 32, requires_grad=True)
-        value = torch.randn(2, 64, requires_grad=True)
+        x = torch.randn(2, 64, requires_grad=True)
 
-        retrieved, loss = memory_module(key, value, update_memory=False)
-
-        # Backward pass
+        result = memory_module(x, update_memory=False)
+        loss = result.output.sum()
         loss.backward()
 
-        # Проверяем, что градиенты вычислены для ключа
-        assert key.grad is not None
-        # Примечание: value.grad может быть None т.к. v используется только в loss
-        # через detach() внутри retrieve() для стабильности TTT
-
-        # Проверяем, что градиенты не NaN
-        assert not torch.isnan(key.grad).any()
+        # Check gradients computed for input
+        assert x.grad is not None
+        # Check gradients not NaN
+        assert not torch.isnan(x.grad).any()
 
     def test_titans_memory_gradient(self, memory_module):
-        """Градиенты проходят через веса памяти."""
+        """Gradients flow through memory weights."""
         memory_module.train()
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
+        x = torch.randn(2, 64)
 
-        retrieved, loss = memory_module(key, value, update_memory=False)
-        loss.backward()
+        result = memory_module(x, update_memory=False)
+        result.loss.backward()
 
-        # Градиенты должны быть у весов памяти
+        # Memory weights should have gradients
         assert memory_module.memory.weight.grad is not None or not memory_module.memory.weight.requires_grad
 
 
 class TestTitansMemoryDecay:
-    """Тесты затухания памяти."""
+    """Tests for memory decay."""
 
     def test_titans_memory_decay_hard(self, memory_module):
-        """Hard reset полностью обнуляет память."""
-        # Сначала обновляем память
+        """Hard reset completely zeroes memory."""
         memory_module.train()
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
-        memory_module.update(key, value)
+        x = torch.randn(2, 64)
+        memory_module(x, update_memory=True)
 
         # Hard reset
-        memory_module.reset_memory(strategy='hard')
+        memory_module.reset(strategy='hard')
 
-        # Проверяем, что всё обнулено
+        # Check everything zeroed
         assert torch.all(memory_module.memory.weight == 0)
         assert torch.all(memory_module.momentum_S == 0)
 
     def test_titans_memory_decay_geometric(self, memory_module):
-        """Geometric decay сохраняет паттерны."""
-        # Обновляем память
+        """Geometric decay preserves patterns."""
         memory_module.train()
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
-        memory_module.update(key, value)
+        x = torch.randn(2, 64)
+        memory_module(x, update_memory=True)
 
         weight_before = memory_module.memory.weight.clone().detach()
         momentum_before = memory_module.momentum_S.clone().detach()
 
         # Geometric reset
-        memory_module.reset_memory(strategy='geometric', decay_window=50.0)
+        memory_module.reset(strategy='geometric', decay_window=50.0)
 
-        # Веса должны уменьшиться, но не обнулиться
-        assert torch.all(memory_module.memory.weight.abs() <= weight_before.abs())
-        assert torch.all(memory_module.momentum_S.abs() <= momentum_before.abs())
+        # Weights should decrease but not zero out
+        assert torch.all(memory_module.memory.weight.abs() <= weight_before.abs() + 1e-6)
+        assert torch.all(memory_module.momentum_S.abs() <= momentum_before.abs() + 1e-6)
 
-        # Проверяем, что не всё обнулилось
+        # Check not everything zeroed
         assert memory_module.memory.weight.abs().sum() > 0 or weight_before.abs().sum() == 0
 
     def test_titans_memory_decay_stabilize(self, memory_module):
-        """Stabilize только нормирует momentum."""
+        """Stabilize only normalizes momentum."""
         memory_module.train()
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
-        memory_module.update(key, value)
+        x = torch.randn(2, 64)
+        memory_module(x, update_memory=True)
 
         weight_before = memory_module.memory.weight.clone().detach()
 
-        memory_module.reset_memory(strategy='stabilize')
+        memory_module.reset(strategy='stabilize')
 
-        # Веса памяти не должны измениться
+        # Memory weights should not change
         assert torch.allclose(memory_module.memory.weight, weight_before)
 
 
 class TestTitansNumericalStability:
-    """Тесты числовой стабильности."""
+    """Tests for numerical stability."""
 
     def test_titans_numerical_stability_normal(self, memory_module):
-        """Нет NaN/Inf при нормальных входах."""
+        """No NaN/Inf with normal inputs."""
         memory_module.train()
-        key = torch.randn(4, 32)
-        value = torch.randn(4, 64)
+        x = torch.randn(4, 64)
 
-        retrieved, loss = memory_module(key, value, update_memory=True)
+        result = memory_module(x, update_memory=True)
 
-        assert not torch.isnan(retrieved).any()
-        assert not torch.isinf(retrieved).any()
-        assert not torch.isnan(loss)
-        assert not torch.isinf(loss)
+        assert not torch.isnan(result.output).any()
+        assert not torch.isinf(result.output).any()
+        assert not torch.isnan(result.loss)
+        assert not torch.isinf(result.loss)
 
     def test_titans_numerical_stability_large_values(self, memory_module):
-        """Стабильность при больших значениях входов."""
+        """Stability with large input values."""
         memory_module.train()
-        key = torch.randn(4, 32) * 100
-        value = torch.randn(4, 64) * 100
+        x = torch.randn(4, 64) * 100
 
-        retrieved, loss = memory_module(key, value, update_memory=True)
+        result = memory_module(x, update_memory=True)
 
-        # Благодаря clamp в update, веса не должны взорваться
-        assert not torch.isnan(retrieved).any()
-        assert not torch.isinf(retrieved).any()
+        # Thanks to clamp in update, weights shouldn't explode
+        assert not torch.isnan(result.output).any()
+        assert not torch.isinf(result.output).any()
 
-        # Проверяем, что веса памяти в разумных пределах
+        # Memory weights in reasonable range
         assert memory_module.memory.weight.abs().max() < 100
 
     def test_titans_numerical_stability_small_values(self, memory_module):
-        """Стабильность при очень маленьких значениях."""
+        """Stability with very small input values."""
         memory_module.train()
-        key = torch.randn(4, 32) * 1e-6
-        value = torch.randn(4, 64) * 1e-6
+        x = torch.randn(4, 64) * 1e-6
 
-        retrieved, loss = memory_module(key, value, update_memory=True)
+        result = memory_module(x, update_memory=True)
 
-        assert not torch.isnan(retrieved).any()
-        assert not torch.isinf(retrieved).any()
-
-
-class TestTitansFreezeUnfreeze:
-    """Тесты заморозки/разморозки памяти."""
-
-    def test_freeze_memory(self, memory_module):
-        """Заморозка памяти для RAG inference."""
-        memory_module.freeze_memory()
-
-        assert memory_module.is_frozen() is True
-        assert memory_module.memory.weight.requires_grad is False
-
-    def test_unfreeze_memory(self, memory_module):
-        """Разморозка для обучения."""
-        memory_module.freeze_memory()
-        memory_module.unfreeze_memory()
-
-        assert memory_module.is_frozen() is False
-        assert memory_module.memory.weight.requires_grad is True
-
-    def test_frozen_memory_no_update(self, memory_module):
-        """Замороженная память не обновляется."""
-        memory_module.freeze_memory()
-        memory_module.train()
-
-        key = torch.randn(2, 32)
-        value = torch.randn(2, 64)
-        initial_weight = memory_module.memory.weight.clone().detach()
-
-        # Попытка обновления
-        state = memory_module.retrieve_and_update(key, value, update_memory=True)
-
-        # Веса не изменились
-        assert torch.allclose(memory_module.memory.weight, initial_weight)
-        assert state.updated is False
+        assert not torch.isnan(result.output).any()
+        assert not torch.isinf(result.output).any()

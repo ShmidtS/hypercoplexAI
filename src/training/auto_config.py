@@ -12,7 +12,7 @@ Derivation Chain:
     expert_names → num_experts
 
 Usage:
-    >>> from src.core.auto_config import AutoConfig
+    >>> from src.training.auto_config import AutoConfig
     >>> cfg = AutoConfig(encoder_type="modernbert", expert_names=["math", "code"])
     >>> cfg.hidden_dim  # 768 (from ModernBERT)
     >>> cfg.clifford_dim  # 32 (2^5 for Cl(4,1,0))
@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from src.models.hdim_model import HDIMConfig
-    from src.core.moe_kernel import MoEKernelConfig
+    from src.core.moe import MoEKernelConfig
     from src.training.experiment_config import ExperimentConfig
 
 
@@ -534,12 +534,12 @@ class AutoConfig:
         return HDIMConfig(
             hidden_dim=self._hidden_dim_resolved,
             num_domains=num_domains,
-            num_experts=self._num_experts,
+            moe={"num_experts": self._num_experts},
             expert_names=self.expert_names,
             clifford_p=self.clifford_p,
             clifford_q=self.clifford_q,
             clifford_r=self.clifford_r,
-            memory_key_dim=self._memory_key_dim,
+            memory={"memory_key_dim": self._memory_key_dim},
             **{k: v for k, v in overrides.items() if k not in reserved},
         )
     
@@ -558,7 +558,7 @@ class AutoConfig:
             >>> cfg = AutoConfig(expert_names=["math", "code", "science"])
             >>> moe_cfg = cfg.to_moe_kernel_config(use_shared_expert=False)
         """
-        from src.core.moe_kernel import MoEKernelConfig
+        from src.core.moe import MoEKernelConfig
         
         return MoEKernelConfig(
             input_dim=self.clifford_dim,
@@ -599,7 +599,7 @@ class AutoConfig:
     @classmethod
     def from_encoder(
         cls,
-        encoder_type: str = "sbert",
+        encoder_type: Literal["sbert", "modernbert", "custom"] = "sbert",
         encoder_name: Optional[str] = None,
         **kwargs: Any,
     ) -> "AutoConfig":
@@ -617,7 +617,7 @@ class AutoConfig:
         Example:
             >>> cfg = AutoConfig.from_encoder("modernbert", expert_names=["math"])
         """
-        return cls(encoder_type=encoder_type, encoder_name=encoder_name, **kwargs)
+        return cls(encoder_type=cast(Literal["sbert", "modernbert", "custom"], encoder_type), encoder_name=encoder_name, **kwargs)
     
     @classmethod
     def from_clifford_signature(
@@ -680,8 +680,8 @@ class AutoConfig:
             clifford_q=hdim_cfg.clifford_q,
             clifford_r=hdim_cfg.clifford_r,
             expert_names=hdim_cfg.expert_names,
-            num_experts=hdim_cfg.num_experts,
-            memory_key_dim=hdim_cfg.memory_key_dim,
+            num_experts=hdim_cfg.moe.num_experts,
+            memory_key_dim=hdim_cfg.memory.memory_key_dim,
         )
     
     # ----------------------------------------------------------

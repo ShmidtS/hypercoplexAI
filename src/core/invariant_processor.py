@@ -20,7 +20,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .memory_interface import MemoryInterface, MemoryResult
+from .memory.interface import MemoryInterface, MemoryResult
 
 
 @dataclass

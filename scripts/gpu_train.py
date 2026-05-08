@@ -471,23 +471,17 @@ def run_gpu_training(
     trainer = HDIMTrainer(
         model, optimizer,
         device=device,
-        lambda_iso=args.lambda_iso,
         lambda_pair=args.lambda_pair,
         lambda_routing=args.lambda_routing,
         lambda_memory=args.lambda_memory,
         ranking_margin=args.ranking_margin,
         use_infonce=getattr(args, 'use_infonce', True),
         infonce_temperature=getattr(args, 'infonce_temperature', ExperimentConfig.infonce_temperature),
-        lambda_sts=getattr(args, 'lambda_sts', 0.0),
-        lambda_angle=getattr(args, 'lambda_angle', 0.0),
-        lambda_supcon=getattr(args, 'lambda_supcon', 0.0),
         lambda_z=getattr(args, 'lambda_z', 0.0),
         lambda_expert_ortho=getattr(args, 'lambda_expert_ortho', 0.0),
         learnable_temperature=getattr(args, 'learnable_temperature', False),
         lambda_dcl=getattr(args, 'lambda_dcl', ExperimentConfig.lambda_dcl),
         lambda_uniformity=getattr(args, 'lambda_uniformity', ExperimentConfig.lambda_uniformity),
-        lambda_diversity_var=getattr(args, 'lambda_diversity_var', 0.0),
-        lambda_diversity_ortho=getattr(args, 'lambda_diversity_ortho', 0.0),
         lambda_matryoshka=getattr(args, 'lambda_matryoshka', ExperimentConfig.lambda_matryoshka),
         aug_noise_std=getattr(args, 'aug_noise_std', 0.0),
         aug_mixup_alpha=getattr(args, 'aug_mixup_alpha', 0.0),
@@ -512,29 +506,24 @@ def run_gpu_training(
     if getattr(args, 'sc_temperature', False):
         trainer.use_sc_temperature = True
         print("SC-InfoNCE cluster temperature: ENABLED")
-    # Phase 22: Enable model-level flags
+    # Phase 22: Config-level features
     _p22_flags = []
-    if getattr(args, 'gradient_surprise', False) and hasattr(model, 'enable_gradient_surprise'):
-        model.enable_gradient_surprise()
+    if getattr(cfg.memory, 'use_gradient_surprise', False):
         _p22_flags.append("gradient_surprise")
-    if getattr(args, 'adaptive_forgetting', False) and hasattr(model, 'enable_adaptive_forgetting'):
-        model.enable_adaptive_forgetting()
+    if getattr(cfg.memory, 'use_adaptive_forgetting', False):
         _p22_flags.append("adaptive_forgetting")
     if getattr(args, 'learnable_metric', False) and hasattr(model, 'enable_learnable_metric'):
         model.enable_learnable_metric()
         _p22_flags.append("learnable_metric")
     if _p22_flags:
         print(f"Phase 22 features: {', '.join(_p22_flags)}")
-    # Phase 26: MoE Expert features
+    # Phase 26: MoE config-level features
     _p26_flags = []
-    if getattr(args, 'shared_expert', False) and hasattr(model, 'enable_shared_expert'):
-        model.enable_shared_expert()
+    if getattr(cfg.moe, 'n_shared_experts', 0) > 0:
         _p26_flags.append("shared_expert")
-    if getattr(args, 'aux_loss_free', False) and hasattr(model, 'enable_aux_loss_free'):
-        model.enable_aux_loss_free(aux_lr=getattr(args, 'aux_lr', 0.001))
+    if getattr(cfg.moe, 'use_aux_loss_free', False):
         _p26_flags.append("aux_loss_free")
-    if getattr(args, 'expert_ortho', False) and hasattr(model, 'enable_expert_ortho'):
-        model.enable_expert_ortho()
+    if getattr(cfg.moe, 'use_expert_ortho', False):
         _p26_flags.append("expert_ortho")
     if _p26_flags:
         print(f"Phase 26 features: {', '.join(_p26_flags)}")
@@ -874,10 +863,6 @@ def main() -> None:
     parser.add_argument("--lambda_uniformity", type=float, default=0.02,
                         help="Uniformity+Alignment loss weight (Wang & Isola 2020)")
     parser.add_argument("--lambda_memory", type=float, default=0.05)
-    parser.add_argument("--lambda_diversity_var", type=float, default=0.0,
-                        help="Diversity variance weight (anti-collapse, 0.0=disabled)")
-    parser.add_argument("--lambda_diversity_ortho", type=float, default=0.0,
-                        help="Diversity orthogonality weight (anti-collapse, 0.0=disabled)")
     parser.add_argument("--lambda_matryoshka", type=float, default=0.15,
                         help="Matryoshka multi-scale loss weight")
     parser.add_argument("--ranking_margin", type=float, default=0.3)
@@ -1027,7 +1012,7 @@ def main() -> None:
     # AutoConfig: derive hidden_dim and num_experts if not provided
     encoder_type = getattr(args, 'encoder_type', 'sbert')
     if args.hidden_dim is None or args.num_experts is None:
-        from src.core.auto_config import AutoConfig
+        from src.training.auto_config import AutoConfig
         auto_cfg = AutoConfig(encoder_type=encoder_type, num_experts=args.num_experts, strict_validation=False)
         hidden_dim = args.hidden_dim if args.hidden_dim is not None else auto_cfg.hidden_dim_resolved
         num_experts = args.num_experts if args.num_experts is not None else auto_cfg.num_experts_resolved
@@ -1039,13 +1024,24 @@ def main() -> None:
     _dropout_override = getattr(args, 'dropout', None)
     cfg = HDIMConfig(
         hidden_dim=hidden_dim,
-        num_experts=num_experts,
+        moe={
+            "num_experts": num_experts,
+            "n_shared_experts": 1 if getattr(args, 'shared_expert', False) else 0,
+            "use_aux_loss_free": getattr(args, 'aux_loss_free', False),
+            "aux_lr": getattr(args, 'aux_lr', 0.001),
+            "use_expert_ortho": getattr(args, 'expert_ortho', False),
+            "z_loss_weight": getattr(args, 'lambda_z', 0.0),
+        },
+        memory={
+            "memory_type": getattr(args, 'memory_type', 'titans'),
+            "use_gradient_surprise": getattr(args, 'gradient_surprise', False),
+            "use_adaptive_forgetting": getattr(args, 'adaptive_forgetting', False),
+        },
         num_domains=args.num_domains,
         dropout=_dropout_override if _dropout_override is not None else 0.1,
         clifford_p=args.clifford_p,
         clifford_q=args.clifford_q,
         clifford_r=args.clifford_r,
-        memory_type=getattr(args, 'memory_type', 'titans'),
         msa_num_prototypes=args.msa_num_prototypes,
         msa_top_k=args.msa_top_k,
         msa_chunk_size=args.msa_chunk_size,

@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 import torch.nn.functional as F
 
-from src.core.moe_kernel import MoEKernelConfig, MoEKernel, MathExpert, LanguageExpert, CodeExpert, ScienceExpert
+from src.core.moe import MoEKernelConfig, MoEKernel, MLPExpert
 from src.core.hypercomplex import CliffordAlgebra
 from src.core.hdim_pipeline import HDIMPipeline
 
@@ -69,10 +69,10 @@ def run_demo() -> int:
     failures += not check(n_params > 0, f"Ядро создано ({n_params:,} params)")
 
     # Проверяем типы экспертов
-    failures += not check(isinstance(kernel.experts[0], MathExpert), "Expert[0] = MathExpert")
-    failures += not check(isinstance(kernel.experts[1], LanguageExpert), "Expert[1] = LanguageExpert")
-    failures += not check(isinstance(kernel.experts[2], CodeExpert), "Expert[2] = CodeExpert")
-    failures += not check(isinstance(kernel.experts[3], ScienceExpert), "Expert[3] = ScienceExpert")
+    failures += not check(isinstance(kernel.experts[0], MLPExpert), "Expert[0] = MLPExpert")
+    failures += not check(isinstance(kernel.experts[1], MLPExpert), "Expert[1] = MLPExpert")
+    failures += not check(isinstance(kernel.experts[2], MLPExpert), "Expert[2] = MLPExpert")
+    failures += not check(isinstance(kernel.experts[3], MLPExpert), "Expert[3] = MLPExpert")
     failures += not check(kernel.shared_expert is not None, "SharedExpert создан")
 
     # --------------------------------------------------------

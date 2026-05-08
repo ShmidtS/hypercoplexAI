@@ -1,5 +1,4 @@
-"""
-HBMA — Human-Brain-Inspired Memory Architecture (pure PyTorch).
+"""HBMA — Human-Brain-Inspired Memory Architecture (pure PyTorch).
 
 Four memory systems inspired by McClelland et al. (1995) and HBMA paper:
   WorkingMemory   : sliding circular buffer, salience-filtered context
@@ -8,7 +7,10 @@ Four memory systems inspired by McClelland et al. (1995) and HBMA paper:
   ProceduralMemory: learnable pattern store, trigger detection, step retrieval
 
 All systems are pure PyTorch nn.Module — no external DBs, no Redis.
-Drop-in replacement for CLSMemory in HDIMPipeline.
+Implements MemoryInterface directly — adapter logic is inlined:
+  - forward(x, update_memory=False) -> MemoryResult
+  - memory_loss() returns combined auxiliary loss
+  - reset() clears all stateful buffers
 
 Extensible via MemorySubsystemPlugin for 5th+ subsystems.
 """
@@ -16,7 +18,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 if TYPE_CHECKING:
     from src.models.hdim_model import MSAConfig
 from typing import Optional
@@ -25,10 +27,71 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Phase 2 MSA: Sparse retrieval for SemanticMemory
-# Phase 3 MSA: Overflow buffer for EpisodicMemory
-from src.core.prototype_memory import MSASparseIndex, MSAOverflowBuffer
-from src.core.nars_truth import NarsTruth
+from .interface import MemoryInterface, MemoryResult
+from .sparse_index import MSASparseIndex, MSAOverflowBuffer
+
+
+# ---------------------------------------------------------------------------
+# NARS Truth-Value (inlined from nars_truth.py)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NarsTruth:
+    """NARS truth-value: (frequency, confidence) pair."""
+
+    freq: float = 0.5
+    conf: float = 0.0
+
+    EVIDENTIAL_HORIZON: ClassVar[float] = 1.0
+    MAX_CONFIDENCE: ClassVar[float] = 0.99
+    RELIANCE: ClassVar[float] = 0.9
+
+    def __post_init__(self):
+        self.freq = max(0.0, min(1.0, self.freq))
+        self.conf = max(0.0, min(self.MAX_CONFIDENCE, self.conf))
+
+    def evidential_weight(self) -> float:
+        if self.conf <= 0.0:
+            return 0.0
+        if self.conf >= self.MAX_CONFIDENCE:
+            return 1e6
+        return self.EVIDENTIAL_HORIZON * self.conf / (1.0 - self.conf)
+
+    def expectation(self) -> float:
+        return self.conf * (self.freq - 0.5) + 0.5
+
+    @staticmethod
+    def w2c(w: float, horizon: float = 1.0) -> float:
+        if w <= 0.0:
+            return 0.0
+        return min(NarsTruth.MAX_CONFIDENCE, w / (w + horizon))
+
+    @staticmethod
+    def c2w(c: float, horizon: float = 1.0) -> float:
+        if c <= 0.0:
+            return 0.0
+        if c >= NarsTruth.MAX_CONFIDENCE:
+            return 1e6
+        return horizon * c / (1.0 - c)
+
+    @staticmethod
+    def revision(a: NarsTruth, b: NarsTruth, horizon: float = 1.0) -> NarsTruth:
+        w1 = a.evidential_weight()
+        w2 = b.evidential_weight()
+        total_w = w1 + w2
+        if total_w <= 0.0:
+            return NarsTruth(freq=0.5, conf=0.0)
+        freq = (w1 * a.freq + w2 * b.freq) / total_w
+        conf = NarsTruth.w2c(total_w, horizon)
+        conf = max(conf, a.conf, b.conf)
+        return NarsTruth(freq=freq, conf=min(conf, NarsTruth.MAX_CONFIDENCE))
+
+    @staticmethod
+    def projection(conf: float, time_diff: float, decay: float = 0.8) -> float:
+        return conf * (decay ** abs(time_diff))
+
+    def __repr__(self) -> str:
+        return f"NarsTruth(f={self.freq:.3f}, c={self.conf:.3f})"
 
 
 # ---------------------------------------------------------------------------
@@ -36,22 +99,7 @@ from src.core.nars_truth import NarsTruth
 # ---------------------------------------------------------------------------
 
 class MemorySubsystemPlugin(nn.Module, ABC):
-    """Base class for HBMA memory subsystem plugins.
-
-    Subclass this to add a new memory system to HBMAMemory.
-    All nn.Parameters and registered buffers are automatically
-    tracked by the parent HBMAMemory module.
-
-    Required:
-        name: unique string identifier (e.g. "emotional", "social")
-        forward(x): returns [B, D] augmented representation
-
-    Optional:
-        on_consolidate(ctx): participate in consolidation pipeline
-        reset(): clear stateful buffers
-        auxiliary_loss(): extra diversity/regularization loss
-        priority: int — ordering hint (lower = earlier, default 10)
-    """
+    """Base class for HBMA memory subsystem plugins."""
 
     name: str = "plugin"
     priority: int = 10
@@ -72,11 +120,7 @@ class MemorySubsystemPlugin(nn.Module, ABC):
 
 @dataclass
 class ConsolidationContext:
-    """Passed to plugins during consolidation.
-
-    Gives plugins read access to other subsystems and the current
-    hidden state, so they can participate in the consolidation pipeline.
-    """
+    """Passed to plugins during consolidation."""
     hidden: torch.Tensor
     working: WorkingMemory
     episodic: EpisodicMemory
@@ -85,19 +129,13 @@ class ConsolidationContext:
     is_training: bool
     step: int
 
+
 # ---------------------------------------------------------------------------
 # Salience Scorer (vectorised, differentiable where needed)
 # ---------------------------------------------------------------------------
 
 class SalienceScorer(nn.Module):
-    """
-    Multi-factor salience scoring.
-
-    score = 0.45*similarity + 0.20*recency + 0.15*frequency
-            + 0.10*importance + 0.10*type_weight
-
-    All inputs are tensors; operates on [B, S] similarity matrices.
-    """
+    """Multi-factor salience scoring."""
 
     W_SIM   = 0.45
     W_REC   = 0.20
@@ -107,19 +145,17 @@ class SalienceScorer(nn.Module):
 
     def score(
         self,
-        similarity: torch.Tensor,   # [B, S]  cosine similarity to slots
-        age: torch.Tensor,          # [S]     slot age in steps
-        frequency: torch.Tensor,    # [S]     access count
-        importance: torch.Tensor,   # [S]     slot importance in [0,1]
+        similarity: torch.Tensor,
+        age: torch.Tensor,
+        frequency: torch.Tensor,
+        importance: torch.Tensor,
         type_weight: float = 0.8,
         decay_half_life: float = 200.0,
-    ) -> torch.Tensor:              # [B, S]
-        # recency: exponential decay by age
-        recency = torch.exp((-age / decay_half_life).clamp(max=80)).unsqueeze(0)          # [1,S]
-        # frequency: log-normalised
+    ) -> torch.Tensor:
+        recency = torch.exp((-age / decay_half_life).clamp(max=80)).unsqueeze(0)
         freq_norm = (torch.log(frequency + 1.0) /
-                     (torch.log(frequency.max() + 2.0).clamp(min=1e-8) + 1e-8)).unsqueeze(0)  # [1,S]
-        imp = importance.unsqueeze(0)                                     # [1,S]
+                     (torch.log(frequency.max() + 2.0).clamp(min=1e-8) + 1e-8)).unsqueeze(0)
+        imp = importance.unsqueeze(0)
         tw  = torch.full_like(recency, type_weight)
 
         sal = (self.W_SIM  * similarity
@@ -135,23 +171,12 @@ class SalienceScorer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class WorkingMemory(nn.Module):
-    """
-    Sliding circular buffer of recent hidden states.
-
-    Inspired by Miller's 7+-2 rule and Baddeley's working memory model.
-    Stores the N most recent vectors with exponential recency weighting.
-    Retrieval uses soft attention weighted by salience.
-
-    Properties:
-    - High temporal resolution (step-level)
-    - Fast read/write (O(N) attention)
-    - No gradient through buffer writes (stateful but detached)
-    """
+    """Sliding circular buffer of recent hidden states."""
 
     def __init__(
         self,
         hidden_dim: int,
-        capacity: int = 16,       # Miller 7+-2, using 16 for richer context
+        capacity: int = 16,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -166,7 +191,6 @@ class WorkingMemory(nn.Module):
         self.norm     = nn.LayerNorm(hidden_dim)
         self.dropout  = nn.Dropout(dropout)
 
-        # Buffer: circular store
         self.register_buffer("buf",         torch.zeros(capacity, hidden_dim))
         self.register_buffer("buf_age",     torch.zeros(capacity))
         self.register_buffer("buf_freq",    torch.ones(capacity))
@@ -177,7 +201,6 @@ class WorkingMemory(nn.Module):
 
     @torch.no_grad()
     def _write(self, x: torch.Tensor, importance: float = 0.5) -> None:
-        """Write mean of batch to next buffer slot."""
         slot = self.write_ptr[0] % self.capacity
         self.buf[slot] = x.detach().mean(0)
         self.buf_age[slot] = 0
@@ -189,26 +212,23 @@ class WorkingMemory(nn.Module):
         self.filled[0] = (self.filled[0] + 1).clamp(max=self.capacity)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, D] → memory-augmented [B, D]"""
         n = max(int(self.filled[0]), 1)
-        # buf_snap требует clone для градиентного вычисления; остальные - detach only
-        buf_snap = self.buf[:n].detach().clone() # [N, D] — нужен clone для k_proj/v_proj
-        age_snap = self.buf_age[:n].detach()  # read-only metadata
-        freq_snap = self.buf_freq[:n].detach()  # read-only metadata
-        imp_snap = self.buf_imp[:n].detach()  # read-only metadata
+        buf_snap = self.buf[:n].detach().clone()
+        age_snap = self.buf_age[:n].detach()
+        freq_snap = self.buf_freq[:n].detach()
+        imp_snap = self.buf_imp[:n].detach()
 
-        q = self.q_proj(x)                           # [B, D]
-        k = self.k_proj(buf_snap)                    # [N, D]
-        v = self.v_proj(buf_snap)                    # [N, D]
+        q = self.q_proj(x)
+        k = self.k_proj(buf_snap)
+        v = self.v_proj(buf_snap)
 
-        # Attention
-        sim   = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).T  # [B, N]
+        sim   = F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).T
         sal   = self._salience.score(sim, age_snap, freq_snap, imp_snap,
                                      type_weight=1.0)
-        attn  = F.softmax(sal.float(), dim=-1).to(sal.dtype)               # [B, N]
+        attn  = F.softmax(sal.float(), dim=-1).to(sal.dtype)
         with torch.no_grad():
             self.buf_freq[:n].add_(attn.detach().sum(dim=0))
-        retrieved = attn @ v                         # [B, D]
+        retrieved = attn @ v
 
         combined = torch.cat([x, retrieved], dim=-1)
         gate_val = torch.sigmoid(self.gate(combined))
@@ -235,17 +255,7 @@ class WorkingMemory(nn.Module):
 # ---------------------------------------------------------------------------
 
 class EpisodicMemory(nn.Module):
-    """
-    Fast episodic memory with temporal context.
-
-    Extends HippocampusMemory with:
-    - Temporal position encoding (sequence order preservation)
-    - Importance-weighted writes (HBMA salience model)
-    - Confidence per slot
-    - Session-level consolidation signal
-
-    Analogous to CA3/CA1 hippocampal circuits.
-    """
+    """Fast episodic memory with temporal context."""
 
     def __init__(
         self,
@@ -255,12 +265,10 @@ class EpisodicMemory(nn.Module):
         forgetting_rate: float = 0.05,
         surprise_threshold: float = 0.4,
         dropout: float = 0.1,
-        # NARS integration gate for per-slot durability (C2.1)
         use_per_slot_durability: bool = False,
- # Phase 3 MSA: Overflow feature flag
- use_overflow: bool = True,
- overflow_num_prototypes: int = 1024,
- overflow_max_hops: int = 3,
+        use_overflow: bool = True,
+        overflow_num_prototypes: int = 1024,
+        overflow_max_hops: int = 3,
     ) -> None:
         super().__init__()
         self.hidden_dim        = hidden_dim
@@ -279,7 +287,6 @@ class EpisodicMemory(nn.Module):
         self.dropout   = nn.Dropout(dropout)
         self.write_rate = nn.Parameter(torch.tensor(0.3))
 
-        # Temporal position encoding
         self.pos_enc = nn.Embedding(num_slots, key_dim)
 
         self.register_buffer("mem_keys",    torch.randn(num_slots, key_dim) * 0.02)
@@ -291,7 +298,7 @@ class EpisodicMemory(nn.Module):
         self.register_buffer("slot_order",  torch.arange(num_slots))
         self.register_buffer("step",        torch.zeros(1, dtype=torch.long))
         self._salience = SalienceScorer()
-         # Phase 3 MSA: Overflow buffer (disabled by default for backward compat)
+
         if use_overflow:
             self.overflow = MSAOverflowBuffer(
                 dim=hidden_dim,
@@ -320,19 +327,14 @@ class EpisodicMemory(nn.Module):
         if not write_mask.any():
             return
         wr = torch.sigmoid(self.write_rate)
-        # Forgetting: per-write exponential decay, not accumulated-age compounding
         self.mem_age += 1
         decay_rate = self.mem_durability if self.use_per_slot_durability else torch.as_tensor(self.forgetting_rate, device=self.mem_vals.device)
         decay = torch.exp(-decay_rate).clamp_min(torch.exp(torch.tensor(-80.0, device=self.mem_vals.device)))
         self.mem_vals.mul_(decay.unsqueeze(-1) if decay.ndim > 0 else decay)
-        # Confidence decay
         self.mem_conf.mul_(0.99)
 
-        # LRU write target — tensor index (avoids .item() sync)
         lru_slot = self.mem_age.argmax()
-        # Phase 3 MSA: Store evicted slot in overflow buffer
         if self.overflow is not None and self.overflow.is_enabled():
-            # Store the evicted slot before overwriting
             self.overflow.store(
                 self.mem_keys[lru_slot].detach(),
                 self.mem_vals[lru_slot].detach(),
@@ -349,37 +351,32 @@ class EpisodicMemory(nn.Module):
             self.mem_durability[lru_slot].copy_((self.mem_durability[lru_slot] * 0.8).clamp(min=0.01))
         else:
             self.mem_durability[lru_slot].fill_(self.forgetting_rate)
-        # Temporal ordering: record step
         self.slot_order[lru_slot] = self.step[0].clone()
         self.step[0] += 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        query_k  = self.key_proj(x)    # [B, K]
-        query_v  = self.val_proj(x)    # [B, D]
+        query_k  = self.key_proj(x)
+        query_v  = self.val_proj(x)
         surprise = self._surprise(query_k)
 
-        # Snap buffers
-        keys_snap = self.mem_keys.detach().clone()   # [S, K]
-        vals_snap = self.mem_vals.detach().clone()   # [S, D]
+        keys_snap = self.mem_keys.detach().clone()
+        vals_snap = self.mem_vals.detach().clone()
         age_snap  = self.mem_age.detach().clone()
         conf_snap = self.mem_conf.detach().clone()
 
-        # Add temporal position encoding to keys
         pos_idx = (self.slot_order % self.num_slots).detach()
-        pos_emb = self.pos_enc(pos_idx)             # [S, K]
+        pos_emb = self.pos_enc(pos_idx)
         keys_with_pos = F.normalize(keys_snap + 0.1 * pos_emb, dim=-1)
         query_norm    = F.normalize(query_k, dim=-1)
 
-        sim  = query_norm @ keys_with_pos.T  # [B, S]
+        sim  = query_norm @ keys_with_pos.T
         sal  = self._salience.score(sim, age_snap, age_snap.clamp(min=1),
                                     conf_snap, type_weight=0.8)
         attn = F.softmax(sal.float(), dim=-1).to(sal.dtype)
         retrieved = attn @ vals_snap
 
-        # Phase 3 MSA: Memory Interleave for overflow retrieval
         if self.overflow is not None and self.overflow.is_enabled():
-            # Use confidence as primary result quality indicator
-            primary_conf = (attn * conf_snap.unsqueeze(0)).sum(dim=-1)  # [B]
+            primary_conf = (attn * conf_snap.unsqueeze(0)).sum(dim=-1)
             retrieved, used_overflow = self.overflow.retrieve_with_interleave(
                 query=x,
                 primary_result=retrieved,
@@ -398,7 +395,6 @@ class EpisodicMemory(nn.Module):
             with torch.no_grad():
                 matched_slot = attn.detach().argmax(dim=-1)
                 if self.use_per_slot_durability:
-                    # Accessed memories become more durable by reducing their forgetting rate.
                     counts = torch.bincount(matched_slot, minlength=self.num_slots).to(self.mem_durability.dtype)
                     update = counts * 0.005
                     self.mem_durability.copy_((self.mem_durability - update).clamp(min=0.0, max=0.2))
@@ -423,32 +419,20 @@ class EpisodicMemory(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SemanticMemory(nn.Module):
-    """
-    Slow semantic memory — stable facts and preferences.
-
-    Extends NeocortexMemory with:
-    - Per-prototype confidence scores (HBMA evidence_count model)
-    - Contradiction detection via cosine distance threshold
-    - Slow EMA updates (high momentum = very slow plasticity)
-    - Fact-type routing: prototypes partitioned into preference/skill/profile/context
-
-    Analogous to neocortical consolidation via interleaved replay.
-    """
+    """Slow semantic memory — stable facts and preferences."""
 
     FACT_TYPES = ["preference", "skill", "profile", "context"]
 
     def __init__(
         self,
         hidden_dim: int,
-        num_prototypes: int = 64,     # 4 types x 16 each
-        ema_momentum: float = 0.995,  # very slow — HBMA "slow decay"
+        num_prototypes: int = 64,
+        ema_momentum: float = 0.995,
         temperature: float = 0.07,
-        contradiction_thresh: float = -0.3,  # negative cosine = contradiction
+        contradiction_thresh: float = -0.3,
         dropout: float = 0.1,
-        # Phase 2 MSA: Sparse retrieval (ENABLED BY DEFAULT)
         use_msa: bool = True,
         msa_config: Optional[MSAConfig] = None,
-        # NARS integration gates (disabled by default for backward compat)
         use_nars_salience: bool = False,
         use_nars_revision: bool = False,
     ) -> None:
@@ -465,7 +449,6 @@ class SemanticMemory(nn.Module):
         self.norm     = nn.LayerNorm(hidden_dim)
         self.dropout  = nn.Dropout(dropout)
 
-        # Type router: classify input to one of 4 fact types
         self.type_router = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
@@ -474,15 +457,13 @@ class SemanticMemory(nn.Module):
 
         self.prototypes = nn.Parameter(F.normalize(torch.randn(num_prototypes, hidden_dim), dim=-1))
         self.prototypes.requires_grad = False
-        self.register_buffer("proto_conf",    torch.full((num_prototypes,), 0.5))   # confidence [0,1]
-        self.register_buffer("proto_evidence",torch.ones(num_prototypes))            # evidence count
-        self.register_buffer("proto_age",     torch.zeros(num_prototypes))           # steps since update
+        self.register_buffer("proto_conf",    torch.full((num_prototypes,), 0.5))
+        self.register_buffer("proto_evidence",torch.ones(num_prototypes))
+        self.register_buffer("proto_age",     torch.zeros(num_prototypes))
         self._salience = SalienceScorer()
-        # S3.2: Activation spreading (NARS-inspired — disabled by default)
         self.use_activation_spreading = False
         self.spreading_decay = 0.3
 
-        # Phase 2 MSA: Sparse index (enabled by default)
         self.use_nars_salience = use_nars_salience
         self.use_nars_revision = use_nars_revision
         self.use_msa = use_msa
@@ -505,54 +486,39 @@ class SemanticMemory(nn.Module):
 
     @torch.no_grad()
     def _update_prototypes(self, h: torch.Tensor) -> None:
-        """EMA update of prototype centroids with confidence tracking.
-
-        Fully vectorized — no per-prototype .item() calls.
-        Contradiction checks use batched cosine similarity instead of loop.
-        NARS revision path (rare, requires Python-level logic) defers .item()
-        to the point of use via tensor indexing.
-        """
-        h_norm = F.normalize(h.detach(), dim=-1)                     # [B, D]
-        p_norm = F.normalize(self.prototypes, dim=-1)                # [P, D]
-        sim    = h_norm @ p_norm.T                                   # [B, P]
-        assigns = sim.argmax(dim=-1)                                 # [B]
+        """EMA update of prototype centroids with confidence tracking."""
+        h_norm = F.normalize(h.detach(), dim=-1)
+        p_norm = F.normalize(self.prototypes, dim=-1)
+        sim    = h_norm @ p_norm.T
+        assigns = sim.argmax(dim=-1)
 
         self.proto_age += 1
 
-        # Vectorized centroid computation via scatter_reduce
-        # Always fp32 to avoid AMP fp16/fp32 dtype mismatch in scatter_add_
         D = h_norm.shape[1]
         proto_sum   = torch.zeros(self.num_prototypes, D, device=h.device, dtype=torch.float32)
         proto_count = torch.zeros(self.num_prototypes, device=h.device, dtype=torch.float32)
         h_norm_f32 = h_norm.float()
 
-        # Expand assigns for scatter: [B] -> [B, 1] to broadcast over dim
         proto_sum.scatter_add_(0, assigns.unsqueeze(-1).expand(-1, D), h_norm_f32)
         proto_count.scatter_add_(0, assigns, torch.ones_like(assigns, dtype=torch.float32))
 
-        # Compute centroids for all prototypes at once
         has_samples = proto_count > 0
-        safe_count = proto_count.clamp(min=1).unsqueeze(-1)          # [P, 1]
-        centroids = proto_sum / safe_count                            # [P, D]
+        safe_count = proto_count.clamp(min=1).unsqueeze(-1)
+        centroids = proto_sum / safe_count
 
-        # Batched cosine similarity: all prototypes vs their centroids
-        # Only compute for prototypes that have samples
-        active_mask = has_samples                                    # [P]
+        active_mask = has_samples
         if not active_mask.any():
             return
 
-        # Vectorized contradiction check — single GPU operation
-        active_idx = active_mask.nonzero(as_tuple=True)[0]           # [A]
-        active_centroids = centroids[active_idx]                     # [A, D]
-        active_protos = self.prototypes[active_idx]                  # [A, D]
-        curr_sims = F.cosine_similarity(active_centroids, active_protos, dim=-1)  # [A]
+        active_idx = active_mask.nonzero(as_tuple=True)[0]
+        active_centroids = centroids[active_idx]
+        active_protos = self.prototypes[active_idx]
+        curr_sims = F.cosine_similarity(active_centroids, active_protos, dim=-1)
 
-        # Split into contradicted vs aligned (vectorized masks)
         contradicted = curr_sims < self.contradiction_thresh
         aligned = ~contradicted
 
         if self.use_nars_revision:
-            # NARS revision requires per-prototype logic — defer .item() to Python boundary
             for i, p in enumerate(active_idx):
                 p = p.item()
                 if contradicted[i]:
@@ -571,15 +537,12 @@ class SemanticMemory(nn.Module):
                     updated = self.ema_momentum * self.prototypes[p] + (1 - self.ema_momentum) * centroids[p]
                     self.prototypes[p].copy_(F.normalize(updated, dim=-1))
         else:
-            # Fully vectorized non-NARS path — zero .item() calls
             contra_idx = active_idx[contradicted]
             align_idx = active_idx[aligned]
 
-            # Contradicted: decrease confidence
             if contra_idx.numel() > 0:
                 self.proto_conf[contra_idx] = (self.proto_conf[contra_idx] - 0.1).clamp(min=0.0)
 
-            # Aligned: increase confidence, reset age, EMA update prototype
             if align_idx.numel() > 0:
                 self.proto_conf[align_idx] = (self.proto_conf[align_idx] + 0.05).clamp(max=1.0)
                 self.proto_age[align_idx] = 0
@@ -588,32 +551,14 @@ class SemanticMemory(nn.Module):
                 self.prototypes.index_copy_(0, align_idx, F.normalize(updated, dim=-1))
 
     def _activation_spreading(self, attn: torch.Tensor, p_norm: torch.Tensor) -> torch.Tensor:
-        """S3.2: NARS-inspired activation spreading.
-
-        After retrieval, high-attention prototypes spread activation
-        to their neighbors via prototype-prototype cosine similarity,
-        similar to NARS InvertedAtomIndex activating related concepts.
-
-        Args:
-            attn: [B, P] attention weights from primary retrieval
-            p_norm: [P, D] normalized prototypes
-
-        Returns:
-            spread_attn: [B, P] attention with spreading applied
-        """
-        # Prototype-prototype similarity graph [P, P]
         proto_sim = p_norm @ p_norm.T
-        # Mask self-connections
         proto_sim = proto_sim * (1 - torch.eye(self.num_prototypes, device=proto_sim.device))
-        # Spread: attn @ proto_sim gives how much each prototype is activated by neighbors
-        spread = attn @ proto_sim  # [B, P]
-        # Combine with decay factor
+        spread = attn @ proto_sim
         spread_attn = attn + self.spreading_decay * spread
         return spread_attn
 
     def _dense_retrieval(self, h_norm, p_snap, p_norm, conf_snap, age_snap, ev_snap, type_weights, x):
-        """Dense retrieval via cosine similarity (fallback for MSA)."""
-        raw_sim = h_norm @ p_norm.T # [B, P]
+        raw_sim = h_norm @ p_norm.T
         type_idx = torch.arange(self.num_prototypes, device=x.device)
         type_assign = type_idx // self.protos_per_type
         type_mask = type_weights[:, type_assign]
@@ -621,57 +566,49 @@ class SemanticMemory(nn.Module):
         weighted_sim = raw_sim * type_mask * nars_conf.unsqueeze(0)
         sal = self._salience.score(weighted_sim, age_snap, ev_snap, nars_conf, type_weight=0.9)
         attn = F.softmax((sal / self.temperature).float(), dim=-1).to(sal.dtype)
-        # S3.2: Activation spreading (disabled by default)
         if self.use_activation_spreading:
             attn = self._activation_spreading(attn, p_norm)
-            attn = F.softmax(attn.float(), dim=-1).to(attn.dtype)  # re-normalize after spreading
+            attn = F.softmax(attn.float(), dim=-1).to(attn.dtype)
         return attn @ p_snap
 
     def diversity_loss(self) -> torch.Tensor:
-        """Prototype diversity loss — prevents semantic collapse."""
         p = F.normalize(self.prototypes, dim=-1)
         sim = p @ p.T
         mask = ~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
         return sim[mask].pow(2).mean()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, D] → semantically-augmented [B, D]"""
-        h = self.in_proj(x)                                          # [B, D]
+        h = self.in_proj(x)
         h_norm = F.normalize(h, dim=-1)
 
-        # Type routing — soft routing to emphasise relevant prototype partition
-        type_logits = self.type_router(x)                            # [B, 4]
-        type_weights = F.softmax(type_logits.float(), dim=-1).to(type_logits.dtype)  # [B, 4]
+        type_logits = self.type_router(x)
+        type_weights = F.softmax(type_logits.float(), dim=-1).to(type_logits.dtype)
 
-        # Snap all buffers before potential inplace updates in _update_prototypes
-        p_snap    = self.prototypes.detach().clone()                 # [P, D]
+        p_snap    = self.prototypes.detach().clone()
         conf_snap = self.proto_conf.detach().clone()
         age_snap  = self.proto_age.detach().clone()
         ev_snap   = self.proto_evidence.detach().clone()
         p_norm    = F.normalize(p_snap, dim=-1)
 
-        # Similarity with confidence weighting
-        raw_sim = h_norm @ p_norm.T                                  # [B, P]
-        # Weight by confidence and type relevance
+        raw_sim = h_norm @ p_norm.T
         type_idx = torch.arange(self.num_prototypes, device=x.device)
-        type_assign = type_idx // self.protos_per_type               # [P] -> type 0-3
-        type_mask   = type_weights[:, type_assign]                   # [B, P]
-        # Confidence weighting: NARS w2c or legacy proto_conf
+        type_assign = type_idx // self.protos_per_type
+        type_mask   = type_weights[:, type_assign]
+
         if self.use_nars_salience:
             conf_weight = ev_snap / (ev_snap + 1.0)
         else:
             conf_weight = conf_snap
-        weighted_sim = raw_sim * type_mask * conf_weight.unsqueeze(0)   # [B, P]
+        weighted_sim = raw_sim * type_mask * conf_weight.unsqueeze(0)
         sal  = self._salience.score(weighted_sim, age_snap, ev_snap,
                                     conf_weight, type_weight=0.9)
-        attn = F.softmax((sal / self.temperature).float(), dim=-1).to(sal.dtype)             # [B, P]
-        # S3.2: Activation spreading (disabled by default)
+        attn = F.softmax((sal / self.temperature).float(), dim=-1).to(sal.dtype)
         if self.use_activation_spreading:
             attn = self._activation_spreading(attn, p_norm)
             attn = F.softmax(attn.float(), dim=-1).to(attn.dtype)
-        retrieved = attn @ p_snap                                    # [B, D]
+        retrieved = attn @ p_snap
 
-        combined = torch.cat([x, retrieved], dim=-1)                 # [B, 2D]
+        combined = torch.cat([x, retrieved], dim=-1)
         out = self.dropout(F.gelu(self.out_proj(combined)))
         out = self.norm(out + x)
 
@@ -693,19 +630,7 @@ class SemanticMemory(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ProceduralMemory(nn.Module):
-    """
-    Implicit procedural memory — skills and how-to patterns.
-
-    Unlike episodic/semantic (explicit recall), procedural memory operates
-    implicitly: patterns are gradually learned via gradient descent on a
-    small content-addressable store.
-
-    Design:
-    - num_patterns learnable prototype vectors ("skill embeddings")
-    - Trigger detector: binary gate — is this query procedural?
-    - Step projector: maps retrieved pattern to actionable output
-    - Success tracking: EMA success rate per pattern slot
-    """
+    """Implicit procedural memory — skills and how-to patterns."""
 
     def __init__(
         self,
@@ -719,10 +644,8 @@ class ProceduralMemory(nn.Module):
         self.num_patterns = num_patterns
         self.temperature  = temperature
 
-        # Learnable pattern prototypes (trained by backprop)
         self.patterns = nn.Parameter(torch.randn(num_patterns, hidden_dim) * 0.02)
 
-        # Trigger detector: is this a procedural query?
         self.trigger_detector = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
@@ -730,7 +653,6 @@ class ProceduralMemory(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Step projector: patterns -> actionable representation
         self.step_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -742,39 +664,31 @@ class ProceduralMemory(nn.Module):
         self.norm       = nn.LayerNorm(hidden_dim)
         self.dropout    = nn.Dropout(dropout)
 
-        # Success rate per pattern (non-differentiable, EMA tracked)
         self.register_buffer("success_rate", torch.full((num_patterns,), 0.5))
         self.register_buffer("usage_count",  torch.zeros(num_patterns))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, D] → procedurally-augmented [B, D]"""
-        # Trigger gate: how procedural is this query?
-        trigger = self.trigger_detector(x)                           # [B, 1]
+        trigger = self.trigger_detector(x)
 
-        # Pattern matching via cosine similarity
-        p_norm = F.normalize(self.patterns, dim=-1)                  # [P, D]
-        x_norm = F.normalize(x, dim=-1)                              # [B, D]
-        sim    = x_norm @ p_norm.T                                   # [B, P]
+        p_norm = F.normalize(self.patterns, dim=-1)
+        x_norm = F.normalize(x, dim=-1)
+        sim    = x_norm @ p_norm.T
 
-        # Weight by success rate
-        weighted_sim = sim * self.success_rate.detach().clone().unsqueeze(0)  # [B, P]
-        attn = F.softmax((weighted_sim / self.temperature).float(), dim=-1).to(weighted_sim.dtype)                 # [B, P]
+        weighted_sim = sim * self.success_rate.detach().clone().unsqueeze(0)
+        attn = F.softmax((weighted_sim / self.temperature).float(), dim=-1).to(weighted_sim.dtype)
 
-        # Retrieve and project patterns
-        retrieved = attn @ self.patterns                             # [B, D]
-        stepped   = self.step_proj(retrieved)                        # [B, D]
+        retrieved = attn @ self.patterns
+        stepped   = self.step_proj(retrieved)
 
-        # Blend: trigger gate controls how much procedural info to inject
-        combined  = torch.cat([x, stepped], dim=-1)                  # [B, 2D]
-        gate_val  = torch.sigmoid(self.blend_gate(combined)) * trigger  # [B, D]
+        combined  = torch.cat([x, stepped], dim=-1)
+        gate_val  = torch.sigmoid(self.blend_gate(combined)) * trigger
         blended   = gate_val * stepped + (1 - gate_val) * x
         out = self.dropout(F.gelu(self.out_proj(combined)))
         out = self.norm(out + blended)
 
-        # Update usage stats (no_grad)
         if self.training:
             with torch.no_grad():
-                best_patterns = attn.argmax(dim=-1)                  # [B]
+                best_patterns = attn.argmax(dim=-1)
                 counts = torch.bincount(best_patterns, minlength=self.num_patterns)
                 self.usage_count += counts.to(self.usage_count.device)
 
@@ -782,7 +696,6 @@ class ProceduralMemory(nn.Module):
 
     @torch.no_grad()
     def update_success(self, pattern_idx: int, success: bool, ema: float = 0.9) -> None:
-        """Update success rate for a specific pattern slot."""
         self.success_rate[pattern_idx] = (
             ema * self.success_rate[pattern_idx] + (1 - ema) * float(success)
         )
@@ -798,38 +711,24 @@ class ProceduralMemory(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ConsolidationEngine(nn.Module):
-    """
-    Memory consolidation: transfers patterns across memory hierarchy.
-
-    Working -> Episodic : recent context encoded as episodic traces
-    Episodic -> Semantic: repeated patterns promoted to semantic facts
-    Episodic forgetting  : low-confidence slots decayed aggressively
-    Semantic forgetting  : slow decay, conflict-aware
-
-    HBMA paper: "sleep cycle" consolidation with salience scoring.
-    In our pure-tensor model, consolidation runs at each forward step
-    (lightweight) with a separate consolidation_step() for heavier ops.
-    """
+    """Memory consolidation: transfers patterns across memory hierarchy."""
 
     def __init__(self, hidden_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # Working -> Episodic projection (compress context)
         self.w2e_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
         )
 
-        # Episodic -> Semantic extraction (fact distillation)
         self.e2s_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
         )
 
-        # Importance estimator: scalar salience for incoming pattern
         self.importance_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 4),
             nn.GELU(),
@@ -845,25 +744,16 @@ class ConsolidationEngine(nn.Module):
         episodic: EpisodicMemory,
         semantic: SemanticMemory,
     ) -> torch.Tensor:
-        """
-        Run lightweight consolidation step.
-        x: [B, D] current hidden state
-        Returns consolidated representation [B, D].
-        """
-        # Estimate importance of current input (keep as tensor until branch)
         importance_tensor = self.importance_head(x.detach()).mean()
 
-        # Working -> Episodic: promote important patterns
         if self.training and importance_tensor > 0.5:
-            e_candidate = self.w2e_proj(x)               # [B, D]
-            # Manually trigger episodic write for important inputs
+            e_candidate = self.w2e_proj(x)
             with torch.no_grad():
                 ek = episodic.key_proj(e_candidate.detach())
                 ev = episodic.val_proj(e_candidate.detach())
                 surprise = episodic._surprise(ek)
                 episodic._write(ek, ev, surprise, importance=float(importance_tensor))
 
-        # Episodic -> Semantic: distill high-confidence episodic patterns
         if importance_tensor > 0.7 and self.training:
             s_candidate = self.e2s_proj(x)
             with torch.no_grad():
@@ -873,10 +763,10 @@ class ConsolidationEngine(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# HBMAMemory — top-level drop-in replacement for CLSMemory
+# HBMAMemory — implements MemoryInterface directly (adapter logic inlined)
 # ---------------------------------------------------------------------------
 
-class HBMAMemory(nn.Module):
+class HBMAMemory(MemoryInterface):
     """
     Human-Brain-Inspired Memory Architecture (pure PyTorch).
 
@@ -891,31 +781,24 @@ class HBMAMemory(nn.Module):
       SalienceScorer      : multi-factor retrieval weighting
       Learned routing gate: decides blend of all four systems
 
-    Interface identical to CLSMemory:
-      forward(x)          -> augmented_x
-      memory_loss()       -> auxiliary diversity loss
-      reset()             -> clear all buffers
-
-    Usage in HDIMConfig: memory_type='hbma'
+    Implements MemoryInterface directly (adapter logic inlined):
+      forward(x, update_memory=False) -> MemoryResult
+      memory_loss() -> combined auxiliary loss
+      reset() -> clear all buffers
     """
 
     def __init__(
         self,
         hidden_dim: int,
-        # Working memory (Phase 1 MSA: 4x capacity)
         wm_capacity: int = 64,
-        # Episodic memory (Phase 1 MSA: 4x capacity)
         ep_slots: int = 256,
         ep_key_dim: int = 32,
         ep_forgetting_rate: float = 0.05,
         ep_surprise_threshold: float = 0.4,
-        # Semantic memory (Phase 1 MSA: 4x capacity)
         sem_prototypes: int = 256,
         sem_ema_momentum: float = 0.995,
         sem_temperature: float = 0.07,
-        # Procedural memory (Phase 1 MSA: 4x capacity)
         proc_patterns: int = 128,
-        # Shared
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -948,21 +831,17 @@ class HBMAMemory(nn.Module):
         )
         self.consolidation = ConsolidationEngine(hidden_dim=hidden_dim, dropout=dropout)
 
-        # Plugin system
         self._plugins = nn.ModuleList()
         self._plugin_names: list[str] = []
         self._needs_rebuild = False
         self._global_step = 0
 
-        # Learned 4-way routing gate
-        # Outputs [B, 4] softmax weights for [working, episodic, semantic, procedural]
         self.router = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Linear(hidden_dim // 2, 4),
         )
 
-        # Output fusion
         self.fusion_proj = nn.Linear(hidden_dim * 4, hidden_dim)
         self.fusion_gate = nn.Linear(hidden_dim, hidden_dim)
         self.norm        = nn.LayerNorm(hidden_dim)
@@ -1009,23 +888,21 @@ class HBMAMemory(nn.Module):
         self.fusion_gate = nn.Linear(self.hidden_dim, self.hidden_dim)
         self._needs_rebuild = False
 
-    def forward(
+    def _hbma_forward(
         self,
         x: torch.Tensor,
         return_gate: bool = False,
-    ) -> torch.Tensor:
-        """
-        x: [B, D]
-        Returns: [B, D] HBMA-augmented representation.
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Internal HBMA forward: returns augmented representation.
+
+        This is the original HBMAMemory.forward logic, preserved exactly.
         """
         self._maybe_rebuild()
 
-        # Run consolidation (promotes patterns across hierarchy)
         x = self.consolidation.consolidate(
             x, self.working, self.episodic, self.semantic
         )
 
-        # Plugin consolidation hooks
         if self._plugins:
             ctx = ConsolidationContext(
                 hidden=x, working=self.working, episodic=self.episodic,
@@ -1035,20 +912,17 @@ class HBMAMemory(nn.Module):
             for p in self._plugins:
                 p.on_consolidate(ctx)
 
-        # Parallel retrieval from all subsystems (built-ins + plugins)
         all_subs = self._get_all_subsystems()
         outputs = [mod(x) for _, mod in all_subs]
 
-        # Learned routing
-        gate = F.softmax(self.router(x).float(), dim=-1).to(x.dtype)  # [B, n]
+        gate = F.softmax(self.router(x).float(), dim=-1).to(x.dtype)
         blended = sum(
             gate[:, i:i+1] * out for i, out in enumerate(outputs)
-        )  # [B, D]
+        )
 
-        # Concatenate all outputs for richer fusion
-        concat = torch.cat(outputs, dim=-1)                       # [B, n*D]
-        fused  = self.dropout_(F.gelu(self.fusion_proj(concat)))  # [B, D]
-        fg     = torch.sigmoid(self.fusion_gate(fused))           # [B, D]
+        concat = torch.cat(outputs, dim=-1)
+        fused  = self.dropout_(F.gelu(self.fusion_proj(concat)))
+        fg     = torch.sigmoid(self.fusion_gate(fused))
         out    = fg * blended + (1 - fg) * fused
         out    = self.norm(out)
 
@@ -1058,22 +932,40 @@ class HBMAMemory(nn.Module):
             return out, gate
         return out
 
-    def reset(self) -> None:
-        """Reset all stateful buffers across all memory systems."""
-        self.working.reset()
-        self.episodic.reset()
-        self.semantic.reset()
-        self.procedural.reset()
-        for p in self._plugins:
-            p.reset()
+    # ------------------------------------------------------------------
+    # MemoryInterface contract
+    # ------------------------------------------------------------------
 
-    def memory_loss(self) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        update_memory: bool = False,
+    ) -> MemoryResult:
+        """MemoryInterface: single-input forward returning MemoryResult.
+
+        Inlined from HBMAMemoryAdapter:
+        - Calls internal _hbma_forward for actual computation
+        - Wraps output in MemoryResult
+        - Computes surprise as normalized deviation from input
+        - update_memory flag controls whether memory is actually updated
+          (HBMA updates internally during training when self.training is True)
         """
-        Combined auxiliary loss:
-        - Semantic diversity (prevents prototype collapse)
-        - Procedural pattern diversity
-        - Plugin auxiliary losses
-        """
+        output = self._hbma_forward(x)
+
+        loss = self._compute_memory_loss()
+        actually_updated = update_memory and self.training
+
+        surprise = (output - x).norm(dim=-1, keepdim=True) / (x.norm(dim=-1, keepdim=True) + 1e-8)
+
+        return MemoryResult(
+            output=output,
+            loss=loss,
+            updated=actually_updated,
+            surprise=surprise.detach(),
+        )
+
+    def _compute_memory_loss(self) -> torch.Tensor:
+        """Combined auxiliary loss from all subsystems."""
         sem_loss  = self.semantic.diversity_loss()
         p_norm    = F.normalize(self.procedural.patterns, dim=-1)
         proc_sim  = p_norm @ p_norm.T
@@ -1083,7 +975,6 @@ class HBMAMemory(nn.Module):
 
         base_loss = 0.7 * sem_loss + 0.3 * proc_loss
 
-        # Accumulate plugin losses
         if not self._plugins:
             return base_loss
         plugin_losses = torch.tensor(0.0, device=base_loss.device, dtype=base_loss.dtype)
@@ -1094,19 +985,28 @@ class HBMAMemory(nn.Module):
         n = len(self._plugins) + 1
         return (base_loss + plugin_losses) / n
 
+    def reset(self, strategy: str = 'geometric') -> None:
+        """Reset all stateful buffers across all memory systems."""
+        self.working.reset()
+        self.episodic.reset()
+        self.semantic.reset()
+        self.procedural.reset()
+        for p in self._plugins:
+            p.reset()
+
+    def memory_loss(self) -> torch.Tensor:
+        """Current auxiliary memory loss."""
+        return self._compute_memory_loss()
+
 
 # ---------------------------------------------------------------------------
 # Legacy aliases (backward compat with CLSMemory interface)
 # ---------------------------------------------------------------------------
 
-# Keep old names available so existing code importing CLSMemory sub-modules works
 HippocampusMemory = EpisodicMemory
 NeocortexMemory   = SemanticMemory
 
 
 class CLSMemory(HBMAMemory):
-    """
-    Backward-compatible alias: CLSMemory now delegates to HBMAMemory.
-    Existing code using CLSMemory(hidden_dim=...) continues to work.
-    """
+    """Backward-compatible alias: CLSMemory now delegates to HBMAMemory."""
     pass

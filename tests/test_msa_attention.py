@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.core.prototype_memory import (
+from src.core.memory.sparse_index import (
     MSAOverflowBuffer,
     MSASparseIndex,
 )
@@ -245,7 +245,7 @@ class TestSemanticMemoryMSA:
     @pytest.fixture
     def semantic_msa(self):
         """Create SemanticMemory with MSA enabled."""
-        from src.core.hbma_memory import SemanticMemory
+        from src.core.memory import SemanticMemory
         return SemanticMemory(
             hidden_dim=64,
             num_prototypes=32,
@@ -255,7 +255,7 @@ class TestSemanticMemoryMSA:
     @pytest.fixture
     def semantic_dense(self):
         """Create SemanticMemory with MSA disabled."""
-        from src.core.hbma_memory import SemanticMemory
+        from src.core.memory import SemanticMemory
         return SemanticMemory(
             hidden_dim=64,
             num_prototypes=32,
@@ -298,7 +298,7 @@ class TestSemanticMemoryMSA:
 
     def test_msa_overflow_integration(self, batch_input):
         """Test MSA integration with EpisodicMemory overflow."""
-        from src.core.hbma_memory import HBMAMemory
+        from src.core.memory import HBMAMemory
         
         # Create HBMA with MSA enabled (default)
         hbma = HBMAMemory(hidden_dim=64)
@@ -308,12 +308,12 @@ class TestSemanticMemoryMSA:
         assert hbma.episodic.use_overflow is True
         
         # Forward pass should work
-        output = hbma(batch_input)
-        assert output.shape == batch_input.shape
+        result = hbma(batch_input, update_memory=False)
+        assert result.output.shape == batch_input.shape
 
     def test_msa_config_override(self):
         """Test that MSAConfig can override defaults."""
-        from src.core.hbma_memory import SemanticMemory
+        from src.core.memory import SemanticMemory
         from src.models.hdim_model import MSAConfig
         
         cfg = MSAConfig(top_k=8, chunk_size=32, temperature=0.05)
@@ -340,7 +340,7 @@ class TestSemanticMemoryMSA:
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
-from src.core.hbma_memory import EpisodicMemory
+from src.core.memory import EpisodicMemory
 
 
 class TestMSAOverflowBuffer:

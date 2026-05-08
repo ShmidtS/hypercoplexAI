@@ -61,8 +61,6 @@ class ExperimentConfig:
     lambda_memory: float = 0.05  # memory regularization (EMA stability)
     lambda_dcl: float = 0.05  # DCL loss — decorrelation (Yeh et al. 2022)
     lambda_uniformity: float = 0.02  # uniformity on hypersphere (Wang & Isola 2020)
-    lambda_diversity_var: float = 0.0  # DISABLED: destroyed clusters. Try 0.005 max for A/B test.
-    lambda_diversity_ortho: float = 0.0  # DISABLED: conflicted with pair_loss. Try 0.005 max for A/B test.
     lambda_matryoshka: float = 0.15  # Matryoshka multi-scale loss
 
     # ------------------------------------------------------------------ #
@@ -125,17 +123,19 @@ class ExperimentConfig:
     # ------------------------------------------------------------------ #
     def to_hdim_config_kwargs(self) -> dict[str, Any]:
         """Return the subset of fields relevant to HDIMConfig construction."""
-        kwargs = dict(
-            hidden_dim=self.hidden_dim,
-            num_domains=self.num_domains,
-        )
-        # Pass expert_names if provided, otherwise pass num_experts
-        if self.expert_names is not None:
-            kwargs["expert_names"] = self.expert_names
-        elif self.num_experts is not None:
-            kwargs["num_experts"] = self.num_experts
+        kwargs: dict[str, Any] = {
+            "hidden_dim": self.hidden_dim,
+            "num_domains": self.num_domains,
+            "expert_names": self.expert_names,
+        }
+        moe: dict[str, Any] = {}
+        if self.num_experts is not None:
+            moe["num_experts"] = self.num_experts
         if self.n_shared_experts > 0:
-            kwargs["n_shared_experts"] = self.n_shared_experts
+            moe["n_shared_experts"] = self.n_shared_experts
+        if self.z_loss_weight > 0:
+            moe["z_loss_weight"] = self.z_loss_weight
+        kwargs["moe"] = moe
         if self.use_domain_embedding:
             kwargs["use_domain_embedding"] = self.use_domain_embedding
         if self.use_domain_lora:

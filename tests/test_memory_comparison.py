@@ -167,9 +167,8 @@ class TestMemoryComparison:
         """Run comparison once for all tests in the class."""
         device = torch.device('cpu')
         titans = run_comparison('titans', n_epochs=5, device=device)
-        cls = run_comparison('cls', n_epochs=5, device=device)
-        hippo = run_comparison('hippocampus', n_epochs=5, device=device)
-        return {'titans': titans, 'cls': cls, 'hippocampus': hippo}
+        hbma = run_comparison('hbma', n_epochs=5, device=device)
+        return {'titans': titans, 'hbma': hbma}
 
     def test_titans_trains(self, results):
         """Titans model loss decreases over training."""
@@ -178,17 +177,12 @@ class TestMemoryComparison:
             f"Titans loss did not decrease: {r['train_loss_epoch1']:.4f} -> {r['train_loss_final']:.4f}"
         )
 
-    def test_cls_trains(self, results):
-        """CLS model loss decreases over training."""
-        r = results['cls']
+    def test_hbma_trains(self, results):
+        """HBMA model loss decreases over training."""
+        r = results['hbma']
         assert r['train_loss_final'] < r['train_loss_epoch1'] * 1.1, (
-            f"CLS loss did not decrease: {r['train_loss_epoch1']:.4f} -> {r['train_loss_final']:.4f}"
+            f"HBMA loss did not decrease: {r['train_loss_epoch1']:.4f} -> {r['train_loss_final']:.4f}"
         )
-
-    def test_hippocampus_trains(self, results):
-        """Hippocampus-only model trains correctly."""
-        r = results['hippocampus']
-        assert r['train_loss_final'] < r['train_loss_epoch1'] * 1.1
 
     def test_val_loss_reasonable(self, results):
         """Both models achieve reasonable validation reconstruction loss."""
@@ -204,9 +198,9 @@ class TestMemoryComparison:
                 f"{name} routing entropy is zero — all tokens routed to same expert"
             )
 
-    def test_cls_forward_shapes(self):
-        """CLS model produces correct output shapes."""
-        cfg = HDIMConfig(memory_type='cls', hidden_dim=64, num_domains=4)
+    def test_hbma_forward_shapes(self):
+        """HBMA model produces correct output shapes."""
+        cfg = HDIMConfig(memory_type='hbma', hidden_dim=64, num_domains=4)
         m = HDIMModel(cfg)
         x = torch.randn(8, 64)
         d = torch.randint(0, 4, (8,))
@@ -228,14 +222,14 @@ class TestMemoryComparison:
 
     def test_reset_memory(self):
         """reset_memory works for both memory types."""
-        for mtype in ('titans', 'cls', 'hippocampus', 'neocortex'):
+        for mtype in ('titans', 'hbma', 'msa'):
             cfg = HDIMConfig(memory_type=mtype)
             m = HDIMModel(cfg)
             m.reset_memory()  # should not raise
 
     def test_transfer_pairs(self):
         """transfer_pairs works with batched (source, src_ids, tgt_ids) interface."""
-        cfg = HDIMConfig(memory_type='cls', hidden_dim=64, num_domains=4)
+        cfg = HDIMConfig(memory_type='hbma', hidden_dim=64, num_domains=4)
         m = HDIMModel(cfg)
         x = torch.randn(3, 64)
         src_ids = torch.tensor([0, 2, 1], dtype=torch.long)
@@ -258,7 +252,7 @@ class TestMemoryComparison:
 def print_comparison_report():
     """Print a side-by-side comparison table."""
     device = torch.device('cpu')
-    memory_types = ['titans', 'hippocampus', 'neocortex', 'cls']
+    memory_types = ['titans', 'hbma', 'msa']
     all_results = {}
 
     print('Running comparison (10 epochs each)...')

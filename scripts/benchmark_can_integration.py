@@ -24,7 +24,7 @@ import torch.nn as nn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.clifford_interaction import CliffordInteractionLayer, CliffordFFN
-from src.core.moe_kernel import MoEKernel, MoEKernelConfig, DomainExpert
+from src.core.moe import MoEKernel, MoEKernelConfig, MLPExpert
 
 
 @dataclass
@@ -131,8 +131,8 @@ def benchmark_domain_expert(
     use_can: bool,
     device: str = "cpu",
 ) -> BenchmarkResult:
-    """Benchmark a single DomainExpert."""
-    expert = DomainExpert(
+    """Benchmark a single MLPExpert."""
+    expert = MLPExpert(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         use_can=use_can,
@@ -151,7 +151,7 @@ def benchmark_domain_expert(
     memory_mb = get_memory_usage()
     
     return BenchmarkResult(
-        name=f"DomainExpert({'CAN' if use_can else 'FFN'})",
+        name=f"MLPExpert({'CAN' if use_can else 'FFN'})",
         params_count=count_parameters(expert),
         forward_time_ms=forward_ms,
         backward_time_ms=backward_ms,
@@ -297,10 +297,10 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     
     # ========================================
-    # Benchmark 1: DomainExpert comparison
+    # Benchmark 1: MLPExpert comparison
     # ========================================
     print("\n" + "-" * 60)
-    print("Benchmark 1: DomainExpert (FFN vs CAN)")
+    print("Benchmark 1: MLPExpert (FFN vs CAN)")
     print("-" * 60)
     
     # For fair comparison, use same input_dim
@@ -385,7 +385,7 @@ def main():
     print("SUMMARY")
     print("=" * 60)
     
-    print(f"\nDomainExpert comparison (input_dim={expert_input_dim}):")
+    print(f"\nMLPExpert comparison (input_dim={expert_input_dim}):")
     params_reduction = (1 - can_expert_result.params_count / ffn_expert_result.params_count) * 100
     print(f"  - CAN has {params_reduction:.1f}% fewer parameters than FFN")
     

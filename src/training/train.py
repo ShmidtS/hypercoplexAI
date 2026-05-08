@@ -23,7 +23,7 @@ from src.training.dataset import (
     create_paired_demo_dataset,
 )
 from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
-from src.core.auto_config import TRAINING_DEFAULTS
+from src.training.auto_config import TRAINING_DEFAULTS
 from src.training.experiment_config import ExperimentConfig
 from src.training.results_logger import append_ledger_row
 from src.training.trainer import HDIMTrainer
@@ -169,13 +169,13 @@ def _build_run_summary(
         "config": {
             "hidden_dim": cfg.hidden_dim,
             "num_domains": cfg.num_domains,
-            "num_experts": cfg.num_experts,
+            "num_experts": cfg.moe.num_experts,
             "dropout": cfg.dropout,
             "clifford_p": cfg.clifford_p,
             "clifford_q": cfg.clifford_q,
             "clifford_r": cfg.clifford_r,
-            "top_k": cfg.top_k,
-            "memory_key_dim": cfg.memory_key_dim,
+            "top_k": cfg.moe.top_k,
+            "memory_key_dim": cfg.memory.memory_key_dim,
             "domain_names": cfg.get_domain_names(),
         },
         "run_args": {
@@ -302,7 +302,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     parser.add_argument(
         "--soft_router", action="store_true",
-        help="Replace R3MoERouter with SoftMoERouter.",
+        help="Use SoftMoERouter for MoE routing.",
     )
     parser.add_argument(
         "--hidden_dim", type=int, default=None,

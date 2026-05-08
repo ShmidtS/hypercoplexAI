@@ -23,8 +23,8 @@ from torch.utils.checkpoint import checkpoint
 
 from .hypercomplex import CliffordAlgebra
 from .domain_operators import DomainRotationOperator, sandwich_transfer
-from .moe_interface import MoERouter
-from .nars_truth import NarsTruth
+from .moe import MoERouter
+from .memory import NarsTruth
 
 
 class TransferEngine(nn.Module):
@@ -66,7 +66,7 @@ class TransferEngine(nn.Module):
         self.output_dim = output_dim
 
         # Import here to avoid circular dependency
-        from .soft_moe_router import SoftMoERouter
+        from .moe import SoftMoERouter
         from .hdim_pipeline import HDIMDecoder
 
         if router_cls is None:

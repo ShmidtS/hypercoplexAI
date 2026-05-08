@@ -13,10 +13,10 @@
 
 Пример регистрации кастомных экспертов:
  ------------------------------
- from src.core.moe_kernel import DomainExpert, register_expert
+ from src.core.moe import MLPExpert, EXPERT_CONFIGS
  import torch.nn as nn
 
- class HistoryExpert(DomainExpert):
+ class HistoryExpert(MLPExpert):
      '''Expert for historical and temporal patterns.'''
      def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
          super().__init__(input_dim, hidden_dim, dropout, name="history")
@@ -27,7 +27,7 @@
              nn.Linear(hidden_dim, input_dim),
          )
 
- class MedicalExpert(DomainExpert):
+ class MedicalExpert(MLPExpert):
      '''Expert for medical and biological patterns.'''
      def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
          super().__init__(input_dim, hidden_dim, dropout, name="medical")
@@ -39,8 +39,9 @@
          )
 
  # Register custom experts before building model
- register_expert("history", HistoryExpert)
- register_expert("medical", MedicalExpert)
+ # NOTE: EXPERT_REGISTRY removed — custom experts now use EXPERT_CONFIGS
+ # EXPERT_CONFIGS["history"] = ExpertConfig(...)
+ # EXPERT_CONFIGS["medical"] = ExpertConfig(...)
 
  # Then use in _patch_moe_kernel:
  # _patch_moe_kernel(model.core_model, expert_names=["math", "medical", "history", "science"])

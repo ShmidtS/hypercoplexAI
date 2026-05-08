@@ -11,7 +11,7 @@ Tests cover:
 
 import pytest
 
-from src.core.auto_config import (
+from src.training.auto_config import (
     AutoConfig,
     compute_clifford_dim,
     compute_expert_hidden_dim,

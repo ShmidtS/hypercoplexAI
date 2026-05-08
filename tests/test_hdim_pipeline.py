@@ -297,8 +297,8 @@ class TestPipelineDomainOperations:
 
         # Проверяем, что память сброшена (для titans)
         if pipeline.memory_type == "titans":
-            # TitansAdapter хранит модуль в self.titans
-            assert torch.all(pipeline.memory.titans.memory.weight == 0)
+            # TitansMemory stores memory directly
+            assert torch.all(pipeline.memory.memory.weight == 0)
 
 
 class TestPipelineEncoderDecoder:

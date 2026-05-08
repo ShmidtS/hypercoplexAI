@@ -7,8 +7,8 @@ batch training scenarios.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -16,15 +16,8 @@ import torch.nn as nn
 from src.core.domain_operators import DomainIndexEmbedding
 from src.core.hdim_pipeline import HDIMPipeline
 from src.core.per_domain_lora import PerDomainLoRA
+from src.models.config import HDIMConfig, HDIMRuntimeConfig, HDIMTextConfig, MSAConfig
 from src.models.results import CoreResult, ForwardResult
-
-
-@dataclass(frozen=True)
-class HDIMRuntimeConfig:
-    """Runtime controls for memory lifecycle during HDIM execution."""
-
-    update_memory: bool = True
-    memory_mode: Literal["none", "retrieve", "update"] = "update"
 
 
 @dataclass(frozen=True)
@@ -79,170 +72,6 @@ class HDIMAuxState:
         }
 
 
-@dataclass(frozen=True)
-class HDIMTextConfig:
-    """Configuration for the minimal HDIM text encoder path."""
-
-    vocab_size: int = 257
-    max_length: int = 128
-    embedding_dim: Optional[int] = None
-    hidden_dim: Optional[int] = None
-    dropout: Optional[float] = None
-    vocab_path: Optional[str] = None
-    tokenizer_name: Optional[str] = None
-
-
-@dataclass
-class MSAConfig:
-    """Configuration for MSA prototype memory subsystem.
-
-    Encapsulates all MSA-specific hyperparameters controlling prototype
-    memory behavior, sparse retrieval, and overflow management.
-    """
-
-    dim: int = 256
-    num_prototypes: int = 256
-    top_k: int = 16
-    chunk_size: int = 64
-    num_heads: int = 4
-    temperature: float = 0.1
-    ema_momentum: float = 0.995
-    overflow_capacity: int = 10000
-    max_hops: int = 3
-    interleave_threshold: float = 0.5
-    compression_threshold: int = 128
-    diversity_loss_weight: float = 1.0
-
-
-@dataclass
-class HDIMConfig:
-    """Configuration dataclass for HDIMModel.
-
-    Attributes:
-        hidden_dim: Input/output feature dimensionality (must be divisible by 4).
-        num_domains: Number of named domains to register domain rotors for.
-        num_experts: Number of MoE experts in the R3MoERouter. If None, computed from expert_names.
-        dropout: Dropout probability applied after the encoder.
-        clifford_p: Positive basis vectors for Cl_{p,q,r} algebra.
-        clifford_q: Negative basis vectors.
-        clifford_r: Nilpotent basis vectors.
-        top_k: Number of active experts per token.
-        memory_key_dim: Dimensionality of Titans memory keys.
-        memory_type: Memory module type: titans | hippocampus | neocortex | cls | hbma | msa | prototype.
-        domain_names: Explicit domain name list. If None, auto-generates
-            ['domain_0', 'domain_1', ...] up to num_domains.
-        expert_names: Explicit expert name list. If provided, num_experts is computed from it.
-        msa: Sub-config for MSA prototype memory. If None, auto-created from deprecated msa_* fields.
-    """
-
-    hidden_dim: int = 64
-    num_domains: int = 4
-    num_experts: Optional[int] = None  # None -> computed from expert_names or default
-    dropout: float = 0.1
-    clifford_p: int = 3  # Cl(3,1,0) dim=16, matches CliffordInteractionLayer default
-    clifford_q: int = 1
-    clifford_r: int = 0
-    top_k: int = 2
-    memory_key_dim: int = 32
-    memory_type: str = "titans"  # titans | hippocampus | neocortex | cls | hbma | msa | prototype
-    domain_names: Optional[List[str]] = None
-    expert_names: Optional[List[str]] = None  # New field for dynamic expert names
-    text: HDIMTextConfig = field(default_factory=HDIMTextConfig)
-    msa: Optional[MSAConfig] = None
-    # Phase 31: Self-Evolution (Online Learning)
-    online_learning: bool = False  # Enable online TTT learning
-    online_replay_size: int = 10000  # Experience replay buffer size
-    online_surprise_threshold: float = 0.3  # Surprise threshold for updates
-    online_ttt_lr: float = 1e-5  # TTT learning rate
-    online_gradient_mode: str = "detached" # Gradient mode: detached | selective | full
-    online_gradient_scale: float = 0.1 # Gradient scaling factor for selective/full modes
-    # Phase 32: Hallucination Detection
-    hallucination_detection: bool = False  # Enable hallucination detection
-    hallucination_risk_threshold: float = 0.5  # Risk threshold for hallucination flag
-    # Phase 33: Hallucination Feedback Loop (Self-Correction)
-    hallucination_feedback: bool = False # Enable hallucination feedback loop
-    hallucination_feedback_config: Optional[dict] = None # Override default feedback config
-    z_loss_weight: float = 0.0  # Router z-loss regularization weight
-    n_shared_experts: int = 0  # DeepSeek-V3 style multiple shared experts
-    use_domain_embedding: bool = False  # Sinusoidal domain-index embedding
-    use_domain_lora: bool = False  # Per-domain LoRA specialization
-    domain_lora_rank: int = 4  # LoRA rank for per-domain adapters
-    # Backward compat: deprecated msa_* fields auto-migrated to msa sub-config
-    msa_num_prototypes: int = 256
-    msa_top_k: int = 16
-    msa_chunk_size: int = 64
-    msa_num_heads: int = 4
-    msa_temperature: float = 0.1
-    msa_ema_momentum: float = 0.995
-    msa_overflow_capacity: int = 10000
-    msa_max_hops: int = 3
-    msa_interleave_threshold: float = 0.5
-    msa_compression_threshold: int = 128
-    msa_diversity_loss_weight: float = 1.0
-
-    def __post_init__(self):
-        if self.hidden_dim <= 0:
-            raise ValueError(f"hidden_dim must be > 0, got {self.hidden_dim}")
-        if self.num_domains <= 0:
-            raise ValueError(f"num_domains must be > 0, got {self.num_domains}")
-        if not 0 <= self.dropout < 1:
-            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
-        if self.memory_key_dim <= 0:
-            raise ValueError(f"memory_key_dim must be > 0, got {self.memory_key_dim}")
-        valid_memory_types = {"titans", "hippocampus", "neocortex", "cls", "hbma", "msa", "prototype"}
-        if self.memory_type not in valid_memory_types:
-            raise ValueError(
-                f"memory_type must be one of {sorted(valid_memory_types)}, got {self.memory_type!r}"
-            )
-        if self.domain_names is not None and len(self.domain_names) != self.num_domains:
-            raise ValueError(
-                f"len(domain_names)={len(self.domain_names)} must equal num_domains={self.num_domains}"
-            )
-        if self.expert_names is not None and len(set(self.expert_names)) != len(self.expert_names):
-            raise ValueError("expert_names must be unique")
-
-        # Backward compat: auto-migrate msa_* fields to msa sub-config
-        if self.msa is None:
-            self.msa = MSAConfig(
-                num_prototypes=self.msa_num_prototypes,
-                top_k=self.msa_top_k,
-                chunk_size=self.msa_chunk_size,
-                num_heads=self.msa_num_heads,
-                temperature=self.msa_temperature,
-                ema_momentum=self.msa_ema_momentum,
-                overflow_capacity=self.msa_overflow_capacity,
-                max_hops=self.msa_max_hops,
-                interleave_threshold=self.msa_interleave_threshold,
-                compression_threshold=self.msa_compression_threshold,
-                diversity_loss_weight=self.msa_diversity_loss_weight,
-            )
-        if self.msa.top_k > self.msa.num_prototypes:
-            raise ValueError(
-                f"msa.top_k={self.msa.top_k} must be <= msa.num_prototypes={self.msa.num_prototypes}"
-            )
-        # Compute num_experts from expert_names if provided
-        if self.expert_names is not None:
-            computed = len(self.expert_names)
-            if self.num_experts is not None and self.num_experts != computed:
-                raise ValueError(
-                    f"num_experts={self.num_experts} conflicts with "
-                    f"len(expert_names)={computed}"
-                )
-            self.num_experts = computed
-        elif self.num_experts is None:
-            self.num_experts = 4  # sensible default
-        if self.num_experts <= 0:
-            raise ValueError(f"num_experts must be > 0, got {self.num_experts}")
-        if self.top_k > self.num_experts:
-            raise ValueError(f"top_k={self.top_k} must be <= num_experts={self.num_experts}")
-
-    def get_domain_names(self) -> List[str]:
-        """Return the resolved list of domain names."""
-        if self.domain_names is not None:
-            return list(self.domain_names)
-        return [f"domain_{i}" for i in range(self.num_domains)]
-
-
 class HDIMModel(nn.Module):
     """Hypercomplex Domain-Invariant Model (HDIM).
 
@@ -253,7 +82,7 @@ class HDIMModel(nn.Module):
     Forward returns (output, routing_weights, invariant) where invariant is
     the hidden-dim projection of the canonical training invariant.
 
-    Phase 31: Supports self-evolution via OnlineLearner when config.online_learning=True.
+    Phase 31: Supports self-evolution via OnlineLearner when config.runtime.online_learning=True.
     """
 
     def __init__(self, config: HDIMConfig) -> None:
@@ -262,19 +91,19 @@ class HDIMModel(nn.Module):
         self._domain_names: List[str] = config.get_domain_names()
 
         msa_config = None
-        if config.msa is not None:
+        if config.memory.msa is not None:
             msa_config = {
-                'num_prototypes': config.msa.num_prototypes,
-                'top_k': config.msa.top_k,
-                'chunk_size': config.msa.chunk_size,
-                'num_heads': config.msa.num_heads,
-                'temperature': config.msa.temperature,
-                'ema_momentum': config.msa.ema_momentum,
-                'overflow_capacity': config.msa.overflow_capacity,
-                'max_hops': config.msa.max_hops,
-                'interleave_threshold': config.msa.interleave_threshold,
-                'compression_threshold': config.msa.compression_threshold,
-                'diversity_loss_weight': config.msa.diversity_loss_weight,
+                'num_prototypes': config.memory.msa.num_prototypes,
+                'top_k': config.memory.msa.top_k,
+                'chunk_size': config.memory.msa.chunk_size,
+                'num_heads': config.memory.msa.num_heads,
+                'temperature': config.memory.msa.temperature,
+                'ema_momentum': config.memory.msa.ema_momentum,
+                'overflow_capacity': config.memory.msa.overflow_capacity,
+                'max_hops': config.memory.msa.max_hops,
+                'interleave_threshold': config.memory.msa.interleave_threshold,
+                'compression_threshold': config.memory.msa.compression_threshold,
+                'diversity_loss_weight': config.memory.msa.diversity_loss_weight,
             }
 
         self.pipeline = HDIMPipeline(
@@ -284,14 +113,22 @@ class HDIMModel(nn.Module):
             clifford_q=config.clifford_q,
             clifford_r=config.clifford_r,
             domain_names=self._domain_names,
-            num_experts=config.num_experts,
-            top_k=config.top_k,
-            memory_key_dim=config.memory_key_dim,
-            memory_type=config.memory_type,
+            num_experts=config.moe.num_experts,
+            top_k=config.moe.top_k,
+            memory_key_dim=config.memory.memory_key_dim,
+            memory_type=config.memory.memory_type,
             msa_config=msa_config,
-            z_loss_weight=config.z_loss_weight,
-            n_shared_experts=config.n_shared_experts,
+            z_loss_weight=config.moe.z_loss_weight,
+            n_shared_experts=config.moe.n_shared_experts,
         )
+        if config.memory.use_gradient_surprise and hasattr(self.pipeline.memory, 'use_gradient_surprise'):
+            self.pipeline.memory.use_gradient_surprise = True
+        if config.memory.use_adaptive_forgetting and hasattr(self.pipeline.memory, 'use_adaptive_forgetting'):
+            self.pipeline.memory.use_adaptive_forgetting = True
+        if config.moe.use_aux_loss_free and hasattr(self.pipeline.moe, 'enable_aux_loss_free'):
+            self.pipeline.moe.enable_aux_loss_free(aux_lr=config.moe.aux_lr)
+        if config.moe.use_expert_ortho and hasattr(self.pipeline.moe, 'enable_expert_ortho'):
+            self.pipeline.moe.enable_expert_ortho()
 
         self.dropout = nn.Dropout(config.dropout)
         self.domain_embedding: Optional[DomainIndexEmbedding] = None
@@ -310,37 +147,37 @@ class HDIMModel(nn.Module):
 
         # Phase 31: Online Learner for self-evolution (uses moe output dimension)
         self.online_learner = None
-        if config.online_learning:
+        if config.runtime.online_learning:
             from src.core.online_learner import OnlineLearner, GradientMode
             # Parse gradient mode from string
-            gradient_mode = GradientMode(config.online_gradient_mode)
+            gradient_mode = GradientMode(config.runtime.online_gradient_mode)
             self.online_learner = OnlineLearner(
                 hidden_dim=clifford_dim,
-                num_experts=config.num_experts or 4,
-                replay_buffer_size=config.online_replay_size,
-                surprise_threshold=config.online_surprise_threshold,
-                ttt_lr=config.online_ttt_lr,
+                num_experts=config.moe.num_experts or 4,
+                replay_buffer_size=config.runtime.online_replay_size,
+                surprise_threshold=config.runtime.online_surprise_threshold,
+                ttt_lr=config.runtime.online_ttt_lr,
                 gradient_mode=gradient_mode,
-                gradient_scale=config.online_gradient_scale,
+                gradient_scale=config.runtime.online_gradient_scale,
             )
 
         # Phase 32: Hallucination Detector (optional)
         self.hallucination_detector = None
-        if config.hallucination_detection:
+        if config.runtime.hallucination_detection:
             from src.core.hallucination_detector import HallucinationDetector
             self.hallucination_detector = HallucinationDetector(
-                num_experts=config.num_experts or 4,
+                num_experts=config.moe.num_experts or 4,
                 hidden_dim=clifford_dim,
-                risk_threshold=config.hallucination_risk_threshold,
+                risk_threshold=config.runtime.hallucination_risk_threshold,
             )
 
 
         # Phase 33: Hallucination Feedback Loop (optional)
         self.hallucination_feedback_loop = None
-        if config.hallucination_feedback:
+        if config.runtime.hallucination_feedback:
             from src.core.hallucination_feedback import HallucinationFeedbackLoop
             # Get expert names from pipeline MoE
-            expert_names = config.expert_names or [f"expert_{i}" for i in range(config.num_experts or 4)]
+            expert_names = config.expert_names or [f"expert_{i}" for i in range(config.moe.num_experts or 4)]
             self.hallucination_feedback_loop = HallucinationFeedbackLoop(
                 expert_names=expert_names,
                 enabled=True,
@@ -620,16 +457,13 @@ class HDIMModel(nn.Module):
             with torch.no_grad():
                 u_mean = u_mem.mean(dim=0, keepdim=True).detach()
                 moe = pipeline.moe
-                num_experts = self.config.num_experts or 4
+                num_experts = self.config.moe.num_experts or 4
                 if hasattr(moe, 'dispatch_proj'):
                     gate_logits = moe.dispatch_proj(u_mean)
                     argmax_t = gate_logits.argmax(dim=-1)
                     dominant_expert = (argmax_t // getattr(moe, 'slots_per_expert', 1)).item()
                 elif hasattr(moe, 'router_proj'):
                     gate_logits = moe.router_proj(u_mean)
-                    dominant_expert = (gate_logits.argmax(dim=-1) % num_experts).item()
-                elif hasattr(moe, 'kernel') and hasattr(moe.kernel, 'router_proj'):
-                    gate_logits = moe.kernel.router_proj(u_mean)
                     dominant_expert = (gate_logits.argmax(dim=-1) % num_experts).item()
                 else:
                     dominant_expert = 0
@@ -728,7 +562,7 @@ class HDIMModel(nn.Module):
         if self.hallucination_feedback_loop is not None:
             # Get current dominant expert from topk_idx (batch mode)
             current_expert_idx = topk_idx[:, 0].mode().values.item() if topk_idx.numel() > 0 else 0
-            expert_names = self.pipeline.moe.expert_names if hasattr(self.pipeline.moe, 'expert_names') else [f'expert_{i}' for i in range(self.config.num_experts or 4)]
+            expert_names = self.pipeline.moe.expert_names if hasattr(self.pipeline.moe, 'expert_names') else [f'expert_{i}' for i in range(self.config.moe.num_experts or 4)]
             current_expert = expert_names[current_expert_idx] if current_expert_idx < len(expert_names) else expert_names[0]
             
             feedback_result = self.hallucination_feedback_loop.check_and_respond(
@@ -753,7 +587,7 @@ class HDIMModel(nn.Module):
                 if _slot_out is not None and _slot_out.shape[0] == routing_weights.shape[1]:
                     _enames = (self.pipeline.moe.expert_names
                                if hasattr(self.pipeline.moe, 'expert_names')
-                               else [f'expert_{i}' for i in range(self.config.num_experts or 4)])
+                               else [f'expert_{i}' for i in range(self.config.moe.num_experts or 4)])
                     _sel = feedback_result.selected_expert
                     if _sel in _enames:
                         _sel_idx = _enames.index(_sel)
@@ -1033,37 +867,12 @@ class HDIMModel(nn.Module):
 
     # Phase 22 feature flags
 
-    def enable_gradient_surprise(self) -> None:
-        """Enable gradient-based surprise metric in Titans memory."""
-        if hasattr(self.pipeline.memory, 'use_gradient_surprise'):
-            self.pipeline.memory.use_gradient_surprise = True
-
-    def enable_adaptive_forgetting(self) -> None:
-        """Enable adaptive forgetting based on surprise."""
-        if hasattr(self.pipeline.memory, 'use_adaptive_forgetting'):
-            self.pipeline.memory.use_adaptive_forgetting = True
-
     def enable_learnable_metric(self) -> None:
         """Enable learnable per-blade metric scaling in Clifford algebra."""
         if hasattr(self.pipeline.algebra, 'enable_learnable_metric'):
             self.pipeline.algebra.enable_learnable_metric()
 
     # Phase 26 feature flags
-
-    def enable_shared_expert(self) -> None:
-        """Enable DeepSeek-V3 always-on shared expert in SoftMoERouter."""
-        if hasattr(self.pipeline.moe, 'enable_shared_expert'):
-            self.pipeline.moe.enable_shared_expert()
-
-    def enable_aux_loss_free(self, aux_lr: float = 0.001) -> None:
-        """Enable Auxiliary-Loss-Free load balancing (DeepSeek-V3)."""
-        if hasattr(self.pipeline.moe, 'enable_aux_loss_free'):
-            self.pipeline.moe.enable_aux_loss_free(aux_lr=aux_lr)
-
-    def enable_expert_ortho(self) -> None:
-        """Enable expert orthogonalization loss."""
-        if hasattr(self.pipeline.moe, 'enable_expert_ortho'):
-            self.pipeline.moe.enable_expert_ortho()
 
     def compute_expert_ortho_loss(self) -> torch.Tensor:
         if hasattr(self.pipeline.moe, 'expert_orthogonalization_loss'):

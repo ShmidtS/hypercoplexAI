@@ -3,10 +3,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from src.core.moe_kernel import (
+from src.core.moe import (
     MoEKernel, MoEKernelConfig, MoEKernelState,
-    MLPExpert, DomainExpert, MathExpert, LanguageExpert, CodeExpert, ScienceExpert,
-    create_expert, EXPERT_REGISTRY, register_expert, get_registered_expert_names,
+    MLPExpert, EXPERT_CONFIGS,
+    MoERouter, SoftMoERouter,
+    _create_mlp_expert,
 )
 
 
@@ -109,7 +110,7 @@ class TestDynamicExpertCount:
         x = torch.randn(8, 32)
         out, state = kernel(x)
         assert out.shape == (8, 32)
-        assert state.expert_weights.shape == (8, 1)
+        assert state["expert_weights"].shape == (8, 1)
         assert not torch.isnan(out).any()
 
     def test_two_experts(self):
@@ -125,8 +126,8 @@ class TestDynamicExpertCount:
         x = torch.randn(16, 32)
         out, state = kernel(x)
         assert out.shape == (16, 32)
-        assert state.expert_weights.shape == (16, 2)
-        assert state.expert_usage.shape == (2,)
+        assert state["expert_weights"].shape == (16, 2)
+        assert state["expert_usage"].shape == (2,)
 
     def test_eight_experts(self):
         """MoEKernel works with 8 experts."""
@@ -141,8 +142,8 @@ class TestDynamicExpertCount:
         x = torch.randn(32, 32)
         out, state = kernel(x)
         assert out.shape == (32, 32)
-        assert state.expert_weights.shape == (32, 8)
-        assert state.expert_usage.shape == (8,)
+        assert state["expert_weights"].shape == (32, 8)
+        assert state["expert_usage"].shape == (8,)
 
     def test_sixteen_experts(self):
         """MoEKernel works with 16 experts."""
@@ -157,8 +158,8 @@ class TestDynamicExpertCount:
         x = torch.randn(64, 32)
         out, state = kernel(x)
         assert out.shape == (64, 32)
-        assert state.expert_weights.shape == (64, 16)
-        assert state.expert_usage.shape == (16,)
+        assert state["expert_weights"].shape == (64, 16)
+        assert state["expert_usage"].shape == (16,)
 
     def test_expert_count_from_names_only(self):
         """num_experts computed correctly when only expert_names provided."""
@@ -189,7 +190,7 @@ class TestDynamicExpertCount:
         kernel.train()
         x = torch.randn(8, 32, requires_grad=True)
         out, state = kernel(x)
-        loss = out.mean() + state.total_loss()
+        loss = out.mean() + state["total_loss"]
         loss.backward()
         assert x.grad is not None
         assert not torch.isnan(x.grad).any()
@@ -206,7 +207,7 @@ class TestDynamicExpertCount:
         kernel.train()
         x = torch.randn(8, 32, requires_grad=True)
         out, state = kernel(x)
-        loss = out.mean() + state.total_loss()
+        loss = out.mean() + state["total_loss"]
         loss.backward()
         assert x.grad is not None
         assert not torch.isnan(x.grad).any()
@@ -220,48 +221,48 @@ class TestDynamicExpertCount:
 # Expert types
 # ============================================================
 
-class TestDomainExperts:
+class TestMLPExperts:
     def test_math_expert_forward(self):
-        expert = MathExpert(input_dim=64, hidden_dim=128)
+        expert = MLPExpert(input_dim=64, hidden_dim=128, name="math", config=EXPERT_CONFIGS["math"])
         x = torch.randn(8, 64)
         out = expert(x)
         assert out.shape == (8, 64)
         assert not torch.isnan(out).any()
 
     def test_language_expert_forward(self):
-        expert = LanguageExpert(input_dim=64, hidden_dim=128)
+        expert = MLPExpert(input_dim=64, hidden_dim=128, name="language", config=EXPERT_CONFIGS["language"])
         x = torch.randn(8, 64)
         out = expert(x)
         assert out.shape == (8, 64)
         assert not torch.isnan(out).any()
 
     def test_code_expert_forward(self):
-        expert = CodeExpert(input_dim=64, hidden_dim=128)
+        expert = MLPExpert(input_dim=64, hidden_dim=128, name="code", config=EXPERT_CONFIGS["code"])
         x = torch.randn(8, 64)
         out = expert(x)
         assert out.shape == (8, 64)
         assert not torch.isnan(out).any()
 
     def test_science_expert_forward(self):
-        expert = ScienceExpert(input_dim=64, hidden_dim=128)
+        expert = MLPExpert(input_dim=64, hidden_dim=128, name="science", config=EXPERT_CONFIGS["science"])
         x = torch.randn(8, 64)
         out = expert(x)
         assert out.shape == (8, 64)
         assert not torch.isnan(out).any()
 
-    def test_create_expert_registered(self):
+    def test_create_mlp_expert_by_name(self):
         for name in ["math", "language", "code", "science"]:
-            e = create_expert(name, input_dim=32, hidden_dim=64, dropout=0.0)
+            e = _create_mlp_expert(name, input_dim=32, hidden_dim=64, dropout=0.0)
             assert e.name == name
-            assert isinstance(e, DomainExpert)
+            assert isinstance(e, MLPExpert)
 
-    def test_create_expert_unknown_falls_back(self):
-        e = create_expert("unknown_domain", input_dim=32, hidden_dim=64, dropout=0.0)
-        assert isinstance(e, DomainExpert)
+    def test_create_mlp_expert_unknown_falls_back(self):
+        e = _create_mlp_expert("unknown_domain", input_dim=32, hidden_dim=64, dropout=0.0)
+        assert isinstance(e, MLPExpert)
         assert e.name == "unknown_domain"
 
-    def test_registry_keys(self):
-        assert set(EXPERT_REGISTRY.keys()) == {"math", "language", "code", "science"}
+    def test_expert_configs_keys(self):
+        assert set(EXPERT_CONFIGS.keys()) == {"math", "language", "code", "science"}
 
 
 # ============================================================
@@ -294,30 +295,32 @@ class TestMoEKernelForward:
     def test_state_expert_weights_shape_2d(self, kernel):
         x = torch.randn(16, 64)
         _, state = kernel(x)
-        assert state.expert_weights.shape == (16, 4)
+        assert state["expert_weights"].shape == (16, 4)
 
     def test_state_expert_weights_shape_3d(self, kernel):
         x = torch.randn(4, 8, 64)
         _, state = kernel(x)
-        assert state.expert_weights.shape == (4, 8, 4)
+        assert state["expert_weights"].shape == (4, 8, 4)
 
     def test_state_expert_usage(self, kernel):
         x = torch.randn(16, 64)
         _, state = kernel(x)
-        assert state.expert_usage.shape == (4,)
+        assert state["expert_usage"].shape == (4,)
         # Usage должна суммироваться приблизительно к 1 (среднее combine-весов)
-        assert state.expert_usage.sum().item() > 0
+        assert state["expert_usage"].sum().item() > 0
 
     def test_state_top_expert_idx(self, kernel):
         x = torch.randn(16, 64)
         _, state = kernel(x)
-        assert state.top_expert_idx.shape == (16, 2)
-        assert state.top_expert_idx.max().item() <= 3
+        assert state["top_expert_idx"].shape == (16, 2)
+        assert state["top_expert_idx"].max().item() <= 3
 
     def test_dominant_expert_names(self, kernel):
         x = torch.randn(8, 64)
         _, state = kernel(x)
-        names = state.dominant_expert_names()
+        expert_names = state["expert_names"]
+        top_idx = state["top_expert_idx"][:, 0].tolist()
+        names = [expert_names[i] for i in top_idx]
         assert len(names) == 8
         valid = {"math", "language", "code", "science"}
         assert all(n in valid for n in names)
@@ -326,7 +329,7 @@ class TestMoEKernelForward:
         x = torch.randn(8, 64)
         _, state = kernel(x)
         # combine_weights: (T, num_slots) — сумма по слотам = 1
-        combine = state.combine_weights
+        combine = state["combine_weights"]
         sums = combine.sum(dim=-1) # (T,)
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 
@@ -334,7 +337,7 @@ class TestMoEKernelForward:
         x = torch.randn(8, 64)
         _, state = kernel(x)
         # dispatch: (T, num_slots) — сумма по токенам = 1 (для T > 1)
-        dispatch = state.dispatch_weights
+        dispatch = state["dispatch_weights"]
         sums = dispatch.sum(dim=0) # (num_slots,)
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 
@@ -361,7 +364,7 @@ class TestGradientFlow:
     def test_input_gradient(self, kernel_train):
         x = torch.randn(8, 64, requires_grad=True)
         out, state = kernel_train(x)
-        loss = out.mean() + state.total_loss()
+        loss = out.mean() + state["total_loss"]
         loss.backward()
         assert x.grad is not None
         assert not torch.isnan(x.grad).any()
@@ -369,7 +372,7 @@ class TestGradientFlow:
     def test_expert_gradients_all(self, kernel_train):
         x = torch.randn(8, 64)
         out, state = kernel_train(x)
-        loss = out.mean() + state.total_loss()
+        loss = out.mean() + state["total_loss"]
         loss.backward()
         for expert in kernel_train.experts:
             for p in expert.parameters():
@@ -379,7 +382,7 @@ class TestGradientFlow:
     def test_router_proj_gradient(self, kernel_train):
         x = torch.randn(8, 64)
         out, state = kernel_train(x)
-        loss = out.mean() + state.router_loss
+        loss = out.mean() + state["router_loss"]
         loss.backward()
         assert kernel_train.router_proj.weight.grad is not None
         assert not torch.isnan(kernel_train.router_proj.weight.grad).any()
@@ -401,22 +404,22 @@ class TestLosses:
     def test_router_loss_nonneg(self, kernel_train):
         x = torch.randn(8, 64)
         _, state = kernel_train(x)
-        assert state.router_loss.item() >= 0
+        assert state["router_loss"].item() >= 0
 
     def test_z_loss_nonneg(self, kernel_train):
         x = torch.randn(8, 64)
         _, state = kernel_train(x)
-        assert state.z_loss.item() >= 0
+        assert state["z_loss"].item() >= 0
 
     def test_ortho_loss_nonneg(self, kernel_train):
         x = torch.randn(8, 64)
         _, state = kernel_train(x)
-        assert state.ortho_loss.item() >= 0
+        assert state["ortho_loss"].item() >= 0
 
     def test_total_loss_finite(self, kernel_train):
         x = torch.randn(8, 64)
         _, state = kernel_train(x)
-        total = state.total_loss()
+        total = state["total_loss"]
         assert torch.isfinite(total)
 
     def test_z_loss_weight_zero_gives_zero(self, config):
@@ -429,7 +432,7 @@ class TestLosses:
         k.train()
         x = torch.randn(8, 64)
         _, state = k(x)
-        assert state.z_loss.item() == 0.0
+        assert state["z_loss"].item() == 0.0
 
     def test_ortho_loss_disabled(self, config):
         cfg = MoEKernelConfig(
@@ -441,7 +444,7 @@ class TestLosses:
         k.train()
         x = torch.randn(8, 64)
         _, state = k(x)
-        assert state.ortho_loss.item() == 0.0
+        assert state["ortho_loss"].item() == 0.0
 
     def test_expert_ortho_loss_positive(self, kernel_train):
         # expert_orthogonalization_loss должен быть >= 0 (Gram-matrix deviation)
@@ -470,14 +473,14 @@ class TestLoadBalance:
             x = torch.randn(128, 64)
             _, state = k(x)
             expected = 1.0 / 4
-            max_dev = (state.expert_usage - expected).abs().max().item()
+            max_dev = (state["expert_usage"] - expected).abs().max().item()
             assert max_dev < 0.2
 
     def test_routing_entropy_positive(self, kernel):
         x = torch.randn(16, 64)
         _, state = kernel(x)
-        assert state.routing_entropy.item() > 0
-        assert torch.isfinite(state.routing_entropy)
+        assert state["routing_entropy"].item() > 0
+        assert torch.isfinite(state["routing_entropy"])
 
     def test_train_scores_updated(self, kernel_train):
         initial = kernel_train.train_scores.clone()
@@ -547,7 +550,7 @@ class TestAuxLossFree:
             _, state = kernel(x)
             # Calculate imbalance as max deviation from uniform
             expected = 1.0 / kernel.num_experts
-            imbalance = (state.expert_usage - expected).abs().max().item()
+            imbalance = (state["expert_usage"] - expected).abs().max().item()
             imbalances.append(imbalance)
 
         # Later imbalances should be generally lower than early ones
@@ -577,7 +580,7 @@ class TestAuxLossFree:
         assert not torch.equal(kernel._expert_bias.data, initial_bias)
 
         # Check bias direction consistency with load deviation
-        load = state.expert_usage
+        load = state["expert_usage"]
         target = kernel._target_load
         expected_delta_sign = torch.sign(load - target)
 
@@ -676,182 +679,144 @@ class TestExpertLoadStats:
 # Dynamic expert registration
 # ============================================================
 
-class TestRegisterExpert:
-    def test_register_custom_expert(self):
-        """Test dynamic expert registration."""
-        class CustomExpert(DomainExpert):
-            def __init__(self, input_dim, hidden_dim, dropout=0.1):
-                super().__init__(input_dim, hidden_dim, dropout, name="custom")
+class TestExpertConfigs:
+    """Tests for EXPERT_CONFIGS dict (replaces registry tests)."""
 
-        # Register custom expert
-        register_expert("custom", CustomExpert)
-        assert "custom" in get_registered_expert_names()
+    def test_expert_configs_has_builtin_domains(self):
+        """EXPERT_CONFIGS contains built-in domain configs."""
+        assert "math" in EXPERT_CONFIGS
+        assert "language" in EXPERT_CONFIGS
+        assert "code" in EXPERT_CONFIGS
+        assert "science" in EXPERT_CONFIGS
 
-        # Create MoEKernel with custom expert
+    def test_create_mlp_expert_with_custom_name(self):
+        """_create_mlp_expert works with custom names (no registry needed)."""
+        e = _create_mlp_expert("custom_domain", input_dim=32, hidden_dim=64, dropout=0.0)
+        assert isinstance(e, MLPExpert)
+        assert e.name == "custom_domain"
+
+    def test_moe_kernel_with_custom_expert_names(self):
+        """MoEKernel works with custom expert names (no registry needed)."""
         cfg = MoEKernelConfig(
             input_dim=64,
-            num_experts=1,
-            expert_names=["custom"],
+            num_experts=2,
+            expert_names=["custom_a", "custom_b"],
         )
         kernel = MoEKernel(cfg)
-        assert kernel.experts[0].name == "custom"
+        kernel.eval()
+        assert kernel.experts[0].name == "custom_a"
+        assert kernel.experts[1].name == "custom_b"
 
-        # Cleanup: remove custom from registry for other tests
-        del EXPERT_REGISTRY["custom"]
-
-    def test_invalid_expert_registration(self):
-        """Test that non-DomainExpert classes are rejected."""
-        class NotAnExpert:
-            pass
-
-        with pytest.raises(TypeError, match="must inherit from MLPExpert"):
-            register_expert("invalid", NotAnExpert)
-
-    def test_get_registered_expert_names_returns_list(self):
-        """Test that get_registered_expert_names returns correct list."""
-        names = get_registered_expert_names()
-        assert isinstance(names, list)
-        # Built-in experts should always be present
-        assert "math" in names
-        assert "language" in names
-        assert "code" in names
-        assert "science" in names
-
-    def test_register_expert_overrides_existing(self):
-        """Test that registering with existing name overrides."""
-        class NewMathExpert(DomainExpert):
-            def __init__(self, input_dim, hidden_dim, dropout=0.1):
-                super().__init__(input_dim, hidden_dim, dropout, name="math")
-
-        original = EXPERT_REGISTRY["math"]
-        register_expert("math", NewMathExpert)
-        assert EXPERT_REGISTRY["math"] is NewMathExpert
-
-        # Restore original
-        EXPERT_REGISTRY["math"] = original
+    def test_expert_configs_override(self):
+        """Custom expert config can be added to EXPERT_CONFIGS."""
+        EXPERT_CONFIGS["test_domain"] = {"activation": "relu"}
+        e = _create_mlp_expert("test_domain", input_dim=32, hidden_dim=64, dropout=0.0)
+        assert isinstance(e, MLPExpert)
+        assert e.name == "test_domain"
+        # Cleanup
+        del EXPERT_CONFIGS["test_domain"]
     
     
     # ============================================================
-    # MoE Interface and Adapter Tests
+    # MoE Interface Tests
     # ============================================================
-    
+
     class TestMoERouterInterface:
         """Tests for MoERouter abstract interface."""
-    
-        def test_moe_kernel_adapter_implements_interface(self):
-            """MoEKernelAdapter must inherit from MoERouter."""
-            from src.core.moe_interface import MoERouter
-            from src.core.moe_kernel_adapter import MoEKernelAdapter
-    
-            assert issubclass(MoEKernelAdapter, MoERouter)
-    
+
+        def test_moe_kernel_implements_interface(self):
+            """MoEKernel must inherit from MoERouter."""
+            from src.core.moe import MoERouter
+
+            assert issubclass(MoEKernel, MoERouter)
+
         def test_soft_moe_router_implements_interface(self):
             """SoftMoERouter must inherit from MoERouter."""
-            from src.core.moe_interface import MoERouter
-            from src.core.soft_moe_router import SoftMoERouter
-    
+            from src.core.moe import MoERouter
+
             assert issubclass(SoftMoERouter, MoERouter)
-    
-        def test_adapter_forward_returns_tuple(self, config):
-            """MoEKernelAdapter.forward() must return (Tensor, Dict)."""
-            from src.core.moe_kernel_adapter import MoEKernelAdapter
-    
+
+        def test_moe_kernel_forward_returns_tuple(self, config):
+            """MoEKernel.forward() must return (Tensor, Dict)."""
             kernel = MoEKernel(config)
-            adapter = MoEKernelAdapter(kernel)
-            adapter.eval()
-    
+            kernel.eval()
+
             x = torch.randn(2, config.input_dim)
-            output, info = adapter(x)
-    
+            output, info = kernel(x)
+
             assert isinstance(output, torch.Tensor)
             assert isinstance(info, dict)
             assert output.shape == x.shape
             assert "expert_load" in info
             assert "router_loss" in info
-    
-        def test_adapter_get_expert_load(self, config):
-            """MoEKernelAdapter.get_expert_load() must return Tensor[num_experts]."""
-            from src.core.moe_kernel_adapter import MoEKernelAdapter
-    
+
+        def test_moe_kernel_get_expert_load(self, config):
+            """MoEKernel.get_expert_load() must return Tensor[num_experts]."""
             kernel = MoEKernel(config)
-            adapter = MoEKernelAdapter(kernel)
-    
-            load = adapter.get_expert_load()
+
+            load = kernel.get_expert_load()
             assert isinstance(load, torch.Tensor)
             assert load.shape == (config.num_experts,)
             # Initial load should be uniform
             assert torch.allclose(load, torch.ones(config.num_experts) / config.num_experts)
-    
-        def test_adapter_expert_orthogonalization_loss(self, config):
-            """MoEKernelAdapter.expert_orthogonalization_loss() must return scalar."""
-            from src.core.moe_kernel_adapter import MoEKernelAdapter
-    
+
+        def test_moe_kernel_expert_orthogonalization_loss(self, config):
+            """MoEKernel.expert_orthogonalization_loss() must return scalar."""
             kernel = MoEKernel(config)
-            adapter = MoEKernelAdapter(kernel)
-    
-            loss = adapter.expert_orthogonalization_loss()
+
+            loss = kernel.expert_orthogonalization_loss()
             assert isinstance(loss, torch.Tensor)
             assert loss.ndim == 0  # scalar
-    
-        def test_adapter_reset_training_state(self, config):
-            """MoEKernelAdapter.reset_training_state() must reset EMA."""
-            from src.core.moe_kernel_adapter import MoEKernelAdapter
-    
+
+        def test_moe_kernel_reset_training_state(self, config):
+            """MoEKernel.reset_training_state() must reset EMA."""
             kernel = MoEKernel(config)
-            adapter = MoEKernelAdapter(kernel)
-    
+
             # Modify train_scores
             kernel.train_scores.fill_(0.5)
-            adapter.reset_training_state()
-    
+            kernel.reset_training_state()
+
             # Should be uniform again
             expected = torch.ones(config.num_experts) / config.num_experts
             assert torch.allclose(kernel.train_scores, expected)
-    
+
         def test_soft_moe_router_get_expert_load(self):
             """SoftMoERouter.get_expert_load() must return Tensor[num_experts]."""
-            from src.core.soft_moe_router import SoftMoERouter
-    
             router = SoftMoERouter(
                 input_dim=64,
                 num_experts=4,
                 expert_dim=128,
             )
-    
+
             load = router.get_expert_load()
             assert isinstance(load, torch.Tensor)
             assert load.shape == (4,)
             assert torch.allclose(load, torch.ones(4) / 4)
-    
+
         def test_soft_moe_router_reset_training_state(self):
             """SoftMoERouter.reset_training_state() must reset EMA."""
-            from src.core.soft_moe_router import SoftMoERouter
-    
             router = SoftMoERouter(
                 input_dim=64,
                 num_experts=4,
                 expert_dim=128,
             )
-    
+
             # Modify train_scores
             router.train_scores.fill_(0.5)
             router.reset_training_state()
-    
+
             # Should be uniform again
             expected = torch.ones(4) / 4
             assert torch.allclose(router.train_scores, expected)
-    
-        def test_adapter_info_dict_contents(self, config):
-            """MoEKernelAdapter forward info dict must contain all required keys."""
-            from src.core.moe_kernel_adapter import MoEKernelAdapter
-    
+
+        def test_moe_kernel_info_dict_contents(self, config):
+            """MoEKernel forward info dict must contain all required keys."""
             kernel = MoEKernel(config)
-            adapter = MoEKernelAdapter(kernel)
-            adapter.eval()
-    
+            kernel.eval()
+
             x = torch.randn(2, config.input_dim)
-            _, info = adapter(x)
-    
+            _, info = kernel(x)
+
             required_keys = [
                 "expert_load",
                 "aux_loss",
@@ -868,30 +833,27 @@ class TestRegisterExpert:
                 assert key in info, f"Missing key: {key}"
     
         def test_polymorphic_usage(self, config):
-            """Both MoEKernelAdapter and SoftMoERouter can be used as MoERouter."""
-            from src.core.moe_interface import MoERouter
-            from src.core.moe_kernel_adapter import MoEKernelAdapter
-            from src.core.soft_moe_router import SoftMoERouter
-    
+            """Both MoEKernel and SoftMoERouter can be used as MoERouter."""
+            from src.core.moe import MoERouter
+
             kernel = MoEKernel(config)
-            adapter = MoEKernelAdapter(kernel)
-    
+
             soft_router = SoftMoERouter(
                 input_dim=config.input_dim,
                 num_experts=config.num_experts,
                 expert_dim=config.expert_hidden_dim,
             )
-    
+
             # Both should be instances of MoERouter
-            assert isinstance(adapter, MoERouter)
+            assert isinstance(kernel, MoERouter)
             assert isinstance(soft_router, MoERouter)
-    
+
             # Both should work with same input shape
             x = torch.randn(2, config.input_dim)
-    
-            out1, info1 = adapter(x)
+
+            out1, info1 = kernel(x)
             out2, info2 = soft_router(x)
-    
+
             assert out1.shape == x.shape
             assert out2.shape == x.shape
         
@@ -911,14 +873,14 @@ class TestRegisterExpert:
                 assert expert.pre_hook is not None
         
             def test_domain_expert_use_can_false(self):
-                """DomainExpert with use_can=False uses standard FFN."""
-                expert = DomainExpert(input_dim=64, hidden_dim=128, use_can=False)
+                """MLPExpert with use_can=False uses standard FFN."""
+                expert = MLPExpert(input_dim=64, hidden_dim=128, use_can=False)
                 assert expert.use_can is False
                 assert hasattr(expert, 'net')
         
             def test_domain_expert_forward_can(self):
                 """Forward pass works with CAN-enabled expert."""
-                expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
+                expert = MLPExpert(input_dim=16, hidden_dim=32, use_can=True)
                 expert.eval()
                 x = torch.randn(4, 16)
                 out = expert(x)
@@ -927,7 +889,7 @@ class TestRegisterExpert:
         
             def test_domain_expert_forward_ffn(self):
                 """Forward pass works with standard FFN expert."""
-                expert = DomainExpert(input_dim=64, hidden_dim=128, use_can=False)
+                expert = MLPExpert(input_dim=64, hidden_dim=128, use_can=False)
                 expert.eval()
                 x = torch.randn(4, 64)
                 out = expert(x)
@@ -935,8 +897,8 @@ class TestRegisterExpert:
                 assert not torch.isnan(out).any()
         
             def test_create_expert_with_can(self):
-                """create_expert function supports use_can parameter."""
-                expert = create_expert(
+                """_create_mlp_expert function supports use_can parameter."""
+                expert = _create_mlp_expert(
                     name="custom",
                     input_dim=16,
                     hidden_dim=32,
@@ -1014,7 +976,7 @@ class TestRegisterExpert:
         
                 x = torch.randn(4, 16, requires_grad=True)
                 out, state = kernel(x)
-                loss = out.mean() + state.total_loss()
+                loss = out.mean() + state["total_loss"]
                 loss.backward()
         
                 assert x.grad is not None
@@ -1039,11 +1001,10 @@ class TestRegisterExpert:
                 assert not torch.isnan(out).any()
         
             def test_mixed_expert_types_not_supported(self):
-                """Specialized experts (MathExpert, etc.) don't support use_can directly."""
-                # MathExpert, LanguageExpert etc. override net in __init__
-                # so use_can would need explicit support in each class
-                math_expert = MathExpert(input_dim=64, hidden_dim=128)
-                # These specialized experts use FFN by default
+                """Specialized experts (MathExpert etc.) now use MLPExpert with config."""
+                # MathExpert is now MLPExpert(name="math", config=EXPERT_CONFIGS["math"])
+                math_expert = MLPExpert(input_dim=64, hidden_dim=128, name="math", config=EXPERT_CONFIGS["math"])
+                # These experts use FFN by default (no CAN)
                 assert hasattr(math_expert, 'net')
 
 
@@ -1064,7 +1025,7 @@ class TestBatchedExpertExecution:
         assert cfg.use_batched_experts is True  # Default is now True
 
     def test_batched_with_homogeneous_experts(self):
-        """Batched execution works with homogeneous DomainExpert instances."""
+        """Batched execution works with homogeneous MLPExpert instances."""
         cfg = MoEKernelConfig(
             input_dim=64,
             expert_hidden_dim=128,
@@ -1075,7 +1036,7 @@ class TestBatchedExpertExecution:
         kernel = MoEKernel(cfg)
         kernel.eval()
 
-        # All experts should be plain MLPExpert (DomainExpert alias)
+        # All experts should be plain MLPExpert (MLPExpert alias)
         for expert in kernel.experts:
             assert isinstance(expert, MLPExpert)
 
@@ -1099,7 +1060,7 @@ class TestBatchedExpertExecution:
 
         x = torch.randn(8, 64, requires_grad=True)
         out, state = kernel(x)
-        loss = out.mean() + state.total_loss()
+        loss = out.mean() + state["total_loss"]
         loss.backward()
 
         assert x.grad is not None
@@ -1123,7 +1084,7 @@ class TestBatchedExpertExecution:
         assert kernel._can_use_batched() is False
 
     def test_can_use_batched_returns_true_for_homogeneous(self):
-        """_can_use_batched returns True for homogeneous DomainExpert."""
+        """_can_use_batched returns True for homogeneous MLPExpert."""
         cfg = MoEKernelConfig(
             input_dim=64,
             expert_hidden_dim=128,
@@ -1247,8 +1208,8 @@ class TestBatchedExpertExecution:
 # Profiling and New Config Tests
 # ============================================================
 
-class TestProfilingAndNewConfig:
-    """Tests for profiling hooks and new config parameters."""
+class TestConfigAndWarnings:
+    """Tests for config parameters and heterogeneous expert warnings."""
 
     def test_config_has_batched_fallback(self):
         """MoEKernelConfig has batched_fallback parameter."""
@@ -1267,111 +1228,6 @@ class TestProfilingAndNewConfig:
             num_experts=2,
         )
         assert cfg.expert_homogeneity_check is True
-
-    def test_enable_profiling(self):
-        """enable_profiling() method works."""
-        cfg = MoEKernelConfig(
-            input_dim=64,
-            expert_hidden_dim=128,
-            num_experts=4,
-            expert_names=["a", "b", "c", "d"],
-        )
-        kernel = MoEKernel(cfg)
-        assert kernel._profiling_enabled is False
-        kernel.enable_profiling(True)
-        assert kernel._profiling_enabled is True
-        kernel.enable_profiling(False)
-        assert kernel._profiling_enabled is False
-
-    def test_get_profiling_stats(self):
-        """get_profiling_stats() returns timing statistics."""
-        cfg = MoEKernelConfig(
-            input_dim=64,
-            expert_hidden_dim=128,
-            num_experts=4,
-            expert_names=["a", "b", "c", "d"],
-        )
-        kernel = MoEKernel(cfg)
-        kernel.eval()
-        kernel.enable_profiling(True)
-
-        x = torch.randn(16, 64)
-        with torch.no_grad():
-            kernel(x)
-
-        stats = kernel.get_profiling_stats()
-        assert "batched_time_ms" in stats
-        assert "sequential_time_ms" in stats
-        assert "batched_calls" in stats
-        assert "sequential_calls" in stats
-        assert stats["batched_calls"] > 0
-
-    def test_reset_profiling(self):
-        """reset_profiling() resets counters."""
-        cfg = MoEKernelConfig(
-            input_dim=64,
-            expert_hidden_dim=128,
-            num_experts=4,
-            expert_names=["a", "b", "c", "d"],
-        )
-        kernel = MoEKernel(cfg)
-        kernel.eval()
-        kernel.enable_profiling(True)
-
-        x = torch.randn(16, 64)
-        with torch.no_grad():
-            kernel(x)
-
-        kernel.reset_profiling()
-        stats = kernel.get_profiling_stats()
-        assert stats["batched_time_ms"] == 0
-        assert stats["batched_calls"] == 0
-
-    def test_batched_vs_sequential_profiling(self):
-        """Profiling compares batched vs sequential execution time."""
-        torch.manual_seed(42)
-
-        # Create two kernels: one batched, one sequential
-        cfg_batched = MoEKernelConfig(
-            input_dim=64,
-            expert_hidden_dim=128,
-            num_experts=4,
-            expert_names=["a", "b", "c", "d"],
-            use_batched_experts=True,
-        )
-
-        cfg_seq = MoEKernelConfig(
-            input_dim=64,
-            expert_hidden_dim=128,
-            num_experts=4,
-            expert_names=["a", "b", "c", "d"],
-            use_batched_experts=False,
-        )
-
-        kernel_batched = MoEKernel(cfg_batched)
-        kernel_seq = MoEKernel(cfg_seq)
-
-        # Copy weights
-        kernel_seq.load_state_dict(kernel_batched.state_dict())
-
-        kernel_batched.eval()
-        kernel_seq.eval()
-
-        kernel_batched.enable_profiling(True)
-        kernel_seq.enable_profiling(True)
-
-        x = torch.randn(32, 64)
-
-        with torch.no_grad():
-            kernel_batched(x)
-            kernel_seq(x)
-
-        stats_batched = kernel_batched.get_profiling_stats()
-        stats_seq = kernel_seq.get_profiling_stats()
-
-        # Both should have recorded calls
-        assert stats_batched["batched_calls"] > 0
-        assert stats_seq["sequential_calls"] > 0
 
     def test_heterogeneous_fallback_warning(self, caplog):
         """Heterogeneous experts trigger warning when use_batched_experts=True."""
@@ -1420,45 +1276,3 @@ class TestProfilingAndNewConfig:
             batched_fallback=False,
         )
         assert cfg.batched_fallback is False
-
-    def test_profile_expert_execution_batched(self):
-        """_profile_expert_execution uses batched path correctly."""
-        cfg = MoEKernelConfig(
-            input_dim=64,
-            expert_hidden_dim=128,
-            num_experts=4,
-            expert_names=["a", "b", "c", "d"],
-        )
-        kernel = MoEKernel(cfg)
-        kernel.eval()
-        kernel.enable_profiling(True)
-
-        slot_inputs = torch.randn(4, 64)
-        with torch.no_grad():
-            out = kernel._profile_expert_execution(slot_inputs, use_batched=True)
-
-        assert out.shape == (4, 64)
-        stats = kernel.get_profiling_stats()
-        assert stats["batched_calls"] == 1
-        assert stats["sequential_calls"] == 0
-
-    def test_profile_expert_execution_sequential(self):
-        """_profile_expert_execution uses sequential path correctly."""
-        cfg = MoEKernelConfig(
-            input_dim=64,
-            expert_hidden_dim=128,
-            num_experts=4,
-            expert_names=["a", "b", "c", "d"],
-        )
-        kernel = MoEKernel(cfg)
-        kernel.eval()
-        kernel.enable_profiling(True)
-
-        slot_inputs = torch.randn(4, 64)
-        with torch.no_grad():
-            out = kernel._profile_expert_execution(slot_inputs, use_batched=False)
-
-        assert out.shape == (4, 64)
-        stats = kernel.get_profiling_stats()
-        assert stats["batched_calls"] == 0
-        assert stats["sequential_calls"] == 1

@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.core.moe_interface import TextEncoder
+from src.models.text_encoder_protocol import TextEncoder
 from src.models.hdim_model import HDIMAuxState, HDIMModel, HDIMTextConfig
 from src.models.results import ForwardResult
 
@@ -266,23 +266,8 @@ class TextHDIMModel(nn.Module):
     def disable_gradient_checkpointing(self) -> None:
         self.core_model.disable_gradient_checkpointing()
 
-    def enable_gradient_surprise(self) -> None:
-        self.core_model.enable_gradient_surprise()
-
-    def enable_adaptive_forgetting(self) -> None:
-        self.core_model.enable_adaptive_forgetting()
-
     def enable_learnable_metric(self) -> None:
         self.core_model.enable_learnable_metric()
-
-    def enable_shared_expert(self) -> None:
-        self.core_model.enable_shared_expert()
-
-    def enable_aux_loss_free(self, aux_lr: float = 0.001) -> None:
-        self.core_model.enable_aux_loss_free(aux_lr=aux_lr)
-
-    def enable_expert_ortho(self) -> None:
-        self.core_model.enable_expert_ortho()
 
     def compute_expert_ortho_loss(self) -> "torch.Tensor":
         return self.core_model.pipeline.moe.expert_orthogonalization_loss()

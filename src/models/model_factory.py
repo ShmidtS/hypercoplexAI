@@ -15,7 +15,7 @@ model_from_experiment_config(exp) -> TextHDIMModel | HDIMModel
 
 from __future__ import annotations
 
-from typing import Union
+from typing import Any, Union
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.text_hdim_model import TextHDIMModel
@@ -85,13 +85,12 @@ def _make_moe_kernel(
     ortho_loss_weight: float = 0.01,
     use_can_experts: bool = False,
 ) -> None:
-    """Set pipeline.moe to MoEKernel (via MoEKernelAdapter).
+    """Set pipeline.moe to MoEKernel (implements MoERouter directly).
 
-    Uses the canonical MoEKernelAdapter from src.core.moe_kernel_adapter
-    which wraps MoEKernel to the MoERouter interface.
+    Uses MoEKernel directly (implements MoERouter interface).
 
-    Supports both built-in experts (math, language, code, science) and
-    custom experts registered via `register_expert()` from moe_kernel.
+    Supports built-in experts (math, language, code, science) and expert
+    behavior configured via EXPERT_CONFIGS from src.core.moe.
 
     num_experts is computed from expert_names if provided, otherwise from
     core_model.config.num_experts.
@@ -99,20 +98,11 @@ def _make_moe_kernel(
     Args:
         core_model: HDIMModel instance to patch
         expert_names: List of expert domain names. Built-in: math, language,
-            code, science. Custom names must be registered via register_expert()
-            before calling. Unknown names use generic DomainExpert.
+            code, science. Unknown names use generic expert config.
         z_loss_weight: Weight for router Z-loss regularization
         ortho_loss_weight: Weight for expert orthogonalization loss
-
-    Example:
-        >>> from src.core.moe_kernel import register_expert, DomainExpert
-        >>> class MedicalExpert(DomainExpert):
-        ...     pass  # custom implementation
-        >>> register_expert("medical", MedicalExpert)
-        >>> _make_moe_kernel(model, expert_names=["math", "medical"])
     """
-    from src.core.moe_kernel import MoEKernel, MoEKernelConfig
-    from src.core.moe_kernel_adapter import MoEKernelAdapter
+    from src.core.moe import MoEKernel, MoEKernelConfig
 
     pipeline = core_model.pipeline
     cfg = core_model.config
@@ -122,8 +112,8 @@ def _make_moe_kernel(
     if expert_names is not None:
         num_experts = len(expert_names)
     else:
-        # Use config.num_experts (guaranteed to be set after __post_init__)
-        num_experts = cfg.num_experts or 4
+        # Use config.moe.num_experts (guaranteed to be set after __post_init__)
+        num_experts = cfg.moe.num_experts or 4
         # Default expert names for built-in experts
         expert_names = ["math", "language", "code", "science"][:num_experts]
         # Pad with generic names if needed
@@ -147,7 +137,7 @@ def _make_moe_kernel(
         use_can_experts=use_can_experts,
     )
 
-    pipeline.moe = MoEKernelAdapter(MoEKernel(kernel_cfg))
+    pipeline.moe = MoEKernel(kernel_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +158,7 @@ def build_text_hdim_model(
 ) -> TextHDIMModel:
     """Build a TextHDIMModel with optional SoftMoERouter."""
     if soft_router and z_loss_weight > 0:
-        cfg.z_loss_weight = z_loss_weight
+        cfg.moe.z_loss_weight = z_loss_weight
 
     return TextHDIMModel(HDIMModel(cfg))
 
@@ -240,18 +230,17 @@ def model_from_experiment_config(
     """
     # Build HDIMConfig from the experiment settings.
     # We forward only the fields that HDIMConfig actually accepts.
-    cfg_kwargs = dict(
-        hidden_dim=exp.hidden_dim,
-        num_domains=exp.num_domains,
-    )
-    # Pass expert_names if provided, otherwise pass num_experts
-    if exp.expert_names is not None:
-        cfg_kwargs["expert_names"] = exp.expert_names
-    elif exp.num_experts is not None:
-        cfg_kwargs["num_experts"] = exp.num_experts
-
+    cfg_kwargs: dict[str, Any] = {
+        "hidden_dim": exp.hidden_dim,
+        "num_domains": exp.num_domains,
+        "expert_names": exp.expert_names,
+    }
+    moe: dict[str, Any] = {}
+    if exp.num_experts is not None:
+        moe["num_experts"] = exp.num_experts
     if getattr(exp, "n_shared_experts", 0) > 0:
-        cfg_kwargs["n_shared_experts"] = exp.n_shared_experts
+        moe["n_shared_experts"] = exp.n_shared_experts
+    cfg_kwargs["moe"] = moe
 
     if getattr(exp, "use_domain_embedding", False):
         cfg_kwargs["use_domain_embedding"] = exp.use_domain_embedding

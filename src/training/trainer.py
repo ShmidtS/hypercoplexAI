@@ -17,11 +17,24 @@ from torch.utils.data import DataLoader
 from src.models.hdim_model import HDIMAuxState, HDIMModel
 from src.models.results import ForwardResult
 from src.training.augmentations import EmbeddingAugmenter
+from src.training.losses import (
+    compute_batch_losses as _compute_batch_losses_fn,
+    compute_pair_ranking_loss as _pair_ranking_loss,
+    compute_iso_loss as _iso_loss,
+    compute_routing_loss as _routing_loss,
+    compute_pair_iso_loss as _pair_iso_loss,
+    compute_infonce_loss as _infonce_loss,
+    LossConfig,
+)
+from src.training.temperature import effective_temperature, cluster_scaled_temperature
+
+
 @dataclass(frozen=True)
 class TrainingRegime:
     mode: Literal["reconstruction", "paired"]
     update_memory: bool
     memory_mode: Literal["none", "retrieve", "update"]
+
 
 class HDIMTrainer:
     """Trainer for the HDIMModel."""
@@ -44,8 +57,6 @@ class HDIMTrainer:
         learnable_temperature: bool = False,
         lambda_dcl: float = 0.05,
         lambda_uniformity: float = 0.02,
-        lambda_diversity_var: float = 0.0,  # DEPRECATED: destroys contrastive clusters, kept for verify_lean4_numerical.py
-        lambda_diversity_ortho: float = 0.0,  # DEPRECATED: conflicts with pair_loss, kept for verify_lean4_numerical.py
         use_sc_temperature: bool = False,
         lambda_matryoshka: float = 0.15,  # multi-scale embedding loss (optional)
         # Temperature scheduling parameters (exposed for configurability)
@@ -76,8 +87,6 @@ class HDIMTrainer:
         self.lambda_online = lambda_online
         self.lambda_dcl = lambda_dcl
         self.lambda_uniformity = lambda_uniformity
-        self.lambda_diversity_var = lambda_diversity_var
-        self.lambda_diversity_ortho = lambda_diversity_ortho
         self.lambda_matryoshka = lambda_matryoshka
         self.use_sc_temperature = use_sc_temperature
         self.accum_steps = max(1, accum_steps)
@@ -95,11 +104,6 @@ class HDIMTrainer:
                            "may prevent contrastive clustering. Recommend lambda_uniformity < lambda_pair.")
         if lambda_dcl > 0 and lambda_uniformity > 0:
             logger.info("DCL + Uniformity is a strong combo for embedding uniformity — ensure lambda_pair is tuned.")
-        # Log re-enabled deprecated diversity losses for visibility
-        if lambda_diversity_var > 0.0:
-            logger.warning("Enabled lambda_diversity_var=%s (DEPRECATED: destroys contrastive clusters)", lambda_diversity_var)
-        if lambda_diversity_ortho > 0.0:
-            logger.warning("Enabled lambda_diversity_ortho=%s (DEPRECATED: conflicts with pair_loss)", lambda_diversity_ortho)
         self.use_hard_negatives: bool = False
         self._last_cluster_temp: float | None = None
         self._step: int = 0
@@ -109,10 +113,10 @@ class HDIMTrainer:
         self._tau_max: float = tau_max
         self._tau_min: float = tau_min
         self._temp_schedule_T_0: int = temp_schedule_T_0
-        import math
+        import math as _math
         if learnable_temperature:
             self._log_temp = nn.Parameter(
-                torch.tensor(math.log(infonce_temperature), device=torch.device(device))
+                torch.tensor(_math.log(infonce_temperature), device=torch.device(device))
             )
             self.model.register_parameter('_log_temp', self._log_temp)
         else:
@@ -231,98 +235,6 @@ class HDIMTrainer:
         )
         return self._training_invariant(result.aux_state).detach()
 
-    def _compute_reconstruction_loss(
-        self, output: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
-        return nn.functional.mse_loss(output, target)
-
-    def _compute_pair_iso_loss(
-        self,
-        training_invariant: torch.Tensor,
-        iso_target: torch.Tensor,
-        batch: Dict[str, Any],
-    ) -> torch.Tensor:
-        if not self._has_pairs(batch):
-            return self.compute_iso_loss(training_invariant, iso_target)
-
-        pair_relation_label = batch.get("pair_relation_label")
-        pair_weight = batch.get("pair_weight")
-        if pair_relation_label is None or pair_weight is None:
-            return self.compute_iso_loss(training_invariant, iso_target)
-
-        pair_relation_label = pair_relation_label.to(
-            self.device, dtype=training_invariant.dtype
-        )
-        pair_weight = pair_weight.to(self.device, dtype=training_invariant.dtype)
-        per_sample_mse = F.mse_loss(
-            training_invariant, iso_target, reduction="none"
-        ).mean(dim=-1)
-        positive_mask = pair_relation_label > 0.5
-        negative_mask = ~positive_mask
-        losses = []
-        if positive_mask.any():
-            positive_loss = (
-                per_sample_mse[positive_mask] * pair_weight[positive_mask]
-            ).sum() / pair_weight[positive_mask].sum()
-            losses.append(positive_loss)
-        if negative_mask.any():
-            negative_penalty = F.relu(
-                self.negative_margin - per_sample_mse[negative_mask]
-            )
-            weighted_negative = (
-                negative_penalty * pair_weight[negative_mask]
-            ).sum() / pair_weight[negative_mask].sum()
-            losses.append(weighted_negative)
-        if not losses:
-            return per_sample_mse.mean()
-        return torch.stack(losses).mean()
-
-    def _zero_loss(self, reference: torch.Tensor) -> torch.Tensor:
-        return torch.zeros((), device=reference.device, dtype=reference.dtype)
-
-    def _compute_diversity_loss(self, exported_invariant: torch.Tensor) -> torch.Tensor:
-        """Anti-collapse: encourage variance in invariant vectors.
-
-        Prevents the degenerate solution where all exported_invariants
-        converge to the same constant vector (causing STS→1.0, margin→0).
-
-        Uses two penalties:
-        1. Variance penalty: -mean(‖x_i - mean‖²) — push vectors apart
-        2. Orthogonality bonus: encourage non-zero pairwise angles
-
-        Returns zero loss when batch is too small (< 4) to be meaningful.
-        """
-        B = exported_invariant.shape[0]
-        if B < 4:
-            return self._zero_loss(exported_invariant)
-
-        # Normalize for consistent scale
-        x = F.normalize(exported_invariant.float(), dim=-1)  # fp32 for AMP safety
-
-        # 1. Variance penalty: encourage vectors to spread out on the hypersphere
-        mean_vec = x.mean(dim=0, keepdim=True)  # (1, D)
-        variance = ((x - mean_vec) ** 2).sum(dim=-1).mean()  # scalar
-
-        # 2. Cosine spread: penalize high average pairwise cosine similarity
-        # When all vectors collapse to one direction, avg_cosine → 1.0
-        cos_matrix = x @ x.T  # (B, B)
-        eye = torch.eye(B, device=x.device, dtype=torch.bool)
-        off_diag = cos_matrix.masked_fill(eye, 0.0)
-        avg_cosine = off_diag.abs().sum() / max(2 * (B * B - B), 1)
-
-        # Combined: we want HIGH variance and LOW avg cosine
-        # loss_div = -variance + avg_cosine (minimize this)
-        loss_div = -self.lambda_diversity_var * variance + self.lambda_diversity_ortho * avg_cosine
-        return loss_div
-
-    def _resolve_pair_group_id(self, batch: Dict[str, Any]) -> torch.Tensor | None:
-        pair_group_id = batch.get("pair_group_id")
-        if pair_group_id is None:
-            pair_group_id = batch.get("pair_family_id")
-        if pair_group_id is None:
-            return None
-        return pair_group_id.to(self.device)
-
     def _extract_pair_target_state(
         self, batch: Dict[str, Any]
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -363,35 +275,6 @@ class HDIMTrainer:
             aux_state.exported_invariant.detach(),
         )
 
-    def _compute_negative_pair_indices(
-        self,
-        pair_group_id: torch.Tensor,
-        domain_id: torch.Tensor,
-        pair_domain_id: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size = pair_group_id.shape[0]
-        # (B, B) mask: True where candidate j is from a different group than anchor i
-        diff_group = pair_group_id.unsqueeze(0) != pair_group_id.unsqueeze(1)  # (B, B)
-        # (B, B) mask: True where candidate j's pair_domain differs from anchor i's domain
-        cross_domain = pair_domain_id.unsqueeze(0) != domain_id.unsqueeze(1)  # (B, B)
-        # Prefer cross-domain negatives; fall back to any different-group negative
-        valid_cross = diff_group & cross_domain  # (B, B)
-        # For rows with no cross-domain candidate, fall back to diff_group only
-        has_cross = valid_cross.any(dim=1)  # (B,)
-        valid_mask = torch.where(
-            has_cross.unsqueeze(1), valid_cross, diff_group
-        )  # (B, B)
-        # Set invalid entries to -1 so argmax picks the first valid candidate
-        # We want the *first* valid candidate per row, so build a ranking where
-        # valid positions get their column index and invalid ones get batch_size
-        col_indices = torch.arange(batch_size, device=self.device).unsqueeze(0).expand(batch_size, -1)  # (B, B)
-        # For invalid entries, set a large value so argmin won't pick them
-        ranked = torch.where(valid_mask, col_indices.float(), float(batch_size))
-        negative_indices = ranked.argmin(dim=1)  # (B,)
-        # Mark rows with no valid candidate at all
-        no_valid = ~valid_mask.any(dim=1)
-        negative_indices[no_valid] = -1
-        return negative_indices
     def set_epoch(self, epoch: int) -> None:
         """Set current epoch for temperature scheduling.
 
@@ -408,64 +291,53 @@ class HDIMTrainer:
         if epoch == 1 and hasattr(self.model, "reset_memory"):
             self.model.reset_memory(strategy="hard")
 
-    def _effective_temperature(self) -> float:
-        """Возвращает эффективную температуру (обучаемую, scheduled, или фиксированную)."""
-        if self._log_temp is not None:
-            return float(self._log_temp.exp().clamp(0.01, 0.5).item())
-        if self._temp_schedule == "warm_restart":
-            # Linear decay within current LR restart cycle
-            T_0 = self._temp_schedule_T_0
-            epoch_in_cycle = self._current_epoch % T_0
-            fraction = epoch_in_cycle / max(T_0, 1)
-            return self._tau_max - (self._tau_max - self._tau_min) * fraction
-        return self.infonce_temperature
+    # -- Loss delegation (public API preserved for test compatibility) ----------
 
-    def _cluster_scaled_temperature(self, embeddings: torch.Tensor, base_temp: float) -> float:
-        """SC-InfoNCE: scale temperature based on cluster tightness (Cheng et al., Nov 2025).
-
-        Tighter clusters → lower temperature (sharper distribution).
-        Looser clusters → higher temperature (softer distribution).
-        """
-        if embeddings.numel() == 0:
-            return base_temp
-        cluster_var = embeddings.var(dim=0, unbiased=False).mean()
-        scale = torch.exp(-cluster_var)
-        scaled = base_temp * scale.clamp(0.5, 2.0)
-        self._last_cluster_temp = float(scaled.item())
-        return self._last_cluster_temp
-
-    def _mine_hard_negatives(
+    def compute_pair_ranking_loss(
         self,
-        source_inv: torch.Tensor,
-        target_inv: torch.Tensor,
-        pair_relation_label: torch.Tensor,
-        top_k: int = 4,
+        exported_invariant: torch.Tensor,
+        pair_exported_target: torch.Tensor | None,
+        batch: Dict[str, Any],
     ) -> torch.Tensor:
-        """Online hard negative mining: find hardest negatives in-batch.
+        config = self._build_loss_config()
+        temp = effective_temperature(
+            log_temp=self._log_temp,
+            temp_schedule=self._temp_schedule,
+            current_epoch=self._current_epoch,
+            infonce_temperature=self.infonce_temperature,
+            tau_max=self._tau_max,
+            tau_min=self._tau_min,
+            temp_schedule_T_0=self._temp_schedule_T_0,
+        )
+        if self.use_sc_temperature:
+            temp = cluster_scaled_temperature(exported_invariant, temp)
+            self._last_cluster_temp = temp
+        return _pair_ranking_loss(
+            exported_invariant, pair_exported_target, batch, config,
+            effective_temp=temp, device=self.device,
+            has_pairs=self._has_pairs(batch),
+        )
 
-        Returns indices (B,) — for each anchor, index of hardest negative.
-        -1 means no hard negative found.
-        """
-        B = source_inv.shape[0]
-        src = F.normalize(source_inv.detach().float(), dim=-1)  # fp32 for AMP safety
-        tgt = F.normalize(target_inv.detach().float(), dim=-1)
-        sim = src @ tgt.T  # (B, B)
+    def compute_iso_loss(
+        self, u_inv_source: torch.Tensor, u_inv_target: torch.Tensor
+    ) -> torch.Tensor:
+        return _iso_loss(u_inv_source, u_inv_target)
 
-        # Mask diagonal and true positives
-        eye = torch.eye(B, dtype=torch.bool, device=self.device)
-        pos_mask = pair_relation_label > 0.5
-        # Use -1e4 instead of -1e9 to avoid fp16 overflow (max fp16 ~65504)
-        _NEG_INF = -1e4
-        sim = sim.masked_fill(eye, _NEG_INF)
-        # Mask same-positive pairs
-        for i in range(B):
-            if pos_mask[i]:
-                sim[i] = sim[i].masked_fill(pos_mask, _NEG_INF)
-                sim[i, i] = _NEG_INF
+    def compute_routing_loss(self, routing_weights: torch.Tensor) -> torch.Tensor:
+        return _routing_loss(routing_weights)
 
-        # Hardest negative = highest similarity among non-positives
-        hard_neg_idx = sim.argmax(dim=-1)  # (B,)
-        return hard_neg_idx
+    def _compute_pair_iso_loss(
+        self,
+        training_invariant: torch.Tensor,
+        iso_target: torch.Tensor,
+        batch: Dict[str, Any],
+    ) -> torch.Tensor:
+        return _pair_iso_loss(
+            training_invariant, iso_target, batch,
+            negative_margin=self.negative_margin,
+            device=self.device,
+            has_pairs=self._has_pairs(batch),
+        )
 
     def _compute_infonce_loss(
         self,
@@ -476,453 +348,13 @@ class HDIMTrainer:
         temperature: float = 0.07,
         pair_group_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """InfoNCE loss (NT-Xent) for positive/negative pair discrimination.
-
-        Использует все негативы в батче одновременно (in-batch negatives),
-        что значительно эффективнее чем pairwise ranking margin.
-        Проверено в SimCLR, CLIP, sentence-transformers.
-
-        Args:
-            source_inv: (B, D) source exported_invariant, L2-normalized
-            target_inv: (B, D) target exported_invariant, L2-normalized
-            pair_relation_label: (B,) 1.0=positive, 0.0=negative
-            pair_weight: (B,) per-sample weights
-            temperature: softmax temperature (меньше = резче границы)
-            pair_group_id: (B,) group/family IDs — same-group entries are false negatives
-        Returns:
-            scalar InfoNCE loss
-        """
-        B = source_inv.shape[0]
-        if B < 2:
-            return self._zero_loss(source_inv)
-
-        # NaN/Inf protection during validation
-        if torch.isnan(source_inv).any() or torch.isinf(source_inv).any():
-            return self._zero_loss(source_inv)
-        if torch.isnan(target_inv).any() or torch.isinf(target_inv).any():
-            return self._zero_loss(source_inv)
-
-        dev = source_inv.device
-        positive_mask = pair_relation_label.to(dev) > 0.5
-        if not positive_mask.any():
-            return self._zero_loss(source_inv)
-
-        src = F.normalize(source_inv.float(), dim=-1)  # (B, D) — float32 for AMP safety
-        tgt = F.normalize(target_inv.float(), dim=-1)  # (B, D)
-
-        # Similarity matrix: (B, B) — force float32 to avoid fp16 overflow in masked_fill/logsumexp
-        sim_matrix = (src @ tgt.T / temperature).float()
-
-        # Mask out false negatives from denominator
-        # 1) Same-family entries (same pair_group_id) — semantically similar but not true negatives
-        if pair_group_id is not None:
-            gid = pair_group_id.to(dev)
-            group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))  # (B, B)
-            eye_mask = torch.eye(B, dtype=torch.bool, device=dev)
-            sim_matrix = sim_matrix.masked_fill(group_match & ~eye_mask, -torch.finfo(torch.float32).max)
-        # 2) Other positive pairs (label>0.5) — also false negatives
-        elif positive_mask.sum() > 1:
-            pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)  # (B, B)
-            eye_mask = torch.eye(B, dtype=torch.bool, device=dev)
-            sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~eye_mask, -torch.finfo(torch.float32).max)
-
-        # InfoNCE: for each positive pair (i,i), treat all other j≠i as negatives
-        # Только для положительных пар считаем loss
-        pos_indices = positive_mask.nonzero(as_tuple=True)[0]
-
-        # Labels: diagonal = self-match for positives
-        labels = torch.arange(B, device=dev)
-        loss_per_sample = F.cross_entropy(sim_matrix[pos_indices], labels[pos_indices], reduction='none')
-
-        weights = pair_weight.to(dev)[pos_indices]
-        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
-
-
-    def _compute_focal_infonce_loss(
-        self,
-        source_inv: torch.Tensor,
-        target_inv: torch.Tensor,
-        pair_relation_label: torch.Tensor,
-        pair_weight: torch.Tensor,
-        temperature: float = 0.07,
-        gamma: float = 0.5,
-        pair_group_id: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Focal-InfoNCE loss (Hou & Li, EMNLP Findings 2023).
-
-        Downweights easy negatives via focal exponent scaling.
-        When gamma < 1.0, the denominator compresses contribution of
-        well-separated negatives, focusing learning on hardest pairs.
-
-        Implementation: apply gamma to the similarity matrix before
-        cross-entropy, which is equivalent to focal modulation of
-        the softmax probabilities.
-
-        Args:
-            source_inv: (B, D) source exported_invariant
-            target_inv: (B, D) target exported_invariant
-            pair_relation_label: (B,) 1.0=positive, 0.0=negative
-            pair_weight: (B,) per-sample weights
-            temperature: softmax temperature
-            gamma: focal parameter (1.0=standard, 0.5=moderate focus on hard)
-        Returns:
-            scalar InfoNCE loss (always >= 0)
-        """
-        B = source_inv.shape[0]
-        if B < 2:
-            return self._zero_loss(source_inv)
-
-        # NaN/Inf protection during validation
-        if torch.isnan(source_inv).any() or torch.isinf(source_inv).any():
-            return self._zero_loss(source_inv)
-        if torch.isnan(target_inv).any() or torch.isinf(target_inv).any():
-            return self._zero_loss(source_inv)
-
-        dev = source_inv.device
-        positive_mask = pair_relation_label.to(dev) > 0.5
-        if not positive_mask.any():
-            return self._zero_loss(source_inv)
-
-        src = F.normalize(source_inv.float(), dim=-1)  # float32 for AMP safety
-        tgt = F.normalize(target_inv.float(), dim=-1)
-
-        pos_indices = positive_mask.nonzero(as_tuple=True)[0]
-        labels = torch.arange(B, device=dev)
-
-        if gamma >= 0.99:
-            # Standard InfoNCE path (no focal modulation)
-            sim_matrix = (src @ tgt.T / temperature).float()
-            # Mask out false negatives from denominator
-            if pair_group_id is not None:
-                gid = pair_group_id.to(dev)
-                group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))
-                sim_matrix = sim_matrix.masked_fill(group_match & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
-            elif positive_mask.sum() > 1:
-                pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
-                sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
-            loss_per_sample = F.cross_entropy(
-                sim_matrix[pos_indices], labels[pos_indices], reduction='none'
-            )
-        else:
-            # Focal-InfoNCE: scale logits by gamma before CE
-            sim_matrix = (src @ tgt.T / temperature).float()
-            if pair_group_id is not None:
-                gid = pair_group_id.to(dev)
-                group_match = (gid.unsqueeze(0) == gid.unsqueeze(1))
-                sim_matrix = sim_matrix.masked_fill(group_match & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
-            elif positive_mask.sum() > 1:
-                pos_mask_2d = positive_mask.unsqueeze(0).expand(B, -1)
-                sim_matrix = sim_matrix.masked_fill(pos_mask_2d & ~torch.eye(B, dtype=torch.bool, device=dev), -torch.finfo(torch.float32).max)
-            pos_mask = (pair_relation_label > 0.5).to(dev)  # (B,)
-            focal_matrix = torch.where(
-                pos_mask.unsqueeze(1),
-                sim_matrix,
-                sim_matrix * gamma
-            )
-            loss_per_sample = F.cross_entropy(
-                focal_matrix[pos_indices], labels[pos_indices], reduction='none'
-            )
-
-        weights = pair_weight.to(dev)[pos_indices]
-        return (loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)
-
-
-    def _compute_dcl_loss(
-        self,
-        source_inv: torch.Tensor,
-        target_inv: torch.Tensor,
-        pair_relation_label: torch.Tensor,
-        pair_weight: torch.Tensor,
-        temperature: float = 0.07,
-    ) -> torch.Tensor:
-        """Decoupled Contrastive Loss (DCL) — Yeh et al., NeurIPS 2022.
-
-        Ключевое отличие от InfoNCE: positive убирается из знаменателя.
-        L_DCL = -log( exp(s_pos/τ) / Σ_{j: j≠pos} exp(s_j/τ) )
-
-        Это устраняет "positive-negative coupling" — InfoNCE подавляет
-        градиент от трудных негативов когда positive слишком похож.
-        Математически: gradient для negative = p_j*(1 + β_j) где β_j > 0 для DCL.
-
-        Refs: Decoupled Contrastive Learning (Yeh et al., NeurIPS 2022)
-        """
-        B = source_inv.shape[0]
-        if B < 2:
-            return self._zero_loss(source_inv)
-
-        positive_mask = pair_relation_label > 0.5
-        if not positive_mask.any():
-            return self._zero_loss(source_inv)
-
-        src = F.normalize(source_inv.float(), dim=-1)   # (B, D) — fp32 to avoid AMP fp16 precision loss
-        tgt = F.normalize(target_inv.float(), dim=-1)   # (B, D)
-
-        sim_matrix = (src @ tgt.T / temperature).float()  # force fp32 for AMP safety
-
-        diag_mask = torch.eye(B, dtype=torch.bool, device=self.device)
-
-        # Vectorized: mask diagonal to -inf for all rows at once
-        masked_sim = sim_matrix.clone()
-        masked_sim.masked_fill_(diag_mask, -torch.finfo(torch.float32).max)
-        log_denom = torch.logsumexp(masked_sim, dim=1)  # (B,)
-        pos_mask = (pair_relation_label > 0.5).to(pair_relation_label.device).float()  # (B,)
-        s_pos = (sim_matrix * pos_mask.unsqueeze(1)).sum(dim=1) / pos_mask.unsqueeze(1).sum(dim=1).clamp(min=1)
-        loss_per_sample = -(s_pos - log_denom)  # (B,)
-        # Apply weights only to positive samples
-        weights = pair_weight * positive_mask.float()
-        if weights.sum() == 0:
-            return self._zero_loss(source_inv)
-        return ((loss_per_sample * weights).sum() / weights.sum().clamp_min(1e-8)).clamp(min=0)
-
-    def _compute_uniformity_alignment_loss(
-        self,
-        source_inv: torch.Tensor,
-        target_inv: torch.Tensor,
-        pair_relation_label: torch.Tensor,
-        t_uniform: float = 2.0,
-        lambda_align: float = 1.0,
-        lambda_uniform: float = 0.5,
-    ) -> torch.Tensor:
-        """Uniformity + Alignment loss (Wang & Isola, ICML 2020).
-
-        L_align  = E[||f(x)-f(y)||²]  — выравниваем позитивные пары
-        L_uniform = log E[exp(-t||f(x)-f(z)||²)] — отталкиваем все равномерно
-
-        Эти два компонента разделены: alignment только для позитивов,
-        uniformity для всех. Это более стабильно чем InfoNCE.
-
-        Refs: Understanding Contrastive Representation Learning through
-        Alignment and Uniformity on the Hypersphere (Wang & Isola, ICML 2020)
-        """
-        B = source_inv.shape[0]
-        if B < 4:
-            return self._zero_loss(source_inv)
-
-        positive_mask = pair_relation_label > 0.5
-        src = F.normalize(source_inv.float(), dim=-1)  # (B, D)
-        tgt = F.normalize(target_inv.float(), dim=-1)  # (B, D)
-
-        # Alignment: только для positives
-        if positive_mask.any():
-            src_pos = src[positive_mask]  # (Np, D)
-            tgt_pos = tgt[positive_mask]  # (Np, D)
-            loss_align = (src_pos - tgt_pos).pow(2).sum(dim=-1).mean()
-        else:
-            loss_align = self._zero_loss(source_inv)
-
-        # Uniformity: по всем парам (src ∪ tgt)
-        all_vecs = torch.cat([src, tgt], dim=0)  # (2B, D)
-        diffs = all_vecs.unsqueeze(0) - all_vecs.unsqueeze(1)  # (2B, 2B, D)
-        sq_dists = diffs.pow(2).sum(dim=-1)  # (2B, 2B)
-        # Маскируем диагональ (нулевое расстояние до себя)
-        mask = ~torch.eye(2 * B, dtype=torch.bool, device=self.device)
-        sq_dists_off = sq_dists[mask].view(2 * B, 2 * B - 1)
-        # Numerically stable log-mean-exp to avoid Inf overflow
-        neg_sq = (-t_uniform * sq_dists_off).float()  # fp32 для logsumexp стабильности
-        loss_uniform = torch.logsumexp(neg_sq, dim=-1).mean() - math.log(neg_sq.shape[-1])
-
-        return (lambda_align * loss_align + lambda_uniform * loss_uniform).clamp(min=0)
-
-    def _compute_pair_ranking_loss(
-        self,
-        exported_invariant: torch.Tensor,
-        pair_exported_target: torch.Tensor | None,
-        batch: Dict[str, Any],
-    ) -> torch.Tensor:
-        if not self._has_pairs(batch) or pair_exported_target is None:
-            return self._zero_loss(exported_invariant)
-
-        pair_relation_label = batch.get("pair_relation_label")
-        pair_weight = batch.get("pair_weight")
-        pair_group_id = self._resolve_pair_group_id(batch)
-        if pair_relation_label is None or pair_weight is None:
-            return self._zero_loss(exported_invariant)
-
-        pair_relation_label = pair_relation_label.to(
-            self.device, dtype=exported_invariant.dtype
-        )
-        pair_weight = pair_weight.to(self.device, dtype=exported_invariant.dtype)
-
-
-        # InfoNCE path (use_infonce=True by default via ranking_margin <= 0)
-        if getattr(self, 'use_infonce', True):
-            temp = self._effective_temperature()
-            if getattr(self, 'use_sc_temperature', False):
-                temp = self._cluster_scaled_temperature(exported_invariant, temp)
-            use_focal = self._focal_gamma < 1.0
-            # Hard negative mining: используем hardest negatives в batche
-            use_hard_neg = getattr(self, 'use_hard_negatives', False)
-            if use_hard_neg and exported_invariant.shape[0] >= 4:
-                hard_neg_idx = self._mine_hard_negatives(
-                    exported_invariant, pair_exported_target, pair_relation_label
-                )
-                hard_pair_target = pair_exported_target[hard_neg_idx]
-                hard_labels = torch.zeros_like(pair_relation_label)
-                hard_weights = pair_weight * 0.5
-                aug_src = torch.cat([exported_invariant, exported_invariant[pair_relation_label > 0.5]], dim=0)
-                aug_tgt = torch.cat([pair_exported_target, hard_pair_target[pair_relation_label > 0.5]], dim=0)
-                aug_lbl = torch.cat([pair_relation_label, hard_labels[pair_relation_label > 0.5]], dim=0)
-                aug_w   = torch.cat([pair_weight, hard_weights[pair_relation_label > 0.5]], dim=0)
-                if use_focal:
-                    infonce = self._compute_focal_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp, gamma=self._focal_gamma)
-                else:
-                    infonce = self._compute_infonce_loss(aug_src, aug_tgt, aug_lbl, aug_w, temperature=temp, pair_group_id=None)
-            else:
-                if use_focal:
-                    infonce = self._compute_focal_infonce_loss(
-                        exported_invariant, pair_exported_target,
-                        pair_relation_label, pair_weight,
-                        temperature=temp, gamma=self._focal_gamma,
-                    )
-                else:
-                    infonce = self._compute_infonce_loss(
-                        exported_invariant, pair_exported_target,
-                        pair_relation_label, pair_weight,
-                        temperature=temp,
-                        pair_group_id=pair_group_id,
-                    )
-            # AnglE loss поверх InfoNCE (если включён) — added directly to loss_total in _compute_batch_losses
-            return infonce
-
-        # Legacy ranking margin fallback
-        if pair_group_id is None:
-            return self._zero_loss(exported_invariant)
-
-        pair_domain_id = batch["pair_domain_id"].to(self.device)
-        domain_id = batch["domain_id"].to(self.device)
-
-        positive_mask = pair_relation_label > 0.5
-        if not positive_mask.any() or exported_invariant.shape[0] < 2:
-            return self._zero_loss(exported_invariant)
-
-        source_normalized = F.normalize(exported_invariant.float(), dim=-1)  # fp32 for AMP safety
-        target_normalized = F.normalize(pair_exported_target.float(), dim=-1)
-        similarities = source_normalized @ target_normalized.transpose(0, 1)
-        anchor_indices = torch.arange(exported_invariant.shape[0], device=self.device)
-        negative_indices = self._compute_negative_pair_indices(
-            pair_group_id,
-            domain_id,
-            pair_domain_id,
-        )
-        valid_mask = positive_mask & (negative_indices >= 0)
-        if not valid_mask.any():
-            return self._zero_loss(exported_invariant)
-
-        positive_scores = similarities[
-            anchor_indices[valid_mask], anchor_indices[valid_mask]
-        ]
-        negative_scores = similarities[
-            anchor_indices[valid_mask],
-            negative_indices[valid_mask],
-        ]
-        margin_loss = F.relu(self.ranking_margin - positive_scores + negative_scores)
-        weighted_loss = margin_loss * pair_weight[valid_mask]
-        return weighted_loss.sum() / pair_weight[valid_mask].sum().clamp_min(1e-8)
-
-    def compute_pair_ranking_loss(
-        self,
-        exported_invariant: torch.Tensor,
-        pair_exported_target: torch.Tensor | None,
-        batch: Dict[str, Any],
-    ) -> torch.Tensor:
-        return self._compute_pair_ranking_loss(
-            exported_invariant,
-            pair_exported_target,
-            batch,
+        return _infonce_loss(
+            source_inv, target_inv, pair_relation_label, pair_weight,
+            temperature=temperature, pair_group_id=pair_group_id,
+            device=self.device,
         )
 
-    def _compute_matryoshka_loss(
-        self,
-        matryoshka_embs: Dict[int, torch.Tensor],
-        batch: Dict[str, Any],
-    ) -> torch.Tensor:
-        """Matryoshka Representation Learning loss.
-        
-        Trains the encoder to produce meaningful embeddings at multiple dimensions.
-        Each scale contributes equally to the total loss.
-        
-        Ref: Kusupati et al., NeurIPS 2022
-        
-        For HDIM: we compute contrastive loss at each Matryoshka scale,
-        encouraging all dimensionalities to preserve semantic structure.
-        """
-        if not matryoshka_embs:
-            return self._zero_loss(next(iter(batch.values())))
-        
-        # Need pair info for contrastive loss at each scale
-        pair_relation_label = batch.get("pair_relation_label")
-        if pair_relation_label is None:
-            # No pairs - can't compute Matryoshka contrastive loss
-            return self._zero_loss(next(iter(matryoshka_embs.values())))
-        
-        pair_weight = batch.get("pair_weight")
-        if pair_weight is None:
-            pair_weight = torch.ones_like(pair_relation_label)
-        
-        # For Matryoshka, we need both source and target embeddings at each scale
-        # The batch should contain "matryoshka_source" and "matryoshka_target" dicts
-        matryoshka_source = batch.get("matryoshka_source", matryoshka_embs)
-        matryoshka_target = batch.get("matryoshka_target", matryoshka_embs)
-        
-        if not matryoshka_source or not matryoshka_target:
-            return self._zero_loss(next(iter(matryoshka_embs.values())))
-        
-        total_loss = self._zero_loss(next(iter(matryoshka_source.values())))
-        n_scales = 0
-        
-        # Compute contrastive loss at each scale
-        for dim in matryoshka_source.keys():
-            if dim not in matryoshka_target:
-                continue
-                
-            src_emb = matryoshka_source[dim]
-            tgt_emb = matryoshka_target[dim]
-
-            # Use InfoNCE at each scale with pair_group_id for SupCon
-            scale_loss = self._compute_infonce_loss(
-                src_emb,
-                tgt_emb,
-                pair_relation_label,
-                pair_weight,
-                temperature=self._effective_temperature(),
-                pair_group_id=batch.get("pair_group_id"),
-            )
-            total_loss = total_loss + scale_loss
-            n_scales += 1
-        
-        # Average across scales
-        if n_scales > 0:
-            total_loss = total_loss / n_scales
-        
-        return total_loss
-    
-    def _compute_pair_loss_terms(
-        self,
-        aux_state: HDIMAuxState,
-        batch: Dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        pair_target_state = self._extract_pair_target_state(batch)
-        if pair_target_state is None:
-            iso_target = self._extract_iso_targets(batch, aux_state)
-            pair_exported_target = None
-        else:
-            iso_target, pair_exported_target = pair_target_state
-        loss_pair = self._compute_pair_ranking_loss(
-            aux_state.exported_invariant,
-            pair_exported_target,
-            batch,
-        )
-        return iso_target, loss_pair, pair_exported_target
-    def _compute_router_diagnostics(
-        self, aux_state: HDIMAuxState
-    ) -> Dict[str, torch.Tensor]:
-        return {
-            "routing_entropy": aux_state.routing_entropy,
-            "expert_usage": aux_state.expert_usage,
-            "topk_idx": aux_state.topk_idx,
-            "topk_gate_weights": aux_state.topk_gate_weights,
-            "train_scores_snapshot": aux_state.train_scores_snapshot,
-        }
+    # -- Forward helpers ---------------------------------------------------------
 
     def _forward_text_batch(
         self,
@@ -954,6 +386,35 @@ class HDIMTrainer:
             update_memory=regime.update_memory,
             memory_mode=regime.memory_mode,
         )
+
+    # -- Loss config builder ----------------------------------------------------
+
+    def _build_loss_config(self) -> LossConfig:
+        return LossConfig(
+            lambda_routing=self.lambda_routing,
+            lambda_pair=self.lambda_pair,
+            lambda_memory=self.lambda_memory,
+            negative_margin=self.negative_margin,
+            ranking_margin=self.ranking_margin,
+            use_infonce=self.use_infonce,
+            infonce_temperature=self.infonce_temperature,
+            lambda_z=self.lambda_z,
+            lambda_expert_ortho=self.lambda_expert_ortho,
+            lambda_online=self.lambda_online,
+            learnable_temperature=self._log_temp is not None,
+            lambda_dcl=self.lambda_dcl,
+            lambda_uniformity=self.lambda_uniformity,
+            use_sc_temperature=self.use_sc_temperature,
+            lambda_matryoshka=self.lambda_matryoshka,
+            temp_schedule=self._temp_schedule,
+            tau_max=self._tau_max,
+            tau_min=self._tau_min,
+            temp_schedule_T_0=self._temp_schedule_T_0,
+            focal_gamma=self._focal_gamma,
+            use_hard_negatives=self.use_hard_negatives,
+        )
+
+    # -- Batch loss computation (delegates to losses.py) ------------------------
 
     def _compute_batch_losses(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         domain_id = batch["domain_id"].to(self.device)
@@ -1048,123 +509,36 @@ class HDIMTrainer:
                 invariant = fwd_result.invariant
                 aux_state = fwd_result.aux_state
                 recon_target = encoding
-        training_invariant = self._training_invariant(aux_state)
-        iso_target, loss_pair, pair_exported_target = self._compute_pair_loss_terms(aux_state, batch)
-        loss_recon = self._compute_reconstruction_loss(output, recon_target)
-        loss_iso = self._zero_loss(training_invariant)
-        loss_routing = aux_state.router_loss
-        pair_relation_label = batch.get("pair_relation_label")
-        pair_weight = batch.get("pair_weight")
-        loss_memory = aux_state.memory_loss
-        loss_sts = self._zero_loss(training_invariant)
 
-        # Router z-loss (ST-MoE stability)
-        loss_z = aux_state.z_loss
-
-        # Anti-collapse diversity loss: encourage variance in exported_invariant
-        # Prevents trivial solution where all invariants are identical (STS→1.0, margin→0)
-        # Only applied when we have paired data (need diverse samples in batch)
-        if self.lambda_diversity_var == 0.0 and self.lambda_diversity_ortho == 0.0:
-            loss_diversity = self._zero_loss(training_invariant)
+        # Compute pair targets for loss delegation
+        pair_target_state = self._extract_pair_target_state(batch)
+        if pair_target_state is None:
+            iso_target = self._extract_iso_targets(batch, aux_state)
+            pair_exported_target = None
         else:
-            loss_diversity = self._zero_loss(training_invariant)
-            if self._has_pairs(batch) and pair_relation_label is not None:
-                loss_diversity = self._compute_diversity_loss(aux_state.exported_invariant)
+            iso_target, pair_exported_target = pair_target_state
 
-        # Matryoshka multi-scale loss in exported_invariant space (not SBERT)
-        loss_matryoshka = self._zero_loss(training_invariant)
-        matryoshka_embs = batch.get("matryoshka_embeddings")
-        if matryoshka_embs is not None and isinstance(matryoshka_embs, dict):
-            _exported_src = aux_state.exported_invariant
-            _exported_dim = _exported_src.shape[-1]
-            _m_dims = [d for d in sorted(matryoshka_embs.keys()) if d < _exported_dim]
-            if _m_dims and pair_exported_target is not None:
-                batch["matryoshka_source"] = {d: _exported_src[..., :d].contiguous() for d in _m_dims}
-                batch["matryoshka_target"] = {d: pair_exported_target[..., :d].contiguous() for d in _m_dims}
-                matryoshka_embs = batch["matryoshka_source"]
-            loss_matryoshka = self._compute_matryoshka_loss(matryoshka_embs, batch)
-        
-        # Phase 26: Expert orthogonalization loss
-        loss_expert_ortho = self._zero_loss(loss_recon)
-        if self.lambda_expert_ortho > 0 and hasattr(self.model, 'compute_expert_ortho_loss'):
-            loss_expert_ortho = self.model.compute_expert_ortho_loss()
-
-        loss_total = (
-            loss_recon
-            + self.lambda_pair * loss_pair
-            + self.lambda_routing * loss_routing
-            + self.lambda_memory * loss_memory
-            + self.lambda_z * loss_z
-            + loss_diversity  # already scaled by lambdas inside _compute_diversity_loss
-            + self.lambda_matryoshka * loss_matryoshka
-            + self.lambda_expert_ortho * loss_expert_ortho
-            + self.lambda_online * aux_state.online_loss
+        # Delegate loss computation to losses.py
+        batch_losses = _compute_batch_losses_fn(
+            batch=batch,
+            output=output,
+            recon_target=recon_target,
+            aux_state=aux_state,
+            routing_weights=routing_weights,
+            invariant=invariant,
+            iso_target=iso_target,
+            pair_exported_target=pair_exported_target,
+            config=self._build_loss_config(),
+            device=self.device,
+            current_epoch=self._current_epoch,
+            log_temp=self._log_temp,
+            model=self.model,
         )
 
-        # Pairwise auxiliary losses (added directly with their own lambdas)
-        pair_group_id = self._resolve_pair_group_id(batch)
-        if pair_relation_label is not None and pair_weight is not None and pair_exported_target is not None:
-            _prl_typed = pair_relation_label.to(self.device, dtype=training_invariant.dtype)
-            _pw_typed = pair_weight.to(self.device, dtype=training_invariant.dtype)
-            if self.lambda_dcl > 0:
-                loss_dcl = self._compute_dcl_loss(
-                    aux_state.exported_invariant, pair_exported_target,
-                    _prl_typed, _pw_typed,
-                    temperature=self._effective_temperature(),
-                )
-                loss_total = loss_total + self.lambda_dcl * loss_dcl
-            if self.lambda_uniformity > 0:
-                loss_uniformity = self._compute_uniformity_alignment_loss(
-                    aux_state.exported_invariant, pair_exported_target,
-                    _prl_typed,
-                )
-                loss_total = loss_total + self.lambda_uniformity * loss_uniformity
-        # NaN protection: zero ALL loss components with correct dtype
-        if torch.isnan(loss_total) or torch.isinf(loss_total):
-            _components = {
-                "loss_recon": loss_recon, "loss_iso": loss_iso, "loss_pair": loss_pair,
-                "loss_routing": loss_routing, "loss_memory": loss_memory, "loss_sts": loss_sts,
-                "loss_z": loss_z, "loss_diversity": loss_diversity, "loss_matryoshka": loss_matryoshka,
-                "loss_expert_ortho": loss_expert_ortho, "loss_online": aux_state.online_loss,
-            }
-            _nan_names = [k for k, v in _components.items() if torch.isnan(v) or torch.isinf(v)]
-            logger.warning("[NaN guard] NaN/Inf in loss components: %s", _nan_names)
-            batch_losses = {k: self._zero_loss(loss_total) for k in _components}
-            batch_losses["_nan_skip"] = True
-            return batch_losses
-        batch_losses = {
-            "loss_total": loss_total,
-            "loss_recon": loss_recon,
-            "loss_iso": loss_iso,
-            "loss_pair": loss_pair,
-            "loss_routing": loss_routing,
-            "loss_memory": loss_memory,
-            "loss_diversity": loss_diversity,
-            "loss_matryoshka": loss_matryoshka,
-            "loss_expert_ortho": loss_expert_ortho,
-            "loss_online": aux_state.online_loss,
-            "loss_z": loss_z,
-            "loss_sts": loss_sts,
-            "routing_weights": routing_weights,
-            "invariant": invariant,
-            "raw_invariant": aux_state.raw_invariant,
-            "memory_augmented_invariant": aux_state.memory_augmented_invariant,
-            "exported_invariant": aux_state.exported_invariant,
-            "training_invariant": training_invariant,
-            "training_mode": regime.mode,
-        }
-        if pair_relation_label is not None:
-            batch_losses["pair_relation_label"] = pair_relation_label.to(
-                self.device, dtype=training_invariant.dtype
-            )
-        if pair_weight is not None:
-            batch_losses["pair_weight"] = pair_weight.to(
-                self.device, dtype=training_invariant.dtype
-            )
-        if self._has_pairs(batch):
-            batch_losses["iso_target"] = iso_target
-        batch_losses.update(self._compute_router_diagnostics(aux_state))
+        # Add training_mode (not in losses.py which is regime-agnostic)
+        batch_losses["training_mode"] = regime.mode
         return batch_losses
+
     def evaluate_batch(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         self.model.eval()
         with torch.no_grad():
@@ -1200,7 +574,7 @@ class HDIMTrainer:
             loss_total = loss_total / self.accum_steps
 
         # Phase 31: Experience replay from OnlineLearner buffer
-        online_replay_loss = self._zero_loss(loss_total)
+        online_replay_loss = torch.zeros((), device=loss_total.device, dtype=loss_total.dtype)
         if hasattr(self.model, 'online_learner') and self.model.online_learner is not None:
             replay_loss = self.model.online_learner.replay_step(self.model)
             if replay_loss is not None:
@@ -1273,16 +647,6 @@ class HDIMTrainer:
         self._last_loss_components["online_replay_loss"] = online_replay_loss.item()
         return unscaled_loss
 
-    def compute_iso_loss(
-        self, u_inv_source: torch.Tensor, u_inv_target: torch.Tensor
-    ) -> torch.Tensor:
-        return nn.functional.mse_loss(u_inv_source, u_inv_target)
-
-    def compute_routing_loss(self, routing_weights: torch.Tensor) -> torch.Tensor:
-        mean_routing = routing_weights.mean(dim=0)
-        eps = 1e-8
-        entropy = -(mean_routing * (mean_routing + eps).log()).sum()
-        return -entropy
     def validate(self, dataloader: DataLoader) -> Dict[str, float]:
         self.model.eval()
         totals: dict = {}
@@ -1308,6 +672,7 @@ class HDIMTrainer:
         totals["effective_temperature"] = lr / (self._last_batch_size * self.accum_steps)
         totals["loss_gap"] = val_loss - train_loss
         return totals
+
     def save_checkpoint(self, path: str, scaler=None, scheduler=None) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         checkpoint = {
@@ -1352,9 +717,31 @@ class HDIMTrainer:
             ) from exc
         return ckpt
 
+    @staticmethod
+    def _migrate_checkpoint_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        # Old adapter checkpoints have keys like pipeline.moe.kernel.X
+        # New MoEKernel checkpoints have keys like pipeline.moe.X
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key
+            if key.startswith("pipeline.moe.kernel."):
+                new_key = "pipeline.moe." + key[len("pipeline.moe.kernel."):]
+            new_state_dict[new_key] = value
+        return new_state_dict
+
     def load_checkpoint(self, path: str, scaler=None, scheduler=None) -> None:
         checkpoint = self._load_checkpoint_safe(path)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        state_dict = checkpoint.get("model_state_dict", {})
+        new_state_dict = self._migrate_checkpoint_state_dict(state_dict)
+        if new_state_dict != state_dict:
+            checkpoint["model_state_dict"] = new_state_dict
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "Checkpoint migration: stripped 'kernel.' prefix from MoEKernelAdapter keys"
+            )
+
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self._step = checkpoint.get("step", 0)
         self._current_epoch = checkpoint.get("current_epoch", 0)

@@ -22,13 +22,13 @@ import torch.nn as nn
 
 from .hypercomplex import CliffordAlgebra
 from .domain_operators import sandwich_transfer
-from .moe_interface import MoERouter
-from .memory_interface import MemoryInterface, TitansAdapter, HBMAMemoryAdapter
+from .moe import MoERouter
+from .memory import MemoryInterface, TitansMemory, HBMAMemory, MSAMemory, NarsTruth
 from .domain_encoder import DomainEncoder
 from .invariant_processor import InvariantProcessor, InvariantMemoryState
 from .transfer_engine import TransferEngine
 from .transfer_state import TransferState
-from .nars_truth import NarsTruth
+# NarsTruth imported from .memory above
 
 
 class HDIMEncoder(nn.Module):
@@ -110,14 +110,8 @@ class HDIMPipeline(nn.Module):
         elif num_experts is None:
             num_experts = 4
 
-        valid_memory_types = ("titans", "hippocampus", "neocortex", "cls", "hbma", "msa", "prototype")
-        if memory_type == "hippocampus":
-            logging.warning("memory_type='hippocampus' is an alias for 'hbma'.")
-            memory_type = "hbma"
-        elif memory_type == "neocortex":
-            logging.warning("memory_type='neocortex' is an alias for 'cls'.")
-            memory_type = "cls"
-        elif memory_type not in valid_memory_types:
+        valid_memory_types = ("titans", "hbma", "msa")
+        if memory_type not in valid_memory_types:
             raise ValueError(
                 f"Unsupported memory_type {memory_type!r}. Valid memory types: {list(valid_memory_types)}"
             )
@@ -133,30 +127,18 @@ class HDIMPipeline(nn.Module):
 
         # === Component 2: Memory + InvariantProcessor ===
         if memory_type == 'titans':
-            from .titans_memory import TitansMemoryModule
-            _raw_memory = TitansMemoryModule(
-                key_dim=memory_key_dim,
-                val_dim=clifford_dim,
-                hidden_dim=memory_key_dim * 2,
-            )
-            self.memory: MemoryInterface = TitansAdapter(
-                _raw_memory,
+            self.memory: MemoryInterface = TitansMemory(
                 clifford_dim=clifford_dim,
                 memory_key_dim=memory_key_dim,
             )
         elif memory_type == 'hbma':
-            from .hbma_memory import HBMAMemory
-            self.memory = HBMAMemoryAdapter(HBMAMemory(hidden_dim=clifford_dim))
-        elif memory_type in ('msa', 'prototype'):
-            from .prototype_memory import MSAMemory
+            self.memory = HBMAMemory(hidden_dim=clifford_dim)
+        elif memory_type == 'msa':
             msa_kwargs = msa_config or {}
             self.memory: MemoryInterface = MSAMemory(
                 hidden_dim=clifford_dim,
                 **msa_kwargs,
             )
-        else:
-            from .hbma_memory import CLSMemory
-            self.memory = HBMAMemoryAdapter(CLSMemory(hidden_dim=clifford_dim))
 
         self.invariant_processor = InvariantProcessor(self.memory)
 

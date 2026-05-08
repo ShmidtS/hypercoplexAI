@@ -61,7 +61,7 @@ import optuna
 # AutoConfig for parameter derivation
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.core.auto_config import AutoConfig, get_encoder_dim
+from src.training.auto_config import AutoConfig, get_encoder_dim
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 

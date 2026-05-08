@@ -77,9 +77,7 @@ all = [
 ]
 
 [project.scripts]
-hdim-train = "scripts.gpu_train:main"
-hdim-tune = "scripts.auto_tune:main"
-hdim-benchmark = "scripts.benchmark_comparison:main"
+hdim = "scripts.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/hdim/hdim"
@@ -89,7 +87,7 @@ Issues = "https://github.com/hdim/hdim/issues"
 
 [tool.setuptools]
 package-dir = {"" = "."}
-packages = ["src", "src.core", "src.models", "src.training"]
+packages = ["src", "src.core", "src.models", "src.training", "scripts"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]

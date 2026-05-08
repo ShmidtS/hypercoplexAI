@@ -23,12 +23,11 @@ from src.core.clifford_interaction import (
     CliffordFFN,
     has_triton_support,
 )
-from src.core.moe_kernel import (
+from src.core.moe import (
     MoEKernel,
     MoEKernelConfig,
-    MoEKernelState,
-    DomainExpert,
-    create_expert,
+    MLPExpert,
+    _create_mlp_expert,
 )
 from src.core.hdim_pipeline import HDIMPipeline
 
@@ -185,15 +184,15 @@ class TestCliffordInteractionLayerIntegration:
 
 
 # ============================================================
-# Test DomainExpert with CAN
+# Test MLPExpert with CAN
 # ============================================================
 
-class TestDomainExpertCAN:
-    """Tests for DomainExpert with use_can=True."""
+class TestMLPExpertCAN:
+    """Tests for MLPExpert with use_can=True."""
 
     def test_can_expert_creation(self):
-        """Test creating DomainExpert with CAN layer."""
-        expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
+        """Test creating MLPExpert with CAN layer."""
+        expert = MLPExpert(input_dim=16, hidden_dim=32, use_can=True)
         
         assert expert.use_can is True
         assert hasattr(expert, 'pre_hook')
@@ -201,7 +200,7 @@ class TestDomainExpertCAN:
 
     def test_can_expert_forward(self):
         """Test forward pass through CAN expert."""
-        expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
+        expert = MLPExpert(input_dim=16, hidden_dim=32, use_can=True)
         x = torch.randn(4, 8, 16)  # (B, T, D)
         
         output = expert(x)
@@ -211,7 +210,7 @@ class TestDomainExpertCAN:
 
     def test_can_expert_gradient_flow(self):
         """Test gradient flow through CAN expert."""
-        expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
+        expert = MLPExpert(input_dim=16, hidden_dim=32, use_can=True)
         x = torch.randn(2, 4, 16, requires_grad=True)
         
         output = expert(x)
@@ -223,7 +222,7 @@ class TestDomainExpertCAN:
 
     def test_ffn_expert_backward_compat(self):
         """Test that FFN expert still works (backward compatibility)."""
-        expert = DomainExpert(input_dim=64, hidden_dim=128, use_can=False)
+        expert = MLPExpert(input_dim=64, hidden_dim=128, use_can=False)
         x = torch.randn(4, 64)
         
         output = expert(x)
@@ -234,8 +233,8 @@ class TestDomainExpertCAN:
 
     def test_can_expert_parameter_count(self):
         """Test that CAN expert has fewer parameters than FFN."""
-        can_expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=True)
-        ffn_expert = DomainExpert(input_dim=16, hidden_dim=32, use_can=False)
+        can_expert = MLPExpert(input_dim=16, hidden_dim=32, use_can=True)
+        ffn_expert = MLPExpert(input_dim=16, hidden_dim=32, use_can=False)
         
         can_params = sum(p.numel() for p in can_expert.parameters())
         ffn_params = sum(p.numel() for p in ffn_expert.parameters())
@@ -268,7 +267,7 @@ class TestMoEKernelCAN:
         
         output, state = can_kernel(x)
         
-        assert isinstance(state, MoEKernelState)
+        assert isinstance(state, dict)
         assert output.shape == x.shape
         assert not torch.isnan(output).any()
 
@@ -288,7 +287,7 @@ class TestMoEKernelCAN:
         x = torch.randn(2, 16, requires_grad=True)
         
         output, state = kernel(x)
-        loss = output.sum() + state.total_loss()
+        loss = output.sum() + state["total_loss"]
         loss.backward()
         
         assert x.grad is not None
@@ -300,12 +299,12 @@ class TestMoEKernelCAN:
         
         output, state = can_kernel(x)
         
-        assert state.router_loss is not None
-        assert state.z_loss is not None
-        assert state.ortho_loss is not None
+        assert state["router_loss"] is not None
+        assert state["z_loss"] is not None
+        assert state["ortho_loss"] is not None
         # Losses should be non-negative
-        assert state.z_loss >= 0
-        assert state.ortho_loss >= 0
+        assert state["z_loss"] >= 0
+        assert state["ortho_loss"] >= 0
 
     def test_can_kernel_expert_usage(self, can_kernel):
         """Test that expert usage is tracked for CAN kernel."""
@@ -313,10 +312,10 @@ class TestMoEKernelCAN:
         
         output, state = can_kernel(x)
         
-        assert state.expert_usage is not None
-        assert state.expert_usage.shape[0] == can_kernel.config.num_experts
+        assert state["expert_usage"] is not None
+        assert state["expert_usage"].shape[0] == can_kernel.config.num_experts
         # Usage should sum to approximately batch size
-        assert state.expert_usage.sum() > 0
+        assert state["expert_usage"].sum() > 0
 
     def test_ffn_kernel_backward_compat(self, ffn_kernel):
         """Test that FFN kernel still works (backward compatibility)."""
@@ -452,8 +451,8 @@ class TestBackwardCompatibility:
         assert config.use_can_experts is False
 
     def test_default_expert_is_ffn(self):
-        """Test that default DomainExpert uses FFN."""
-        expert = DomainExpert(input_dim=64, hidden_dim=128)
+        """Test that default MLPExpert uses FFN."""
+        expert = MLPExpert(input_dim=64, hidden_dim=128)
         
         assert expert.use_can is False
         assert hasattr(expert, 'net')
@@ -469,16 +468,16 @@ class TestBackwardCompatibility:
         assert not torch.isnan(output).any()
         assert not torch.isinf(output).any()
 
-    def test_create_expert_backward_compat(self):
-        """Test create_expert function backward compatibility."""
+    def test_create_mlp_expert(self):
+        """Test _create_mlp_expert function."""
         # Without use_can parameter (default behavior)
-        expert = create_expert("math", input_dim=64, hidden_dim=128, dropout=0.1)
-        
+        expert = _create_mlp_expert("math", input_dim=64, hidden_dim=128, dropout=0.1)
+
         assert expert.use_can is False
-        
+
         # With use_can=False explicitly
-        expert_ffn = create_expert("math", input_dim=64, hidden_dim=128, dropout=0.1, use_can=False)
-        
+        expert_ffn = _create_mlp_expert("math", input_dim=64, hidden_dim=128, dropout=0.1, use_can=False)
+
         assert expert_ffn.use_can is False
 
     def test_clifford_ffn_backward_compat(self):
