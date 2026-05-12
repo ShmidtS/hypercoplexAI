@@ -57,7 +57,9 @@ class InvariantIndex:
 
         query = F.normalize(query.to(self.device), dim=-1)
         scores = F.cosine_similarity(query[:, None, :], self._vectors[None, :, :], dim=-1)
-        k = min(top_k, len(self._keys))
+        k = min(top_k, len(self._keys), scores.size(-1))
+        if k <= 0:
+            return [[] for _ in range(batch_size)]
         top_scores, top_indices = torch.topk(scores, k=k, dim=-1)
 
         results: List[List[AnalogyMatch]] = []
