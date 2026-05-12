@@ -182,7 +182,7 @@ Core package exports only these 7 symbols: `CliffordAlgebra`, `DomainRotationOpe
 
 ### 3.2 CliffordAlgebra
 
-**Файл:** `[src/core/hypercomplex.py:20](../src/core/hypercomplex.py:20)`
+**Файл:** `[src/core/algebra.py:20](../src/core/algebra.py:20)`
 
 **Назначение:** Вырожденная алгебра Клиффорда Cl_{p,q,r}(R). По умолчанию Cl_{3,1,0} с размерностью мультивектора 16.
 
@@ -191,10 +191,10 @@ Core package exports only these 7 symbols: `CliffordAlgebra`, `DomainRotationOpe
 
 | Метод                                                        | Строка | Формула   | Описание                                                     |
 | ------------------------------------------------------------ | ------ | --------- | ------------------------------------------------------------ |
-| `[geometric_product(a, b)](../src/core/hypercomplex.py:105)` | L105   | `a ⊗ b`   | Геометрическое произведение через scattering по Cayley table |
-| `[sandwich(R, x)](../src/core/hypercomplex.py:171)`          | L171   | `R x R⁻¹` | Сэндвич-произведение — основа доменных вращений              |
-| `[reverse(x)](../src/core/hypercomplex.py:149)`              | L149   | `x̃`      | Реверсия мультивектора (инволюция)                           |
-| `[norm(x)](../src/core/hypercomplex.py:161)`                 | L161   | `√⟨xx̃⟩₀` | Норма через скалярную часть                                  |
+| `[geometric_product(a, b)](../src/core/algebra.py:105)` | L105   | `a ⊗ b`   | Геометрическое произведение через scattering по Cayley table |
+| `[sandwich(R, x)](../src/core/algebra.py:171)`          | L171   | `R x R⁻¹` | Сэндвич-произведение — основа доменных вращений              |
+| `[reverse(x)](../src/core/algebra.py:149)`              | L149   | `x̃`      | Реверсия мультивектора (инволюция)                           |
+| `[norm(x)](../src/core/algebra.py:161)`                 | L161   | `√⟨xx̃⟩₀` | Норма через скалярную часть                                  |
 
 
 **Особенности реализации:**
@@ -205,7 +205,7 @@ Core package exports only these 7 symbols: `CliffordAlgebra`, `DomainRotationOpe
 
 ### 3.3 DomainRotationOperator
 
-**Файл:** `[src/core/domain_operators.py:19](../src/core/domain_operators.py:19)`
+**Файл:** `[src/core/rotors.py:19](../src/core/rotors.py:19)`
 
 **Назначение:** Обучаемый ротор домена с именем и нормализацией.
 
@@ -214,15 +214,15 @@ Core package exports only these 7 symbols: `CliffordAlgebra`, `DomainRotationOpe
 
 | Метод                                                    | Строка | Формула             | Описание                               |
 | -------------------------------------------------------- | ------ | ------------------- | -------------------------------------- |
-| `[_normalized_R()](../src/core/domain_operators.py:35)`  | L35    | `R / ‖R‖`           | Нормализация для стабильности сэндвича |
-| `[get_inverse()](../src/core/domain_operators.py:40)`    | L40    | `reverse(R) / ‖R‖²` | Вычисление обратного ротора            |
-| `[forward(x)](../src/core/domain_operators.py:47)`       | L47    | `R x R⁻¹`           | Сэндвич-преобразование                 |
-| `[apply_inverse(x)](../src/core/domain_operators.py:50)` | L50    | `R⁻¹ x R`           | Обратное преобразование                |
+| `[_normalized_R()](../src/core/rotors.py:35)`  | L35    | `R / ‖R‖`           | Нормализация для стабильности сэндвича |
+| `[get_inverse()](../src/core/rotors.py:40)`    | L40    | `reverse(R) / ‖R‖²` | Вычисление обратного ротора            |
+| `[forward(x)](../src/core/rotors.py:47)`       | L47    | `R x R⁻¹`           | Сэндвич-преобразование                 |
+| `[apply_inverse(x)](../src/core/rotors.py:50)` | L50    | `R⁻¹ x R`           | Обратное преобразование                |
 
 
 ### 3.4 InvariantExtractor
 
-**Файл:** `[src/core/domain_operators.py:54](../src/core/domain_operators.py:54)`
+**Файл:** `[src/core/invariants.py](../src/core/invariants.py)`
 
 **Назначение:** Извлечение структурного инварианта через сэндвич-произведение.
 
@@ -236,7 +236,7 @@ U_inv = R_source⁻¹ ⊗_Cl G_source ⊗_Cl R_source
 
 ### 3.5 TitansMemoryModule
 
-**Файл:** `[src/core/titans_memory.py:30](../src/core/titans_memory.py:30)`
+**Файл:** `[src/extensions/memory/titans.py:30](../src/extensions/memory/titans.py:30)`
 
 **Назначение:** Test-Time Training ассоциативная память.
 
@@ -255,10 +255,10 @@ U_inv = R_source⁻¹ ⊗_Cl G_source ⊗_Cl R_source
 
 | Метод                                                           | Строка | Описание                          |
 | --------------------------------------------------------------- | ------ | --------------------------------- |
-| `[retrieve(k, v)](../src/core/titans_memory.py:60)`             | L60    | Только извлечение, без обновления |
-| `[update(k, v)](../src/core/titans_memory.py:74)`               | L74    | TTT-обновление в fp32             |
-| `[retrieve_and_update(k, v)](../src/core/titans_memory.py:115)` | L115   | Атомарный retrieve + update       |
-| `[reset_memory(strategy)](../src/core/titans_memory.py:150)`    | L150   | Умный сброс памяти                |
+| `[retrieve(k, v)](../src/extensions/memory/titans.py:60)`             | L60    | Только извлечение, без обновления |
+| `[update(k, v)](../src/extensions/memory/titans.py:74)`               | L74    | TTT-обновление в fp32             |
+| `[retrieve_and_update(k, v)](../src/extensions/memory/titans.py:115)` | L115   | Атомарный retrieve + update       |
+| `[reset_memory(strategy)](../src/extensions/memory/titans.py:150)`    | L150   | Умный сброс памяти                |
 
 
 **Алгоритм TTT:**
@@ -330,7 +330,7 @@ if self.use_shared_expert:
 
 ### 3.7 MoEKernel
 
-**Файл:** `[src/core/moe_kernel.py](../src/core/moe_kernel.py)`
+**Файл:** `[src/extensions/moe/kernel.py](../src/extensions/moe/kernel.py)`
 
 **Назначение:** 4 именованных доменных эксперта (math/language/code/science) с 560K параметров. Заменяет удалённый `DomainExpertPool`.
 
@@ -1113,14 +1113,14 @@ config = HDIMConfig(
 
 | Компонент                   | Файл                                                                 | Статус     |
 | --------------------------- | -------------------------------------------------------------------- | ---------- |
-| `CliffordAlgebra`           | `[hypercomplex.py:20](../src/core/hypercomplex.py:20)`               | **Stable** |
-| `DomainRotationOperator`    | `[domain_operators.py:19](../src/core/domain_operators.py:19)`       | **Stable** |
-| `InvariantExtractor`        | `[domain_operators.py:54](../src/core/domain_operators.py:54)`       | **Stable** |
-| `TitansMemoryModule`        | `[titans_memory.py:30](../src/core/titans_memory.py:30)`             | **Stable** |
+| `CliffordAlgebra`           | `[algebra.py:20](../src/core/algebra.py:20)`               | **Stable** |
+| `DomainRotationOperator`    | `[rotors.py:19](../src/core/rotors.py:19)`       | **Stable** |
+| `InvariantExtractor`        | `[invariants.py](../src/core/invariants.py)`       | **Stable** |
+| `TitansMemoryModule`        | `[titans.py:30](../src/extensions/memory/titans.py:30)`             | **Stable** |
 | `SoftMoERouter`             | `[soft_moe_router.py:43](../src/core/soft_moe_router.py:43)`         | **Stable** |
-| `MoEKernel`                 | `[moe_kernel.py](../src/core/moe_kernel.py)`                         | **Stable** |
-| `MoEKernelConfig`           | `[moe_kernel.py](../src/core/moe_kernel.py)`                         | **Stable** |
-| `MoEKernelState`            | `[moe_kernel.py](../src/core/moe_kernel.py)`                         | **Stable** |
+| `MoEKernel`                 | `[kernel.py](../src/extensions/moe/kernel.py)`                         | **Stable** |
+| `MoEKernelConfig`           | `[kernel.py](../src/extensions/moe/kernel.py)`                         | **Stable** |
+| `MoEKernelState`            | `[kernel.py](../src/extensions/moe/kernel.py)`                         | **Stable** |
 | `MoERouter` ABC             | `[moe_interface.py](../src/core/moe_interface.py)`                   | **Stable** |
 | `MoEKernelAdapter`          | `[moe_kernel_adapter.py](../src/core/moe_kernel_adapter.py)`         | **Stable** |
 | `MaxScoreRouter`            | `[maxscore_router.py](../src/core/maxscore_router.py)`               | **Stable** |
@@ -1290,11 +1290,11 @@ config = HDIMConfig(
 
 ### Файлы
 
-- `[src/core/hypercomplex.py](../src/core/hypercomplex.py)` — Алгебраическая база
-- `[src/core/domain_operators.py](../src/core/domain_operators.py)` — Доменные операторы
-- `[src/core/titans_memory.py](../src/core/titans_memory.py)` — Titans memory
+- `[src/core/algebra.py](../src/core/algebra.py)` — Алгебраическая база
+- `[src/core/rotors.py](../src/core/rotors.py)` — Доменные операторы
+- `[src/extensions/memory/titans.py](../src/extensions/memory/titans.py)` — Titans memory
 - `[src/core/soft_moe_router.py](../src/core/soft_moe_router.py)` — Soft MoE router
-- `[src/core/moe_kernel.py](../src/core/moe_kernel.py)` — MoEKernel (named domain experts)
+- `[src/extensions/moe/kernel.py](../src/extensions/moe/kernel.py)` — MoEKernel (named domain experts)
 - `[src/core/moe_interface.py](../src/core/moe_interface.py)` — MoERouter ABC
 - `[src/core/moe_kernel_adapter.py](../src/core/moe_kernel_adapter.py)` — MoEKernel → MoERouter
 - `[src/core/maxscore_router.py](../src/core/maxscore_router.py)` — MaxScore Router (ACL 2025)

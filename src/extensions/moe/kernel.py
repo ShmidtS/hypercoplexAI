@@ -27,253 +27,25 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import MoEKernelConfig
+from .experts import EXPERT_CONFIGS, MLPExpert, _create_mlp_expert
 from .interface import MoERouter
+from .state import MoEKernelState
 from .utils import (
     load_balance_loss,
     z_loss as compute_z_loss,
     aux_loss_free_update,
     expert_orthogonalization_loss,
+    expert_orthogonalization_loss as compute_expert_orthogonalization_loss,
 )
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# Конфигурация
-# ============================================================
-
-EXPERT_CONFIGS: Dict[str, Dict] = {
-    "math": {"activation": "gelu", "architecture": "bottleneck"},
-    "language": {"activation": "gelu", "pre_norm": True},
-    "code": {"activation": "silu"},
-    "science": {"activation": "tanh"},
-}
-
-
-@dataclass
-class MoEKernelConfig:
-    """Конфигурация MoE-ядра.
-
-    num_experts вычисляется автоматически из expert_names если не указан явно.
-    """
-
-    input_dim: int = 128
-    expert_hidden_dim: int = 256
-    num_experts: Optional[int] = None  # None -> вычисляется из expert_names
-    slots_per_expert: int = 1
-    temperature: float = 1.0
-    z_loss_weight: float = 0.01
-    ortho_loss_weight: float = 0.01
-    use_shared_expert: bool = True
-    use_aux_loss_free: bool = True
-    use_expert_ortho: bool = True
-    aux_lr: float = 0.001
-    dropout: float = 0.1
-    expert_names: Optional[List[str]] = None
-    use_can_experts: bool = False
-    # Deprecated: auto-dispatch is always enabled; kept for backward compatibility with tests
-    use_batched_experts: bool = True
-    batched_fallback: bool = True
-    expert_homogeneity_check: bool = True
-    use_bias_balancing: bool = True  # Alias for use_aux_loss_free (DeepSeek-V3 style)
-    bias_update_frequency: int = 100  # Steps between bias updates (0 = update every forward)
-    dispatch_budget_threshold: float = 0.0  # 0 = disabled
-
-    def __post_init__(self):
-        if self.temperature < 0.1:
-            raise ValueError(
-                f"MoEKernelConfig.temperature={self.temperature} < 0.1: "
-                "z_loss regulation is suppressed by clamp at such small values. "
-                "Use temperature >= 0.1."
-            )
-        if self.expert_names is not None:
-            computed_num = len(self.expert_names)
-            if self.num_experts is not None and self.num_experts != computed_num:
-                raise ValueError(
-                    f"num_experts={self.num_experts} conflicts with "
-                    f"len(expert_names)={computed_num}"
-                )
-            self.num_experts = computed_num
-        else:
-            if self.num_experts is None:
-                self.num_experts = 4
-            self.expert_names = [f"expert_{i}" for i in range(self.num_experts)]
-
-
-@dataclass
-class MoEKernelState:
-    """Состояние одного forward-прохода MoE-ядра."""
-
-    output: torch.Tensor
-    router_loss: torch.Tensor
-    z_loss: torch.Tensor
-    ortho_loss: torch.Tensor
-    expert_weights: torch.Tensor
-    expert_usage: torch.Tensor
-    routing_entropy: torch.Tensor
-    dispatch_weights: torch.Tensor
-    combine_weights: torch.Tensor
-    expert_names: List[str]
-    top_expert_idx: torch.Tensor
-    expert_reliability: torch.Tensor
-    slot_outputs: Optional[torch.Tensor] = None
-
-    def total_loss(self) -> torch.Tensor:
-        return self.router_loss + self.z_loss + self.ortho_loss
-
-    def dominant_expert_names(self) -> List[str]:
-        idx = self.top_expert_idx[..., 0] if self.top_expert_idx.dim() >= 2 else self.top_expert_idx
-        return [self.expert_names[int(i)] for i in idx.flatten().tolist()]
-
-    def to_dict(self, orig_shape: torch.Size, num_experts: int, slots_per_expert: int, top_k: int) -> Dict[str, Any]:
-        """Convert to MoERouter-compatible dict."""
-        expert_weights = self.expert_weights.reshape(*orig_shape[:-1], num_experts)
-        topk_weights, topk_indices = self.expert_weights.topk(top_k, dim=-1)
-        topk_weights_norm = topk_weights / topk_weights.sum(-1, keepdim=True).clamp_min(1e-8)
-
-        return {
-            "expert_load": self.expert_usage,
-            "aux_loss": self.router_loss,
-            "router_loss": self.router_loss,
-            "z_loss": self.z_loss,
-            "ortho_loss": self.ortho_loss,
-            "expert_usage": self.expert_usage,
-            "routing_entropy": self.routing_entropy,
-            "expert_weights": expert_weights,
-            "dispatch_weights": self.dispatch_weights.reshape(*orig_shape[:-1], num_experts * slots_per_expert),
-            "combine_weights": self.combine_weights.reshape(*orig_shape[:-1], num_experts * slots_per_expert),
-            "expert_names": self.expert_names,
-            "top_expert_idx": self.top_expert_idx.reshape(*orig_shape[:-1], top_k),
-            "total_loss": self.total_loss(),
-            "dominant_expert_names": self.dominant_expert_names(),
-            "slot_outputs": self.slot_outputs,
-            "gate_weights": expert_weights,
-            "topk_idx": topk_indices.reshape(*orig_shape[:-1], top_k),
-            "topk_gate_weights": topk_weights_norm.reshape(*orig_shape[:-1], top_k),
-            "train_scores_snapshot": self.expert_reliability.detach().clone(),
-        }
-
-
-# ============================================================
-# Доменные эксперты
-# ============================================================
-
-class MLPExpert(nn.Module):
-    """
-    Parameterized FFN-expert with configurable activation, architecture,
-    and optional pre-hook transform.
-
-    Supports variants via config dict:
-      - activation: "gelu"|"silu"|"tanh"|"relu" (default: "gelu")
-      - architecture: "standard"|"bottleneck" (default: "standard")
-      - pre_norm: bool (default: False) — LayerNorm before FFN
-
-    pre_hook: optional nn.Module applied before FFN (e.g., CliffordInteractionLayer).
-    When use_can=True, a CliffordInteractionLayer is created as pre_hook.
-    """
-
-    ACTIVATION_MAP = {
-        "gelu": nn.GELU,
-        "silu": nn.SiLU,
-        "tanh": nn.Tanh,
-        "relu": nn.ReLU,
-    }
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        dropout: float = 0.1,
-        name: str = "expert",
-        use_can: bool = False,
-        config: Optional[Dict] = None,
-        pre_hook: Optional[nn.Module] = None,
-    ):
-        super().__init__()
-        self.name = name
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self._config = config or {}
-        self.architecture = self._config.get("architecture", "standard")
-        self._pre_norm = self._config.get("pre_norm", False)
-
-        if pre_hook is not None:
-            self.pre_hook = pre_hook
-        elif use_can:
-            from src.extensions.moe.clifford_interaction import CliffordInteractionLayer
-            self.pre_hook = CliffordInteractionLayer(dim=input_dim, dropout=dropout)
-        else:
-            self.pre_hook = None
-
-        _can_replaces_ffn = use_can and pre_hook is None
-
-        if not _can_replaces_ffn:
-            if self._pre_norm:
-                self.pre_norm = nn.LayerNorm(input_dim)
-
-            act_name = self._config.get("activation", "gelu")
-            act_cls = self.ACTIVATION_MAP.get(act_name, nn.GELU)
-
-            if self.architecture == "bottleneck":
-                self.net = nn.Sequential(
-                    nn.Linear(input_dim, hidden_dim * 2),
-                    act_cls(),
-                    nn.Dropout(dropout),
-                    nn.Linear(hidden_dim * 2, hidden_dim),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim, input_dim),
-                )
-            else:
-                self.net = nn.Sequential(
-                    nn.Linear(input_dim, hidden_dim),
-                    act_cls(),
-                    nn.Dropout(dropout),
-                    nn.Linear(hidden_dim, input_dim),
-                )
-
-            self._init_weights()
-
-    @property
-    def use_can(self) -> bool:
-        """True if a pre_hook (CliffordInteractionLayer) is configured."""
-        return self.pre_hook is not None
-
-    def _init_weights(self):
-        for module in self.net.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
-                if module.bias is not None:
-                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(module.weight)
-                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-                    nn.init.uniform_(module.bias, -bound, bound)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.pre_hook is not None and not hasattr(self, 'net'):
-            return self.pre_hook(x)
-        if self.pre_hook is not None:
-            x = self.pre_hook(x)
-        if self._pre_norm:
-            x = self.pre_norm(x)
-        return self.net(x)
-
-
-def _create_mlp_expert(
-    name: str,
-    input_dim: int,
-    hidden_dim: int,
-    dropout: float,
-    use_can: bool = False,
-) -> MLPExpert:
-    """Create an MLPExpert by name, using EXPERT_CONFIGS for built-in domain configs."""
-    config = EXPERT_CONFIGS.get(name, {})
-    return MLPExpert(input_dim, hidden_dim, dropout, name=name, use_can=use_can, config=config)
 
 
 # ============================================================

@@ -1299,15 +1299,15 @@ flowchart TD
 ## Ключевые ссылки
 
 ### Core Layer
-- [`src/core/hypercomplex.py`](../src/core/hypercomplex.py) -- `CliffordAlgebra`
-- [`src/core/domain_operators.py`](../src/core/domain_operators.py) -- `DomainRotationOperator`
-- [`src/core/domain_operators.py`](../src/core/domain_operators.py) -- `InvariantExtractor`
-- [`src/core/titans_memory.py`](../src/core/titans_memory.py) -- `TitansMemoryModule`
+- [`src/core/algebra.py`](../src/core/algebra.py) -- `CliffordAlgebra`
+- [`src/core/rotors.py`](../src/core/rotors.py) -- `DomainRotationOperator`
+- [`src/core/invariants.py`](../src/core/invariants.py) -- `InvariantExtractor`
+- [`src/extensions/memory/titans.py`](../src/extensions/memory/titans.py) -- `TitansMemoryModule`
 - [`src/core/hbma_memory.py`](../src/core/hbma_memory.py) -- `HBMAMemory`, `WorkingMemory`, `EpisodicMemory`, `SemanticMemory`, `ProceduralMemory`
 - [`src/core/memory_interface.py`](../src/core/memory_interface.py) -- `MemoryInterface`, `TitansAdapter`, `HBMAMemoryAdapter`
 - [`src/core/memory_persistence.py`](../src/core/memory_persistence.py) -- `MemoryPersistence`
 - [`src/core/soft_moe_router.py`](../src/core/soft_moe_router.py) -- `SoftMoERouter`
-- [`src/core/moe_kernel.py`](../src/core/moe_kernel.py) -- `MoEKernel`, `MoEKernelConfig`, `MoEKernelState`
+- [`src/extensions/moe/kernel.py`](../src/extensions/moe/kernel.py) -- `MoEKernel`, `MoEKernelConfig`, `MoEKernelState`
 - [`src/core/moe_kernel_adapter.py`](../src/core/moe_kernel_adapter.py) -- `MoEKernelAdapter`
 - [`src/core/maxscore_router.py`](../src/core/maxscore_router.py) -- `MaxScoreRouter`, `RouterResult`, `RouterCheckpoint`
 - [`src/extensions/hallucination/detector.py`](../src/extensions/hallucination/detector.py) -- `HallucinationDetector`

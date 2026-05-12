@@ -254,9 +254,9 @@ Mathematical properties are numerically verified in `formalization/verify_numeri
 
 | Component                  | Description                                                  | File                                |
 | -------------------------- | ------------------------------------------------------------ | ----------------------------------- |
-| **CliffordAlgebra**        | Cl(3,1,0) implementation with Cayley-table geometric product | `src/core/hypercomplex.py`          |
-| **DomainRotationOperator** | Learnable rotor for domain transformations                   | `src/core/domain_operators.py`      |
-| **InvariantExtractor**     | Sandwich product: R⁻¹⊗G⊗R                                    | `src/core/domain_operators.py`      |
+| **CliffordAlgebra**        | Cl(3,1,0) implementation with Cayley-table geometric product | `src/core/algebra.py`          |
+| **DomainRotationOperator** | Learnable rotor for domain transformations                   | `src/core/rotors.py`      |
+| **InvariantExtractor**     | Sandwich product: R⁻¹⊗G⊗R                                    | `src/core/invariants.py`  |
 | **InvariantIndex**         | Invariant search index                                      | `src/core/invariant_index.py`     |
 | **CoreEngineConfig**       | Core engine configuration                                   | `src/core/engine.py`              |
 | **HDIMCoreEngine**         | Minimal encode/extract/match/transfer engine                | `src/core/engine.py`              |
@@ -740,12 +740,12 @@ training_config = {
 
 | Component            | File                                  |
 | -------------------- | ------------------------------------- |
-| Geometric Product    | `src/core/hypercomplex.py`            |
-| Sandwich Product     | `src/core/domain_operators.py`        |
+| Geometric Product    | `src/core/algebra.py`            |
+| Sandwich Product     | `src/core/algebra.py`       |
 | SoftMoE Router       | `src/core/soft_moe_router.py`         |
-| MoEKernel            | `src/core/moe_kernel.py`              |
-| Shared Expert        | `src/core/moe_kernel.py` (use_shared_expert) |
-| Titans Memory        | `src/core/titans_memory.py`           |
+| MoEKernel            | `src/extensions/moe/kernel.py`              |
+| Shared Expert        | `src/extensions/moe/kernel.py` (use_shared_expert) |
+| Titans Memory        | `src/extensions/memory/titans.py`           |
 | HBMA Adapter         | `src/core/hbma_memory.py`             |
 | Hallucination Detect | `src/extensions/hallucination/detector.py` |
 | Online Learning      | `src/core/online_learner.py`          |
