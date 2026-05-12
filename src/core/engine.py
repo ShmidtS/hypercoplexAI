@@ -1,12 +1,12 @@
 from dataclasses import dataclass
-from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
 
 from .algebra import CliffordAlgebra
 from .invariant_index import InvariantIndex
-from .invariants import InvariantExtractor, sandwich_transfer
+from .invariants import InvariantExtractor
+from .invariants import sandwich_transfer
 from .rotors import DomainRotationOperator
 from .types import AnalogyMatch
 
@@ -37,7 +37,7 @@ class HDIMCoreEngine(nn.Module):
         self.index = InvariantIndex()
         self._text_adapter = None
 
-    def encode(self, problem: Union[torch.Tensor, str]) -> torch.Tensor:
+    def encode(self, problem: torch.Tensor | str) -> torch.Tensor:
         """problem -> G (multivector in Clifford algebra)"""
         if isinstance(problem, str):
             if self._text_adapter is None:
@@ -51,17 +51,17 @@ class HDIMCoreEngine(nn.Module):
 
         return self.dropout(self.encoder(problem))
 
-    def extract(self, G: torch.Tensor, domain_rotor: Union[DomainRotationOperator, str]) -> torch.Tensor:
+    def extract(self, G: torch.Tensor, domain_rotor: DomainRotationOperator | str) -> torch.Tensor:
         """G, domain -> U_inv (structural invariant via sandwich product)"""
         rotor = self._resolve_rotor(domain_rotor)
         return self.extractor.forward(G, rotor)
 
-    def match(self, U_inv: torch.Tensor, expert_base: Optional[InvariantIndex] = None) -> List[List[AnalogyMatch]]:
+    def match(self, U_inv: torch.Tensor, expert_base: InvariantIndex | None = None) -> list[list[AnalogyMatch]]:
         """U_inv -> ranked analogies"""
         index = expert_base if expert_base is not None else self.index
         return index.search(U_inv)
 
-    def transfer(self, U_inv: torch.Tensor, target_rotor: Union[DomainRotationOperator, str]) -> torch.Tensor:
+    def transfer(self, U_inv: torch.Tensor, target_rotor: DomainRotationOperator | str) -> torch.Tensor:
         """U_inv, target -> G_target"""
         rotor = self._resolve_rotor(target_rotor)
         _, target = sandwich_transfer(
@@ -73,7 +73,7 @@ class HDIMCoreEngine(nn.Module):
         )
         return target
 
-    def _resolve_rotor(self, rotor: Union[DomainRotationOperator, str]) -> DomainRotationOperator:
+    def _resolve_rotor(self, rotor: DomainRotationOperator | str) -> DomainRotationOperator:
         if isinstance(rotor, str):
             return self.domain_rotors[rotor]
         return rotor

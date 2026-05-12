@@ -8,11 +8,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch, math
 import torch.nn as nn
 import torch.nn.functional as F
-from src.core.hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
-from src.core.domain_operators import DomainRotationOperator, sandwich_transfer, InvariantExtractor
+from src.core.algebra import CliffordAlgebra
+from src.core.rotors import DomainRotationOperator
+from src.core.invariants import InvariantExtractor, sandwich_transfer
 from src.extensions.memory import TitansMemory, HBMAMemory, WorkingMemory, SemanticMemory, MemoryResult
 from src.extensions.moe import SoftMoERouter
-from src.core.hdim_pipeline import HDIMPipeline
 
 
 def _memory_output(result):

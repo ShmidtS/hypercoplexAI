@@ -1,7 +1,13 @@
 from __future__ import annotations
+
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING
+from typing import Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
 
 def append_ledger_row(path: str | Path, row: dict[str, Any]) -> None:
     ledger_path = Path(path)
@@ -16,6 +22,7 @@ def write_json(path: str | Path, payload: dict[str, Any] | list[Any]) -> Path:
     target_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return target_path
 
+
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     ledger_path = Path(path)
     if not ledger_path.exists():
@@ -27,6 +34,7 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
             continue
         rows.append(json.loads(line))
     return rows
+
 
 def latest_ledger_row(rows: Iterable[dict[str, Any]], *, run_id: str) -> dict[str, Any] | None:
     latest_row: dict[str, Any] | None = None

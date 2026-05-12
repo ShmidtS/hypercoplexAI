@@ -391,38 +391,21 @@ class TestHallucinationFeedbackConfig:
 
 
 class TestHDIMIntegration:
-    """Test integration with HDIMModel."""
+    """Test integration with HDIMModel — simplified core has no hallucination feedback hook."""
 
-    def test_feedback_disabled_by_default(self):
+    def test_feedback_not_attached_in_core_model(self):
         from src.models.hdim_model import HDIMConfig, HDIMModel
 
         config = HDIMConfig(hidden_dim=64, num_domains=2)
         model = HDIMModel(config)
 
-        assert model.hallucination_feedback_loop is None
+        # Simplified HDIMModel does not expose hallucination_feedback_loop
+        assert not hasattr(model, "hallucination_feedback_loop")
 
-    def test_feedback_config_flag_does_not_attach_extension_in_core_wrapper(self):
+    def test_forward_runs_without_feedback_extensions(self):
         from src.models.hdim_model import HDIMConfig, HDIMModel
 
-        config = HDIMConfig(
-            hidden_dim=64,
-            num_domains=2,
-            hallucination_feedback=True,
-        )
-        model = HDIMModel(config)
-
-        assert model.extension_flags["hallucination_feedback"] is True
-        assert model.hallucination_feedback_loop is None
-
-    def test_feedback_action_in_aux_state(self):
-        from src.models.hdim_model import HDIMConfig, HDIMModel
-
-        config = HDIMConfig(
-            hidden_dim=64,
-            num_domains=2,
-            hallucination_detection=True,
-            hallucination_feedback=True,
-        )
+        config = HDIMConfig(hidden_dim=64, num_domains=2)
         model = HDIMModel(config)
         model.eval()
 
@@ -430,20 +413,16 @@ class TestHDIMIntegration:
         domain_id = torch.tensor([0, 1])
 
         with torch.no_grad():
-            aux = model.forward(x, domain_id, return_state=True).aux_state
+            result = model.forward(x, domain_id, return_state=True)
 
-        assert hasattr(aux, 'feedback_action')
-        # feedback_action may be None if risk is low
+        # Forward completes and produces aux_state without hallucination hooks
+        assert result.aux_state is not None
+        assert hasattr(result.aux_state, "raw_invariant")
 
-    def test_feedback_flow_through_forward(self):
+    def test_feedback_loop_can_be_used_standalone(self):
         from src.models.hdim_model import HDIMConfig, HDIMModel
 
-        config = HDIMConfig(
-            hidden_dim=64,
-            num_domains=2,
-            hallucination_detection=True,
-            hallucination_feedback=True,
-        )
+        config = HDIMConfig(hidden_dim=64, num_domains=2)
         model = HDIMModel(config)
         model.eval()
 
@@ -451,11 +430,15 @@ class TestHDIMIntegration:
         domain_id = torch.tensor([0, 1])
 
         with torch.no_grad():
-            aux = model.forward(x, domain_id, return_state=True).aux_state
+            result = model.forward(x, domain_id, return_state=True)
 
-        # Should have hallucination_risk computed
-        assert hasattr(aux, 'hallucination_risk')
-        assert aux.hallucination_risk >= 0.0
-
-        # Should have feedback_action (may be None or a string)
-        assert aux.feedback_action is None or isinstance(aux.feedback_action, str)
+        # Standalone HallucinationFeedbackLoop can be applied to aux_state externally
+        loop = HallucinationFeedbackLoop(
+            expert_names=["domain_0", "domain_1"],
+            enabled=False,
+        )
+        feedback = loop.check_and_respond(
+            risk_score=0.1,
+            routing_info={"current_expert": "domain_0"},
+        )
+        assert feedback.action == FeedbackAction.NONE

@@ -1,10 +1,13 @@
-"""Core HDIM model configuration and compatibility shims."""
+"""Core HDIM model configuration."""
 
 from __future__ import annotations
 
 import warnings
-from dataclasses import MISSING, dataclass, field
-from typing import Any, List, Literal, Optional
+from dataclasses import MISSING
+from dataclasses import dataclass
+from dataclasses import field
+from typing import Any
+from typing import Literal
 
 from src.extensions.memory.config import MemoryConfig as _MemoryConfig
 from src.extensions.memory.config import MSAConfig as _MSAConfig
@@ -45,61 +48,17 @@ _RUNTIME_FIELDS = set(_RuntimeConfig.__dataclass_fields__)
 _LOSS_FIELDS = set(LossConfig.__dataclass_fields__)
 
 
-class MoEConfig(_MoEConfig):
-    """Deprecated import shim for src.extensions.moe.config.MoEConfig."""
-
-    def __post_init__(self) -> None:
-        warnings.warn(
-            "MoEConfig from src.models.config is deprecated; import from src.extensions.moe.config",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-
-class MSAConfig(_MSAConfig):
-    """Deprecated import shim for src.extensions.memory.config.MSAConfig."""
-
-    def __post_init__(self) -> None:
-        warnings.warn(
-            "MSAConfig from src.models.config is deprecated; import from src.extensions.memory.config",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-
-class MemoryConfig(_MemoryConfig):
-    """Deprecated import shim for src.extensions.memory.config.MemoryConfig."""
-
-    def __post_init__(self) -> None:
-        warnings.warn(
-            "MemoryConfig from src.models.config is deprecated; import from src.extensions.memory.config",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-
-class RuntimeConfig(_RuntimeConfig):
-    """Deprecated import shim for src.extensions.runtime_config.RuntimeConfig."""
-
-    def __post_init__(self) -> None:
-        warnings.warn(
-            "RuntimeConfig from src.models.config is deprecated; import from src.extensions.runtime_config",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-
 @dataclass(frozen=True)
 class HDIMTextConfig:
     """Configuration for the minimal HDIM text encoder path."""
 
     vocab_size: int = 257
     max_length: int = 128
-    embedding_dim: Optional[int] = None
-    hidden_dim: Optional[int] = None
-    dropout: Optional[float] = None
-    vocab_path: Optional[str] = None
-    tokenizer_name: Optional[str] = None
+    embedding_dim: int | None = None
+    hidden_dim: int | None = None
+    dropout: float | None = None
+    vocab_path: str | None = None
+    tokenizer_name: str | None = None
 
 
 @dataclass
@@ -118,10 +77,7 @@ def _normalize_memory_type(value: str) -> str:
 
 
 def _dataclass_values(config: object) -> dict[str, Any]:
-    return {
-        key: getattr(config, key)
-        for key in getattr(config, "__dataclass_fields__", {})
-    }
+    return {key: getattr(config, key) for key in getattr(config, "__dataclass_fields__", {})}
 
 
 @dataclass(init=False)
@@ -130,12 +86,12 @@ class HDIMConfig:
 
     hidden_dim: int = 64
     num_domains: int = 4
-    domain_names: Optional[tuple] = None
+    domain_names: tuple | None = None
     clifford_p: int = 3
     clifford_q: int = 1
     clifford_r: int = 0
     dropout: float = 0.1
-    text_encoder: Optional[str] = None
+    text_encoder: str | None = None
     extensions: dict = field(default_factory=dict)
 
     def __init__(self, **kwargs: Any) -> None:
@@ -253,9 +209,7 @@ class HDIMConfig:
         if not 0 <= self.dropout < 1:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
         if self.domain_names is not None and len(self.domain_names) != self.num_domains:
-            raise ValueError(
-                f"len(domain_names)={len(self.domain_names)} must equal num_domains={self.num_domains}"
-            )
+            raise ValueError(f"len(domain_names)={len(self.domain_names)} must equal num_domains={self.num_domains}")
         if self.expert_names is not None and len(set(self.expert_names)) != len(self.expert_names):
             raise ValueError("expert_names must be unique")
 
@@ -263,9 +217,7 @@ class HDIMConfig:
             moe_ext = self._ensure_extension_dict(self.extensions, "moe")
             computed = len(self.expert_names)
             if moe_ext.get("num_experts") is not None and moe_ext["num_experts"] != computed:
-                raise ValueError(
-                    f"num_experts={moe_ext['num_experts']} conflicts with len(expert_names)={computed}"
-                )
+                raise ValueError(f"num_experts={moe_ext['num_experts']} conflicts with len(expert_names)={computed}")
             moe_ext["num_experts"] = computed
 
         memory_ext = self.extensions.get("memory")
@@ -275,9 +227,7 @@ class HDIMConfig:
             memory_ext["msa"] = _dataclass_values(memory_ext["msa"])
         msa_ext = memory_ext.get("msa") if isinstance(memory_ext, dict) else None
         if isinstance(msa_ext, dict) and msa_ext.get("top_k", 16) > msa_ext.get("num_prototypes", 256):
-            raise ValueError(
-                f"msa.top_k={msa_ext['top_k']} must be <= msa.num_prototypes={msa_ext['num_prototypes']}"
-            )
+            raise ValueError(f"msa.top_k={msa_ext['top_k']} must be <= msa.num_prototypes={msa_ext['num_prototypes']}")
 
     @property
     def moe(self) -> _MoEConfig:
@@ -324,7 +274,11 @@ class HDIMConfig:
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name in self.__dataclass_fields__ or name in {
-            "text", "expert_names", "use_domain_embedding", "use_domain_lora", "domain_lora_rank"
+            "text",
+            "expert_names",
+            "use_domain_embedding",
+            "use_domain_lora",
+            "domain_lora_rank",
         }:
             super().__setattr__(name, value)
             return
@@ -370,7 +324,7 @@ class HDIMConfig:
                 return value
         raise AttributeError(f"'HDIMConfig' has no attribute '{name}'")
 
-    def get_domain_names(self) -> List[str]:
+    def get_domain_names(self) -> list[str]:
         """Return the resolved list of domain names."""
         if self.domain_names is not None:
             return list(self.domain_names)

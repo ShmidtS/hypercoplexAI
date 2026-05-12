@@ -10,9 +10,9 @@ from typing import Optional
 class RuntimeConfig:
     """Training and runtime configuration."""
 
-    batch_size: int = 32
-    learning_rate: float = 1e-4
-    epochs: int = 100
+    batch_size: int = 16
+    learning_rate: float = 1e-3
+    epochs: int = 5
     online_learning: bool = False
     online_replay_size: int = 10000
     online_surprise_threshold: float = 0.3

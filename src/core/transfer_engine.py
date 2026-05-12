@@ -10,19 +10,20 @@
     transfer(u_mem, source_domain, target_domain, ...) -> (output, state_dict)
 
     где:
-    - u_mem: memory-augmented инвариант [B, clifford_dim]
-    - output: выходной тензор [B, output_dim]
-    - state_dict: словарь с метаданными трансфера
+    - u_mem: memory-augmented invariant [B, clifford_dim]
+    - output: output tensor [B, output_dim]
+    - state_dict: transfer metadata dictionary
 """
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from .hypercomplex import CliffordAlgebra
-from .domain_operators import DomainRotationOperator, sandwich_transfer
+from .algebra import CliffordAlgebra
+from .invariants import sandwich_transfer
+from .rotors import DomainRotationOperator
 
 
 class _CoreTruth:
@@ -34,13 +35,7 @@ class _CoreTruth:
 
 
 class TransferEngine(nn.Module):
-    """Выполняет кроссдоменный перенос через MoE routing.
-
-    Pipeline:
-        u_mem -> moe -> u_route
-        u_route -> sandwich_transfer -> g_target
-        g_target -> decoder -> output
-    """
+    """Выполняет кроссдоменный перенос через MoE routing."""
 
     def __init__(
         self,
@@ -49,35 +44,19 @@ class TransferEngine(nn.Module):
         algebra: CliffordAlgebra,
         num_experts: int = 4,
         top_k: int = 2,
-        router: Optional[nn.Module] = None,
-        router_cls: Optional[type] = None,
+        router: nn.Module | None = None,
+        router_cls: type | None = None,
         z_loss_weight: float = 0.0,
         n_shared_experts: int = 0,
     ):
-        """Инициализация TransferEngine.
-
-        Args:
-            clifford_dim: размерность мультивектора Клиффорда
-            output_dim: размерность выходного вектора
-            algebra: алгебра Клиффорда для операций
-            num_experts: количество экспертов MoE
-            top_k: топ-k маршрутизации
-            router: optional MoE router module; None uses identity routing
-            router_cls: optional router class for explicit legacy MoE construction
-            z_loss_weight: weight for router z-loss regularization
-            n_shared_experts: number of DeepSeek-V3 style shared experts
-        """
         super().__init__()
 
         self.algebra = algebra
         self.clifford_dim = clifford_dim
         self.output_dim = output_dim
 
-        # Import here to avoid circular dependency
-        from .hdim_pipeline import HDIMDecoder
-
         if router is not None:
-            self.router: Optional[nn.Module] = router
+            self.router: nn.Module | None = router
         elif router_cls is not None:
             self.router = router_cls(
                 input_dim=clifford_dim,
@@ -91,10 +70,11 @@ class TransferEngine(nn.Module):
             self.router = None
         self.moe = self.router
 
-        # Decoder: мультивектор -> выход
-        self.decoder = HDIMDecoder(clifford_dim, output_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(clifford_dim, output_dim),
+            nn.LayerNorm(output_dim),
+        )
 
-        # Gradient checkpointing flag
         self._use_gradient_checkpointing = False
 
     def enable_gradient_checkpointing(self) -> None:
@@ -116,23 +96,10 @@ class TransferEngine(nn.Module):
         u_mem: torch.Tensor,
         source_rotor: DomainRotationOperator,
         target_rotor: DomainRotationOperator,
-        g_source: Optional[torch.Tensor] = None,
+        g_source: torch.Tensor | None = None,
         input_is_invariant: bool = False,
-    ) -> tuple[torch.Tensor, Dict[str, Any]]:
-        """Выполняет перенос из source в target домен.
-
-        Args:
-            u_mem: memory-augmented инвариант [B, clifford_dim]
-            source_rotor: ротор source домена
-            target_rotor: ротор target домена
-            g_source: исходный мультивектор (опционально)
-            input_is_invariant: True если u_mem уже является инвариантом
-
-        Returns:
-            output: выходной тензор [B, output_dim]
-            router_state: словарь с состоянием MoE router
-        """
-        # Optional MoE routing with identity fallback for core mode
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Выполняет перенос из source в target домен."""
         if self.router is None:
             u_route = u_mem
             router_state = {}
@@ -165,19 +132,16 @@ class TransferEngine(nn.Module):
         step = self.algebra.geometric_product(R_tgt_n.expand(*U_inv.shape), U_inv)
         g_target = self.algebra.geometric_product(step, R_tgt_inv.expand(*U_inv.shape))
 
-        # MoE adaptation: residual applied separately after transfer
         moe_delta = u_route - u_mem
         step = self.algebra.geometric_product(R_tgt_n.expand(*moe_delta.shape), moe_delta)
         moe_residual = self.algebra.geometric_product(step, R_tgt_inv.expand(*moe_delta.shape))
         g_target = g_target + moe_residual
 
-        # Compute alignment confidence from Clifford rotor quality
         if hasattr(source_rotor, '_normalized_R') and hasattr(target_rotor, '_normalized_R'):
             alignment = (self._rotor_quality(source_rotor) * self._rotor_quality(target_rotor)).clamp(0.0, 1.0)
         else:
             alignment = torch.tensor(1.0, device=u_mem.device)
 
-        # Decode to output
         output = self.decoder(g_target)
 
         router_state = dict(router_state)
@@ -194,12 +158,7 @@ class TransferEngine(nn.Module):
         source_rotor: DomainRotationOperator,
         target_rotor: DomainRotationOperator,
     ) -> tuple[torch.Tensor, "_CoreTruth"]:
-        """Abductive inference: project from target back to source domain.
-
-        NARS backward inference: from conclusion to premises.
-        Uses inverse sandwich: sandwich(target_rotor^{-1}, u_target, unit=True)
-        then project through source_rotor^{-1}.
-        """
+        """Abductive inference: project from target back to source domain."""
         inv_rotor = target_rotor.get_inverse()
         U = self.algebra.sandwich(inv_rotor, u_target, unit=True)
         R_src_n = source_rotor._normalized_R()
@@ -217,23 +176,16 @@ class TransferEngine(nn.Module):
         u_mem: torch.Tensor,
         source_rotor: DomainRotationOperator,
         target_rotor: DomainRotationOperator,
-        g_source: Optional[torch.Tensor] = None,
+        g_source: torch.Tensor | None = None,
         input_is_invariant: bool = False,
-    ) -> tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Алиас для transfer()."""
         return self.transfer(
             u_mem, source_rotor, target_rotor, g_source, input_is_invariant
         )
 
     def decode(self, g_target: torch.Tensor) -> torch.Tensor:
-        """Декодирует мультивектор в выход.
-
-        Args:
-            g_target: мультивектор [B, clifford_dim]
-
-        Returns:
-            output: выходной тензор [B, output_dim]
-        """
+        """Декодирует мультивектор в выход."""
         return self.decoder(g_target)
 
     @property

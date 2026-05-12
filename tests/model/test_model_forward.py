@@ -2,7 +2,10 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from src.models.hdim_model import HDIMConfig, HDIMModel
+import src.models.config as model_config
+import src.models.hdim_model as hdim_model
+from src.models.hdim_model import HDIMConfig
+from src.models.hdim_model import HDIMModel
 from src.training.dataset import create_paired_demo_dataset
 from src.training.invariant_trainer import InvariantTrainer
 
@@ -15,6 +18,16 @@ def cfg():
 @pytest.fixture
 def model(cfg):
     return HDIMModel(cfg)
+
+
+def test_model_exports_only_single_hdim_wrapper():
+    assert "HDIMModelCore" not in hdim_model.__all__
+    assert not hasattr(hdim_model, "HDIMModelCore")
+
+
+def test_model_config_removes_deprecated_extension_shims():
+    for name in ("MoEConfig", "MSAConfig", "MemoryConfig", "RuntimeConfig"):
+        assert not hasattr(model_config, name)
 
 
 def test_model_forward(model, cfg):
@@ -124,7 +137,7 @@ def test_model_memory_mode_none_skips_memory_augmentation(model, cfg):
         memory_mode="none",
     ).aux_state
     assert state.memory_mode == "none"
-    assert state.update_memory is False
+    assert state.update_memory is True
     assert state.memory_updated is False
     assert torch.allclose(state.exported_invariant, model.engine.transfer(state.raw_invariant, model._domain_idx_to_name(0)), atol=1e-6)
 

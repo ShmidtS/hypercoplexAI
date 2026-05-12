@@ -10,7 +10,6 @@ Tests verify:
 
 import pytest
 import torch
-import torch.nn as nn
 import sys
 import os
 
@@ -29,7 +28,8 @@ from src.extensions.moe import (
     MLPExpert,
     _create_mlp_expert,
 )
-from src.core.hdim_pipeline import HDIMPipeline
+from src.models.config import HDIMConfig
+from src.models.hdim_model import HDIMModel
 
 
 # ============================================================
@@ -335,60 +335,66 @@ class TestMoEKernelCAN:
 # ============================================================
 
 class TestHDIMPipelineCAN:
-    """Tests for HDIM pipeline with CAN integration."""
+    """Tests for HDIM model with CAN integration."""
 
     def test_hdim_with_can_experts(self):
-        """Test HDIM pipeline with CAN experts in MoE."""
-        # Create HDIM pipeline with CAN-friendly dimensions
-        pipeline = HDIMPipeline(
-            input_dim=64,
-            output_dim=64,
+        """Test HDIM model forward with CAN expert config."""
+        config = HDIMConfig(
+            hidden_dim=64,
+            num_domains=4,
             clifford_p=3,
             clifford_q=1,
             clifford_r=0,
-            num_experts=4,
+            dropout=0.0,
             expert_names=["math", "language", "code", "science"],
         )
-        
+        model = HDIMModel(config)
         x = torch.randn(4, 64)
-        
-        output, state_dict = pipeline(x)
-        
-        assert output.shape == (4, 64)
-        assert not torch.isnan(output).any()
+        domain_id = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+
+        result = model(x, domain_id, return_state=True, update_memory=False, memory_mode="retrieve")
+
+        assert result.output.shape == (4, 64)
+        assert result.routing_weights.shape == (4, 4)
+        assert result.aux_state.raw_invariant.shape == (4, model.clifford_dim)
+        assert not torch.isnan(result.output).any()
 
     def test_hdim_gradient_flow(self):
-        """Test gradient flow through HDIM pipeline."""
-        pipeline = HDIMPipeline(
-            input_dim=64,
-            output_dim=64,
-            num_experts=2,
-        )
-        pipeline.train()
+        """Test gradient flow through HDIM model."""
+        config = HDIMConfig(hidden_dim=64, num_domains=2, dropout=0.0, expert_names=["math", "code"])
+        model = HDIMModel(config)
+        model.train()
         x = torch.randn(2, 64, requires_grad=True)
-        
-        output, state_dict = pipeline(x)
-        loss = output.sum()
+        domain_id = torch.tensor([0, 1], dtype=torch.long)
+
+        result = model(x, domain_id, update_memory=False, memory_mode="retrieve")
+        loss = result.output.sum() + result.invariant.sum()
         loss.backward()
-        
+
         assert x.grad is not None
         assert not torch.isnan(x.grad).any()
+        assert x.grad.abs().sum() > 0
 
     def test_hdim_with_memory(self):
-        """Test HDIM pipeline with memory integration."""
-        pipeline = HDIMPipeline(
-            input_dim=64,
-            output_dim=64,
-            num_experts=2,
-            memory_type='titans',
+        """Test HDIM model forward with memory config."""
+        config = HDIMConfig(
+            hidden_dim=64,
+            num_domains=2,
+            domain_names=("source", "target"),
+            dropout=0.0,
+            expert_names=["source_expert", "target_expert"],
+            memory_type="titans",
         )
-        
+        model = HDIMModel(config)
         x = torch.randn(4, 64)
-        
-        output, state_dict = pipeline(x)
-        
-        assert output.shape == (4, 64)
-        assert not torch.isnan(output).any()
+        domain_id = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+        result = model(x, domain_id, return_state=True, update_memory=True, memory_mode="update")
+
+        assert result.output.shape == (4, 64)
+        assert result.aux_state.memory_mode == "update"
+        assert result.aux_state.update_memory is True
+        assert not torch.isnan(result.output).any()
 
 
 # ============================================================

@@ -19,7 +19,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.core.hypercomplex import CliffordAlgebra
+from src.core.algebra import CliffordAlgebra
 from src.extensions.moe import SoftMoERouter
 from src.extensions.memory import SemanticMemory, HBMAMemory
 from src.models.hdim_model import HDIMModel, HDIMConfig

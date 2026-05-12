@@ -6,9 +6,12 @@ Moved from the old core text encoder interface to keep MoE focused on routing.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING
+from typing import Protocol
+from typing import runtime_checkable
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 
 @runtime_checkable
