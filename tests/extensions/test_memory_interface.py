@@ -11,7 +11,7 @@ Coverage:
 import pytest
 import torch
 
-from src.core.memory import (
+from src.extensions.memory import (
     MemoryInterface,
     MemoryResult,
     TitansMemory,

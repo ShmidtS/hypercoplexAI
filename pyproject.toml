@@ -87,7 +87,7 @@ Issues = "https://github.com/hdim/hdim/issues"
 
 [tool.setuptools]
 package-dir = {"" = "."}
-packages = ["src", "src.core", "src.models", "src.training", "scripts"]
+packages = ["src", "src.core", "src.adapters", "src.models", "src.training", "scripts"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]

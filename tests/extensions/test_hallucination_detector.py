@@ -5,18 +5,18 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import math
 
 import torch
 import pytest
 
-from src.core.hallucination_detector import (
+from src.extensions.hallucination.detector import (
     HallucinationDetector,
     HallucinationDetectionResult,
 )
-from src.core.semantic_entropy_probe import SemanticEntropyProbe
+from src.extensions.hallucination.semantic_entropy_probe import SemanticEntropyProbe
 
 
 class TestHallucinationDetectorConfig:
@@ -378,7 +378,7 @@ class TestSurpriseSignalIntegration:
 
     def test_surprise_in_memory_result_when_enabled(self):
         """When gradient surprise is enabled, MemoryResult should have surprise."""
-        from src.core.memory import TitansMemory
+        from src.extensions.memory import TitansMemory
 
         titans = TitansMemory(clifford_dim=64, memory_key_dim=32)
         titans.use_gradient_surprise = True
@@ -392,7 +392,7 @@ class TestSurpriseSignalIntegration:
 
     def test_surprise_none_when_disabled(self):
         """When gradient surprise is disabled, surprise should be None initially."""
-        from src.core.memory import TitansMemory
+        from src.extensions.memory import TitansMemory
 
         titans = TitansMemory(clifford_dim=64, memory_key_dim=32)
         # use_gradient_surprise is False by default
@@ -493,7 +493,7 @@ class TestSurpriseSignalIntegration:
 
     def test_end_to_end_surprise_signal_path(self):
         """End-to-end test: TitansMemory -> MemoryResult -> HallucinationDetector."""
-        from src.core.memory import TitansMemory
+        from src.extensions.memory import TitansMemory
 
         # Setup: Titans memory with gradient surprise enabled
         titans = TitansMemory(clifford_dim=64, memory_key_dim=32)

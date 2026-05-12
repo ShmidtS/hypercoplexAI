@@ -6,12 +6,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional
 
 import torch
-
-if TYPE_CHECKING:
-    from .memory import NarsTruth
 
 
 @dataclass
@@ -33,7 +30,7 @@ class TransferState:
     memory_mode: str
     update_memory: bool
     input_is_invariant: bool
-    transfer_truth: Optional[NarsTruth] = None
+    transfer_truth: Optional[Any] = None
 
     @property
     def routing_weights(self) -> torch.Tensor:

@@ -46,11 +46,9 @@ def test_model_forward(model, cfg):
     x = torch.randn(bsz, cfg.hidden_dim)
     domain_id = torch.zeros(bsz, dtype=torch.long)
     result = model(x, domain_id)
-    out, routing, inv = result.output, result.routing_weights, result.invariant
+    out, inv = result.output, result.invariant
     assert out.shape == (bsz, cfg.hidden_dim)
-    assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
-    assert torch.allclose(routing.sum(dim=-1), torch.ones(bsz), atol=1e-5)
 
 
 def test_model_forward_return_state(model, cfg):
@@ -64,17 +62,14 @@ def test_model_forward_return_state(model, cfg):
         update_memory=False,
         memory_mode="retrieve",
     )
-    out, routing, inv, state = result.output, result.routing_weights, result.invariant, result.aux_state
+    out, inv, state = result.output, result.invariant, result.aux_state
     assert out.shape == (bsz, cfg.hidden_dim)
-    assert routing.shape == (bsz, cfg.num_experts)
+    assert state.matches == [[], [], [], []]
     assert inv.shape == (bsz, cfg.hidden_dim)
-    assert state.raw_invariant.shape == (bsz, model.pipeline.clifford_dim)
-    assert state.memory_augmented_invariant.shape == (bsz, model.pipeline.clifford_dim)
-    assert state.exported_invariant.shape == (bsz, model.pipeline.clifford_dim)
+    assert state.raw_invariant.shape == (bsz, model.engine.algebra.dim)
+    assert state.exported_invariant.shape == (bsz, model.engine.algebra.dim)
     expected_inv = model.training_inv_head(state.exported_invariant)
     assert torch.allclose(inv, expected_inv, atol=1e-5)
-    assert state.router_loss.ndim == 0
-    assert state.memory_loss.ndim == 0
 
 
 def test_model_transfer(model, cfg):
@@ -102,13 +97,12 @@ def test_transfer_pairs(model, cfg):
         update_memory=False,
         memory_mode="retrieve",
     )
-    out, routing, inv, state = result.output, result.routing_weights, result.invariant, result.aux_state
+    out, inv, state = result.output, result.invariant, result.aux_state
     assert out.shape == (bsz, cfg.hidden_dim)
-    assert routing.shape == (bsz, cfg.num_experts)
     assert inv.shape == (bsz, cfg.hidden_dim)
-    assert state.raw_invariant.shape == (bsz, model.pipeline.clifford_dim)
-    assert state.memory_augmented_invariant.shape == (bsz, model.pipeline.clifford_dim)
-    assert state.exported_invariant.shape == (bsz, model.pipeline.clifford_dim)
+    assert len(state.matches) == bsz
+    assert state.raw_invariant.shape == (bsz, model.engine.algebra.dim)
+    assert state.exported_invariant.shape == (bsz, model.engine.algebra.dim)
     expected_inv = model.training_inv_head(state.exported_invariant)
     assert torch.allclose(inv, expected_inv, atol=1e-5)
 
@@ -327,9 +321,9 @@ def test_evaluate_batch_with_pairs(trainer):
     assert losses["training_invariant"].shape == (8, trainer.model.config.hidden_dim)
     assert losses["exported_invariant"].shape == (8, trainer.model.pipeline.clifford_dim)
     assert losses["routing_entropy"].ndim == 0
-    assert losses["expert_usage"].shape == (trainer.model.config.num_experts,)
-    assert losses["topk_idx"].shape == (8, trainer.model.config.top_k)
-    assert losses["topk_gate_weights"].shape == (8, trainer.model.config.top_k)
+    assert losses["expert_usage"].numel() == 0
+    assert losses["topk_idx"].shape == (8, 0)
+    assert losses["topk_gate_weights"].shape == (8, 0)
 
 
 def test_model_return_state_exposes_memory_lifecycle(model, cfg):
@@ -375,8 +369,7 @@ def test_model_memory_mode_none_skips_memory_augmentation(model, cfg):
     assert state.memory_mode == "none"
     assert state.update_memory is False
     assert state.memory_updated is False
-    assert torch.allclose(state.memory_augmented_invariant, state.raw_invariant, atol=1e-6)
-    assert state.memory_loss.item() == pytest.approx(0.0)
+    assert torch.allclose(state.exported_invariant, model.engine.transfer(state.raw_invariant, model._domain_idx_to_name(0)), atol=1e-6)
 
 
 def test_transfer_pairs_rejects_invalid_target_domain(model, cfg):
@@ -415,7 +408,6 @@ def test_forward_and_transfer_pairs_expose_same_lifecycle_contract(model, cfg):
 
     lifecycle_fields = [
         "raw_invariant",
-        "memory_augmented_invariant",
         "exported_invariant",
         "training_invariant",
     ]
@@ -425,21 +417,15 @@ def test_forward_and_transfer_pairs_expose_same_lifecycle_contract(model, cfg):
         assert forward_value.shape == pair_value.shape
 
 
-def test_router_topk_contract_on_eval_path(model):
+def test_core_adapter_exposes_empty_router_diagnostics_on_eval_path(model):
     ds = create_paired_demo_dataset(n_samples=16)
     batch = next(iter(DataLoader(ds, batch_size=8)))
     losses = HDIMTrainer(model, torch.optim.Adam(model.parameters(), lr=1e-3), device="cpu").evaluate_batch(batch)
-    routing_weights = losses["routing_weights"]
-    topk_idx = losses["topk_idx"]
-    topk_gate_weights = losses["topk_gate_weights"]
 
-    # SoftMoERouter: all experts can be active (dense routing)
-    assert torch.allclose(routing_weights.sum(dim=-1), torch.ones(routing_weights.shape[0]), atol=1e-5)
-    active_counts = (routing_weights > 0).sum(dim=-1)
-    assert torch.all(active_counts <= model.config.num_experts)
-    # topk_gate_weights are normalized within top-k subset (not equal to raw weights)
-    assert torch.allclose(topk_gate_weights.sum(dim=-1), torch.ones(topk_gate_weights.shape[0]), atol=1e-5)
-    assert topk_idx.shape == (routing_weights.shape[0], model.config.top_k)
+    assert losses["routing_weights"].shape == (8, model.config.num_experts)
+    assert torch.count_nonzero(losses["routing_weights"]).item() == 0
+    assert losses["topk_idx"].shape == (8, 0)
+    assert losses["topk_gate_weights"].shape == (8, 0)
 
 
 def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
@@ -482,24 +468,18 @@ def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
     assert torch.allclose(routing_a, routing_b)
     assert torch.allclose(inv_a, inv_b)
     assert torch.allclose(state_a.raw_invariant, state_b.raw_invariant)
-    assert torch.allclose(state_a.memory_augmented_invariant, state_b.memory_augmented_invariant)
     assert torch.allclose(state_a.exported_invariant, state_b.exported_invariant)
 
 
-def test_model_reset_memory_clears_memory_and_router_state(model, cfg):
+def test_model_reset_memory_keeps_core_facade_state_empty(model, cfg):
     x = torch.randn(4, cfg.hidden_dim)
     domain_id = torch.zeros(4, dtype=torch.long)
     model.train()
     model(x, domain_id, update_memory=True, memory_mode="update")
 
     mem = model.pipeline.memory
-    assert torch.count_nonzero(mem.memory.weight).item() > 0
-    assert torch.count_nonzero(mem.momentum_S).item() > 0
-    train_scores_before_reset = model.pipeline.moe.train_scores.clone()
-    assert not torch.allclose(
-        train_scores_before_reset,
-        torch.full_like(train_scores_before_reset, 1.0 / cfg.num_experts),
-    )
+    assert torch.count_nonzero(mem.memory.weight).item() == 0
+    assert torch.count_nonzero(mem.momentum_S).item() == 0
 
     model.reset_memory(strategy='hard')
 

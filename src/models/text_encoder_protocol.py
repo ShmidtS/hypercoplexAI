@@ -1,7 +1,7 @@
 """HDIM — TextEncoder Protocol.
 
 Protocol for text encoding components (SimpleTextEncoder, SBERTEncoder, ModernBertEncoder).
-Moved from src.core.moe_interface to keep MoE package focused on routing.
+Moved from the old core text encoder interface to keep MoE focused on routing.
 """
 
 from __future__ import annotations

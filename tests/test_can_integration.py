@@ -23,7 +23,7 @@ from src.core.clifford_interaction import (
     CliffordFFN,
     has_triton_support,
 )
-from src.core.moe import (
+from src.extensions.moe import (
     MoEKernel,
     MoEKernelConfig,
     MLPExpert,

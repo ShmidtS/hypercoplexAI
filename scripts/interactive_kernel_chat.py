@@ -26,7 +26,7 @@ import json
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.model_factory import build_sbert_hdim_model, _patch_moe_kernel
-from src.core.memory import TitansMemory
+from src.extensions.memory import TitansMemory
 
 
 class HDIMKernelChat:

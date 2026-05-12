@@ -12,7 +12,7 @@ Coverage:
 import pytest
 import torch
 
-from src.core.memory import TitansMemory, MemoryResult
+from src.extensions.memory import TitansMemory, MemoryResult
 
 
 @pytest.fixture

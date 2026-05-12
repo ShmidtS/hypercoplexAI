@@ -3,7 +3,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from src.core.moe import (
+from src.extensions.moe import (
     MoEKernel, MoEKernelConfig, MoEKernelState,
     MLPExpert, EXPERT_CONFIGS,
     MoERouter, SoftMoERouter,
@@ -726,13 +726,13 @@ class TestExpertConfigs:
 
         def test_moe_kernel_implements_interface(self):
             """MoEKernel must inherit from MoERouter."""
-            from src.core.moe import MoERouter
+            from src.extensions.moe import MoERouter
 
             assert issubclass(MoEKernel, MoERouter)
 
         def test_soft_moe_router_implements_interface(self):
             """SoftMoERouter must inherit from MoERouter."""
-            from src.core.moe import MoERouter
+            from src.extensions.moe import MoERouter
 
             assert issubclass(SoftMoERouter, MoERouter)
 
@@ -834,7 +834,7 @@ class TestExpertConfigs:
     
         def test_polymorphic_usage(self, config):
             """Both MoEKernel and SoftMoERouter can be used as MoERouter."""
-            from src.core.moe import MoERouter
+            from src.extensions.moe import MoERouter
 
             kernel = MoEKernel(config)
 

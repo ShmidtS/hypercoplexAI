@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 import torch.nn.functional as F
 
-from src.core.moe import MoEKernelConfig, MoEKernel, MLPExpert
+from src.extensions.moe import MoEKernelConfig, MoEKernel, MLPExpert
 from src.core.hypercomplex import CliffordAlgebra
 from src.core.hdim_pipeline import HDIMPipeline
 

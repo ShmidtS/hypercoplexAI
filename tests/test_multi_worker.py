@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, TensorDataset
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.core.moe import SoftMoERouter
+from src.extensions.moe import SoftMoERouter
 
 
 # ============================================================

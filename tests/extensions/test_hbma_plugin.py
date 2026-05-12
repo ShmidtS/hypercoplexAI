@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.core.memory import (
+from src.extensions.memory import (
     HBMAMemory,
     MemoryResult,
     MemorySubsystemPlugin,

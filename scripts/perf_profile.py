@@ -12,7 +12,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.core.hypercomplex import CliffordAlgebra
-from src.core.memory import HBMAMemory, TitansMemory
+from src.extensions.memory import HBMAMemory, TitansMemory
 from src.models.hdim_model import HDIMModel, HDIMConfig
 
 

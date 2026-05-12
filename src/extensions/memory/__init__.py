@@ -1,14 +1,6 @@
-"""Unified memory subpackage for HDIM pipeline.
+"""Optional memory backend extensions for HDIM."""
 
-Exports:
-    MemoryInterface, MemoryResult — abstract contract
-    TitansMemory — neural associative memory with TTT updates
-    HBMAMemory — hippocampal-based memory architecture
-    MSAMemory — prototype-based sparse retrieval
-    MSASparseIndex, MSAOverflowBuffer — MSA utilities
-    NarsTruth — NARS truth-value system
-"""
-
+from .config import MemoryConfig, MSAConfig
 from .interface import MemoryInterface, MemoryResult
 from .titans import TitansMemory, TitansMemoryModule
 from .hbma import (
@@ -28,6 +20,8 @@ from .msa import MSAMemory
 from .sparse_index import MSASparseIndex, MSAOverflowBuffer
 
 __all__ = [
+    "MemoryConfig",
+    "MSAConfig",
     "MemoryInterface",
     "MemoryResult",
     "TitansMemory",

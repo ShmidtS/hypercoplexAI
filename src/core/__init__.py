@@ -1,90 +1,64 @@
-"""HDIM src/core — ядро гиперкомплексной архитектуры."""
+"""Streamlined HDIM core exports."""
 
-from .hypercomplex import (
-    CliffordAlgebra,
-    QuaternionLinear,
-    QLayerNorm,
-)
-from .domain_operators import (
-    DomainRotationOperator,
-    InvariantExtractor,
-    sandwich_transfer,
-)
-from .memory import TitansMemory, TitansMemoryModule, HBMAMemory, WorkingMemory, EpisodicMemory, SemanticMemory, ProceduralMemory, NarsTruth
-from .hdim_pipeline import HDIMPipeline, HDIMEncoder, HDIMDecoder
-from .transfer_state import TransferState
-from .moe import (
-    MoEKernel,
-    MoEKernelConfig,
-    MoEKernelState,
-    MLPExpert,
-    EXPERT_CONFIGS,
-    MoERouter,
-    RouterState,
-    SoftMoERouter,
-    _create_mlp_expert,
-    load_balance_loss,
-    entropy_load_balance_loss,
-    z_loss,
-    aux_loss_free_update,
-    expert_orthogonalization_loss,
-)
-from .hallucination_detector import HallucinationDetector, HallucinationDetectionResult
-from .semantic_entropy_probe import SemanticEntropyProbe
-from .online_lora import (
-    OnlineLoRA,
-    OnlineLoRALinear,
-    OnlineLoRAConv,
-    OnlineLoRAConfig,
-    OnlineLoRAManager,
-    wrap_with_online_lora,
-)
-from .online_learner import OnlineLearner, ReplayBuffer, OnlineLearnerConfig
-from .per_domain_lora import PerDomainLoRA
+from __future__ import annotations
 
-# SRP components (refactored from HDIMPipeline)
-from .domain_encoder import DomainEncoder
-from .invariant_processor import InvariantProcessor, InvariantMemoryState
-from .transfer_engine import TransferEngine
+import warnings
+from importlib import import_module
+from typing import Any
 
-# Memory interface
-from .memory import MemoryInterface, MSAMemory
-
-# Clifford interaction layers
-from .clifford_interaction import CliffordInteractionLayer, CliffordFFN
+from .algebra import CliffordAlgebra
+from .engine import CoreEngineConfig, HDIMCoreEngine
+from .invariant_index import InvariantIndex
+from .invariants import InvariantExtractor, sandwich_transfer
+from .rotors import DomainRotationOperator
+from .types import AnalogyMatch, InvariantRecord
 
 __all__ = [
-    # Hypercomplex
-    'CliffordAlgebra', 'QuaternionLinear', 'QLayerNorm',
-    # Domain operators
-    'DomainRotationOperator', 'InvariantExtractor', 'sandwich_transfer',
-    # Memory
-    'TitansMemory', 'TitansMemoryModule',
-    'HBMAMemory', 'WorkingMemory', 'EpisodicMemory', 'SemanticMemory', 'ProceduralMemory',
-    # Pipeline (backward compatible)
-    'HDIMPipeline', 'HDIMEncoder', 'HDIMDecoder',
-    'TransferState',  # moved to separate module
-    # MoE
-    'MoEKernel', 'MoEKernelConfig', 'MoEKernelState',
-    'MLPExpert', 'EXPERT_CONFIGS',
-    'MoERouter', 'RouterState', 'SoftMoERouter', '_create_mlp_expert',
-    'load_balance_loss', 'entropy_load_balance_loss', 'z_loss',
-    'aux_loss_free_update', 'expert_orthogonalization_loss',
-    # Hallucination detection
-    'HallucinationDetector', 'HallucinationDetectionResult', 'SemanticEntropyProbe',
-    # Online-LoRA
-    'OnlineLoRA', 'OnlineLoRALinear', 'OnlineLoRAConv', 'OnlineLoRAConfig', 'OnlineLoRAManager',
-    'wrap_with_online_lora',
-    # Online Learner
-    'OnlineLearner', 'ReplayBuffer', 'OnlineLearnerConfig',
-    # Per-domain LoRA
-    'PerDomainLoRA',
-    # SRP Components
-    'DomainEncoder', 'InvariantProcessor', 'InvariantMemoryState', 'TransferEngine',
-    # Memory interface
-    'MemoryInterface', 'MSAMemory',
-    # Clifford interaction layers
-    'CliffordInteractionLayer', 'CliffordFFN',
-    # NARS truth
-    'NarsTruth',
+    "CliffordAlgebra",
+    "DomainRotationOperator",
+    "InvariantExtractor",
+    "sandwich_transfer",
+    "AnalogyMatch",
+    "InvariantRecord",
+    "InvariantIndex",
+    "HDIMCoreEngine",
+    "CoreEngineConfig",
 ]
+
+_EXTENSION_EXPORTS = {
+    "MemoryInterface": "src.extensions.memory",
+    "MemoryResult": "src.extensions.memory",
+    "TitansMemory": "src.extensions.memory",
+    "TitansMemoryModule": "src.extensions.memory",
+    "HBMAMemory": "src.extensions.memory",
+    "WorkingMemory": "src.extensions.memory",
+    "EpisodicMemory": "src.extensions.memory",
+    "SemanticMemory": "src.extensions.memory",
+    "ProceduralMemory": "src.extensions.memory",
+    "ConsolidationEngine": "src.extensions.memory",
+    "MemorySubsystemPlugin": "src.extensions.memory",
+    "ConsolidationContext": "src.extensions.memory",
+    "SalienceScorer": "src.extensions.memory",
+    "NarsTruth": "src.extensions.memory",
+    "CLSMemory": "src.extensions.memory",
+    "MSAMemory": "src.extensions.memory",
+    "MSASparseIndex": "src.extensions.memory",
+    "MSAOverflowBuffer": "src.extensions.memory",
+    "MoERouter": "src.extensions.moe",
+    "MoEKernel": "src.extensions.moe",
+    "MoEKernelConfig": "src.extensions.moe",
+    "SoftMoERouter": "src.extensions.moe",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXTENSION_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    warnings.warn(
+        f"src.core.{name} is deprecated; import from {module_name} instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return getattr(import_module(module_name), name)

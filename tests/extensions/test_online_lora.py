@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import math
 
@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import pytest
 
-from src.core.online_lora import (
+from src.extensions.lora.online_lora import (
     OnlineLoRA,
     OnlineLoRALinear,
     OnlineLoRAConv,

@@ -16,8 +16,15 @@ import torch.nn as nn
 
 from .hypercomplex import CliffordAlgebra
 
+# Compatibility shim: core moved to focused modules
+from .rotors import DomainRotationOperator as _DomainRotationOperator
+DomainRotationOperator = _DomainRotationOperator
+from .invariants import InvariantExtractor as _InvariantExtractor, sandwich_transfer as _sandwich_transfer
+InvariantExtractor = _InvariantExtractor
+sandwich_transfer = _sandwich_transfer
 
-class DomainRotationOperator(nn.Module):
+
+class _LegacyDomainRotationOperator(nn.Module):
     """Обучаемый ротор домена.
 
     Математически (согласно теоремам HDIM.lean):
@@ -80,7 +87,7 @@ class DomainRotationOperator(nn.Module):
         return self.algebra.sandwich(self.get_inverse(), x, unit=False)
 
 
-class InvariantExtractor(nn.Module):
+class _LegacyInvariantExtractor(nn.Module):
     """Извлекает структурный инвариант U_inv = R^{-1} ⊗_Cl G ⊗_Cl R."""
 
     def __init__(self, algebra: CliffordAlgebra):
@@ -98,7 +105,7 @@ class InvariantExtractor(nn.Module):
         return self.algebra.geometric_product(step1, R_n.expand(*G_source.shape))
 
 
-def sandwich_transfer(
+def _legacy_sandwich_transfer(
     algebra: CliffordAlgebra,
     G_source: torch.Tensor,
     R_source: DomainRotationOperator,

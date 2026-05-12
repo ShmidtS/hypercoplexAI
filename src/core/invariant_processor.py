@@ -15,12 +15,10 @@
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-
-from .memory.interface import MemoryInterface, MemoryResult
 
 
 @dataclass
@@ -48,11 +46,11 @@ class InvariantProcessor(nn.Module):
 
     VALID_MEMORY_MODES = {"none", "retrieve", "update"}
 
-    def __init__(self, memory: MemoryInterface):
+    def __init__(self, memory: Optional[nn.Module] = None):
         """Инициализация InvariantProcessor.
 
         Args:
-            memory: memory system (TitansAdapter, HBMAMemoryAdapter, etc.)
+            memory: optional extension memory system with MemoryInterface-like API
         """
         super().__init__()
         self.memory = memory
@@ -61,7 +59,7 @@ class InvariantProcessor(nn.Module):
         self,
         u_inv: torch.Tensor,
         update_memory: bool = True,
-        memory_mode: str = "update",
+        memory_mode: str = "none",
     ) -> tuple[torch.Tensor, InvariantMemoryState]:
         """Обрабатывает инвариант через memory system.
 
@@ -83,25 +81,21 @@ class InvariantProcessor(nn.Module):
                 f"Valid modes: {self.VALID_MEMORY_MODES}"
             )
 
-        # Mode 'none': bypass memory entirely
-        if memory_mode == "none":
-            empty_state = InvariantMemoryState(
-                retrieved=torch.zeros_like(u_inv),
-                loss=torch.zeros((), device=u_inv.device, dtype=u_inv.dtype),
-                updated=False,
-                surprise=torch.zeros(1, device=u_inv.device, dtype=u_inv.dtype),
-            )
+        empty_state = InvariantMemoryState(
+            retrieved=torch.zeros_like(u_inv),
+            loss=torch.zeros((), device=u_inv.device, dtype=u_inv.dtype),
+            updated=False,
+            surprise=torch.zeros(1, device=u_inv.device, dtype=u_inv.dtype),
+        )
+
+        if memory_mode == "none" or self.memory is None:
             return u_inv, empty_state
 
-        # Determine if we should update memory
         do_update = update_memory and memory_mode == "update"
+        result: Any = self.memory(u_inv, update_memory=do_update)
 
-        # Unified path through MemoryInterface
-        result: MemoryResult = self.memory(u_inv, update_memory=do_update)
-
-        # Convert MemoryResult to InvariantMemoryState
         state = InvariantMemoryState(
-            retrieved=result.output - u_inv,  # actual retrieved component
+            retrieved=result.output - u_inv,
             loss=result.loss,
             updated=result.updated,
             alpha=result.alpha,
@@ -116,7 +110,7 @@ class InvariantProcessor(nn.Module):
         self,
         u_inv: torch.Tensor,
         update_memory: bool = True,
-        memory_mode: str = "update",
+        memory_mode: str = "none",
     ) -> tuple[torch.Tensor, InvariantMemoryState]:
         """Алиас для process()."""
         return self.process(u_inv, update_memory, memory_mode)
@@ -127,7 +121,8 @@ class InvariantProcessor(nn.Module):
         Args:
             strategy: стратегия сброса (geometric/hard)
         """
-        self.memory.reset(strategy=strategy)
+        if self.memory is not None:
+            self.memory.reset(strategy=strategy)
 
     def get_memory_loss(self) -> torch.Tensor:
         """Возвращает текущий auxiliary loss памяти.
@@ -135,4 +130,6 @@ class InvariantProcessor(nn.Module):
         Returns:
             Скалярный тензор с memory loss
         """
+        if self.memory is None:
+            return torch.tensor(0.0)
         return self.memory.memory_loss()

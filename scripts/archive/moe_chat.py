@@ -13,7 +13,7 @@
 
 Пример регистрации кастомных экспертов:
  ------------------------------
- from src.core.moe import MLPExpert, EXPERT_CONFIGS
+ from src.extensions.moe import MLPExpert, EXPERT_CONFIGS
  import torch.nn as nn
 
  class HistoryExpert(MLPExpert):

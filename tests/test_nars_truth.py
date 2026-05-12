@@ -13,7 +13,7 @@ Coverage:
 
 import pytest
 import torch
-from src.core.memory import NarsTruth
+from src.extensions.memory import NarsTruth
 
 
 class TestPostInitClamping:
@@ -269,7 +269,7 @@ class TestSoftMoERouterAlignment:
     """
 
     def test_router_state_contains_alignment_key(self):
-        from src.core.moe import SoftMoERouter
+        from src.extensions.moe import SoftMoERouter
         router = SoftMoERouter(input_dim=32, num_experts=2, expert_dim=16)
         router.eval()
         x = torch.randn(4, 32)

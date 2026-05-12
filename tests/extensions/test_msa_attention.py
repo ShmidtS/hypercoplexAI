@@ -11,11 +11,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.core.memory.sparse_index import (
+from src.extensions.memory.sparse_index import (
     MSAOverflowBuffer,
     MSASparseIndex,
 )
-from src.models.hdim_model import MSAConfig
+from src.extensions.memory.config import MSAConfig
 
 
 class TestMSASparseIndex:
@@ -245,7 +245,7 @@ class TestSemanticMemoryMSA:
     @pytest.fixture
     def semantic_msa(self):
         """Create SemanticMemory with MSA enabled."""
-        from src.core.memory import SemanticMemory
+        from src.extensions.memory import SemanticMemory
         return SemanticMemory(
             hidden_dim=64,
             num_prototypes=32,
@@ -255,7 +255,7 @@ class TestSemanticMemoryMSA:
     @pytest.fixture
     def semantic_dense(self):
         """Create SemanticMemory with MSA disabled."""
-        from src.core.memory import SemanticMemory
+        from src.extensions.memory import SemanticMemory
         return SemanticMemory(
             hidden_dim=64,
             num_prototypes=32,
@@ -298,7 +298,7 @@ class TestSemanticMemoryMSA:
 
     def test_msa_overflow_integration(self, batch_input):
         """Test MSA integration with EpisodicMemory overflow."""
-        from src.core.memory import HBMAMemory
+        from src.extensions.memory import HBMAMemory
         
         # Create HBMA with MSA enabled (default)
         hbma = HBMAMemory(hidden_dim=64)
@@ -313,8 +313,8 @@ class TestSemanticMemoryMSA:
 
     def test_msa_config_override(self):
         """Test that MSAConfig can override defaults."""
-        from src.core.memory import SemanticMemory
-        from src.models.hdim_model import MSAConfig
+        from src.extensions.memory import SemanticMemory
+        from src.extensions.memory.config import MSAConfig
         
         cfg = MSAConfig(top_k=8, chunk_size=32, temperature=0.05)
         memory = SemanticMemory(
@@ -340,7 +340,7 @@ class TestSemanticMemoryMSA:
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
-from src.core.memory import EpisodicMemory
+from src.extensions.memory import EpisodicMemory
 
 
 class TestMSAOverflowBuffer:

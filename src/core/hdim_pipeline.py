@@ -15,20 +15,29 @@
 """
 
 import logging
+import warnings
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
+from .engine import CoreEngineConfig, HDIMCoreEngine
+from .rotors import DomainRotationOperator
 from .hypercomplex import CliffordAlgebra
 from .domain_operators import sandwich_transfer
-from .moe import MoERouter
-from .memory import MemoryInterface, TitansMemory, HBMAMemory, MSAMemory, NarsTruth
+from .invariant_index import InvariantIndex
 from .domain_encoder import DomainEncoder
 from .invariant_processor import InvariantProcessor, InvariantMemoryState
 from .transfer_engine import TransferEngine
 from .transfer_state import TransferState
-# NarsTruth imported from .memory above
+
+
+class _CoreTruth(SimpleNamespace):
+    """Minimal truth-value placeholder for core transfer metadata."""
+
+    def __init__(self, freq: float = 1.0, conf: float = 1.0):
+        super().__init__(freq=freq, conf=conf)
 
 
 class HDIMEncoder(nn.Module):
@@ -68,6 +77,68 @@ class HDIMDecoder(nn.Module):
         return self.norm(self.proj(x))
 
 
+class _CoreMoEShim(nn.Module):
+    """Minimal legacy MoE surface for HDIMModel compatibility in core mode."""
+
+    def __init__(self, num_experts: int, top_k: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = min(top_k, num_experts)
+        self.expert_names = [f"expert_{i}" for i in range(num_experts)]
+        self.slots_per_expert = 1
+        self.register_buffer("train_scores", torch.full((num_experts,), 1.0 / num_experts))
+
+    def forward(self, u_inv: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size = u_inv.shape[0]
+        scores = u_inv[:, :self.num_experts]
+        if scores.shape[1] < self.num_experts:
+            pad = u_inv.new_zeros(batch_size, self.num_experts - scores.shape[1])
+            scores = torch.cat([scores, pad], dim=1)
+        gate_weights = torch.softmax(scores, dim=-1)
+        topk_gate_weights, topk_idx = torch.topk(gate_weights, k=self.top_k, dim=-1)
+        topk_gate_weights = topk_gate_weights / topk_gate_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        expert_usage = gate_weights.mean(dim=0)
+        if self.training:
+            self.train_scores.mul_(0.7).add_(expert_usage.detach().to(self.train_scores) * 0.3)
+        zero = u_inv.new_tensor(0.0)
+        entropy = -(gate_weights * gate_weights.clamp_min(1e-8).log()).sum(dim=-1).mean()
+        return u_inv, {
+            "gate_weights": gate_weights,
+            "topk_idx": topk_idx,
+            "topk_gate_weights": topk_gate_weights,
+            "router_loss": zero,
+            "z_loss": zero,
+            "routing_entropy": entropy,
+            "train_scores_snapshot": self.train_scores.to(device=u_inv.device, dtype=u_inv.dtype),
+            "expert_usage": expert_usage,
+        }
+
+    def enable_aux_loss_free(self, aux_lr: float = 0.01) -> None:
+        return None
+
+    def enable_expert_ortho(self) -> None:
+        return None
+
+    def expert_orthogonalization_loss(self) -> torch.Tensor:
+        return self.train_scores.new_tensor(0.0)
+
+
+class _CoreMemoryShim(nn.Module):
+    """Minimal legacy memory surface for core mode."""
+
+    def __init__(self, clifford_dim: int):
+        super().__init__()
+        self.memory = nn.Embedding(1, clifford_dim)
+        nn.init.zeros_(self.memory.weight)
+        self.register_buffer("momentum_S", torch.zeros(1, clifford_dim))
+        self.use_gradient_surprise = False
+        self.use_adaptive_forgetting = False
+
+    def reset(self, strategy: str = "geometric") -> None:
+        self.memory.weight.data.zero_()
+        self.momentum_S.zero_()
+
+
 class HDIMPipeline(nn.Module):
     """Полный пайплайн HDIM для кроссдоменного переноса знаний.
 
@@ -99,79 +170,58 @@ class HDIMPipeline(nn.Module):
         if domain_names is None:
             domain_names = ["source", "target"]
 
-        self.domain_names = domain_names
-        self.algebra = CliffordAlgebra(p=clifford_p, q=clifford_q, r=clifford_r)
-        clifford_dim = self.algebra.dim
-        self.clifford_dim = clifford_dim
-
-        # Compute num_experts from expert_names if provided
-        if expert_names is not None:
-            num_experts = len(expert_names)
-        elif num_experts is None:
-            num_experts = 4
-
         valid_memory_types = ("titans", "hbma", "msa")
         if memory_type not in valid_memory_types:
             raise ValueError(
                 f"Unsupported memory_type {memory_type!r}. Valid memory types: {list(valid_memory_types)}"
             )
+
+        if memory_type != "titans" or msa_config is not None or memory_key_dim != 32:
+            warnings.warn(
+                "memory_type is deprecated in core mode; using InvariantIndex",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        # Compute num_experts from expert_names if provided, for compatibility metadata only.
+        if expert_names is not None:
+            num_experts = len(expert_names)
+        elif num_experts is None:
+            num_experts = 4
+
+        engine_config = CoreEngineConfig(
+            input_dim=input_dim,
+            clifford_p=clifford_p,
+            clifford_q=clifford_q,
+            clifford_r=clifford_r,
+            domain_names=tuple(domain_names),
+        )
+        self.engine = HDIMCoreEngine(engine_config)
+
+        self.domain_names = list(domain_names)
+        self.algebra = self.engine.algebra
+        self.clifford_dim = self.algebra.dim
         self.memory_type = memory_type
 
-        # === Component 1: DomainEncoder ===
-        self.domain_encoder = DomainEncoder(
-            input_dim=input_dim,
-            clifford_dim=clifford_dim,
-            algebra=self.algebra,
-            domain_names=domain_names,
-        )
-
-        # === Component 2: Memory + InvariantProcessor ===
-        if memory_type == 'titans':
-            self.memory: MemoryInterface = TitansMemory(
-                clifford_dim=clifford_dim,
-                memory_key_dim=memory_key_dim,
-            )
-        elif memory_type == 'hbma':
-            self.memory = HBMAMemory(hidden_dim=clifford_dim)
-        elif memory_type == 'msa':
-            msa_kwargs = msa_config or {}
-            self.memory: MemoryInterface = MSAMemory(
-                hidden_dim=clifford_dim,
-                **msa_kwargs,
-            )
-
-        self.invariant_processor = InvariantProcessor(self.memory)
-
-        # === Component 3: TransferEngine ===
-        self.transfer_engine = TransferEngine(
-            clifford_dim=clifford_dim,
-            output_dim=output_dim,
-            algebra=self.algebra,
-            num_experts=num_experts,
-            top_k=top_k,
-            z_loss_weight=z_loss_weight,
-            n_shared_experts=n_shared_experts,
-        )
-
-        # Backward compatibility aliases
-        self.encoder = self.domain_encoder.encoder
-        self.decoder = self.transfer_engine.decoder
-        self.domain_rotors = self.domain_encoder.domain_rotors
-        self.invariant_extractor = self.domain_encoder.invariant_extractor
-        self.invariant_norm = self.domain_encoder.invariant_norm
-        self.moe = self.transfer_engine.moe
+        # Backward compatibility aliases. Legacy memory/MoE objects are not used in core mode.
+        self.encoder = self.engine.encoder
+        self.decoder = HDIMDecoder(self.clifford_dim, output_dim)
+        self.domain_rotors = self.engine.domain_rotors
+        self.invariant_extractor = self.engine.extractor
+        self.invariant_norm = nn.Identity()
+        self.moe = _CoreMoEShim(num_experts=num_experts, top_k=top_k)
+        self.memory = _CoreMemoryShim(self.clifford_dim)
+        self.invariant_index = self.engine.index
 
         self._use_gradient_checkpointing = False
 
     def enable_gradient_checkpointing(self) -> None:
-        """Enable gradient checkpointing on memory and MoE forward paths."""
+        """Enable gradient checkpointing compatibility flag."""
         self._use_gradient_checkpointing = True
-        self.transfer_engine.enable_gradient_checkpointing()
 
     def disable_gradient_checkpointing(self) -> None:
         """Disable gradient checkpointing."""
         self._use_gradient_checkpointing = False
-        self.transfer_engine.disable_gradient_checkpointing()
 
     def encode_domain(
         self,
@@ -179,16 +229,31 @@ class HDIMPipeline(nn.Module):
         domain_name: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Кодирует вход и извлекает структурный инвариант для домена."""
-        return self.domain_encoder.encode_domain(x, domain_name)
+        G = self.engine.encode(x)
+        U_inv = self.engine.extract(G, domain_name)
+        return G, U_inv
 
     def _apply_memory(
         self,
         u_inv: torch.Tensor,
         update_memory: bool,
         memory_mode: str,
-    ) -> Tuple[torch.Tensor, InvariantMemoryState]:
-        """Применяет память к инварианту."""
-        return self.invariant_processor.process(u_inv, update_memory, memory_mode)
+    ) -> Tuple[torch.Tensor, Any]:
+        """Legacy memory hook; core mode leaves invariants unchanged."""
+        zero = u_inv.new_tensor(0.0)
+        if update_memory and memory_mode == "update" and self.training:
+            with torch.no_grad():
+                mean_inv = u_inv.detach().mean(dim=0, keepdim=True).to(self.memory.memory.weight)
+                self.memory.memory.weight.copy_(mean_inv[:1])
+                self.memory.momentum_S.copy_(mean_inv[:1])
+        return u_inv, SimpleNamespace(
+            loss=zero,
+            retrieved=None,
+            updated=False,
+            alpha=zero,
+            eta=zero,
+            theta=zero,
+        )
 
     def transfer(
         self,
@@ -201,53 +266,47 @@ class HDIMPipeline(nn.Module):
         input_is_invariant: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Полный кроссдоменный перенос: source → target."""
+        valid_memory_modes = ("none", "retrieve", "update")
+        if memory_mode not in valid_memory_modes:
+            raise ValueError(
+                f"Unsupported memory_mode {memory_mode!r}. Valid memory modes: {list(valid_memory_modes)}"
+            )
+
         if input_is_invariant:
             g_source = None
             u_inv = x
         else:
             g_source, u_inv = self.encode_domain(x, source_domain)
 
-        u_mem, memory_state = self._apply_memory(
-            u_inv,
-            update_memory=update_memory,
-            memory_mode=memory_mode,
-        )
+        g_target = self.engine.transfer(u_inv, target_domain)
+        output = self.decoder(g_target)
+        zero = u_inv.new_tensor(0.0)
+        transfer_truth = _CoreTruth(freq=1.0, conf=1.0)
 
-        source_rotor = self.domain_encoder.get_rotor(source_domain)
-        target_rotor = self.domain_encoder.get_rotor(target_domain)
-
-        output, router_state = self.transfer_engine.transfer(
-            u_mem=u_mem,
-            source_rotor=source_rotor,
-            target_rotor=target_rotor,
-            g_source=g_source,
-            input_is_invariant=input_is_invariant,
-        )
-
-        alignment = router_state.get("alignment", 1.0)
-        conf_val = alignment.item() if isinstance(alignment, torch.Tensor) else alignment
-        transfer_truth = NarsTruth(freq=1.0, conf=conf_val)
-
-        transfer_state = TransferState(
-            g_source=g_source,
-            u_inv=u_inv,
-            u_mem=u_mem,
-            u_route=router_state.get("u_route", u_mem),
-            g_target=router_state["g_target"],
-            output=output,
-            memory_loss=memory_state.loss,
-            memory_retrieved=memory_state.retrieved,
-            memory_updated=memory_state.updated,
-            memory_alpha=memory_state.alpha,
-            memory_eta=memory_state.eta,
-            memory_theta=memory_state.theta,
-            router_state=router_state,
-            memory_mode=memory_mode,
-            update_memory=update_memory,
-            input_is_invariant=input_is_invariant,
-            transfer_truth=transfer_truth,
-        )
-        return output, transfer_state.to_dict()
+        state = {
+            "g_source": g_source,
+            "u_inv": u_inv,
+            "u_mem": u_inv,
+            "u_route": u_inv,
+            "g_target": g_target,
+            "output": output,
+            "memory_loss": zero,
+            "memory_retrieved": None,
+            "memory_updated": False,
+            "memory_alpha": zero,
+            "memory_eta": zero,
+            "memory_theta": zero,
+            "router_state": {"g_target": g_target, "u_route": u_inv},
+            "memory_mode": "none",
+            "update_memory": update_memory,
+            "input_is_invariant": input_is_invariant,
+            "transfer_truth": transfer_truth,
+            "raw_invariant": u_inv,
+            "memory_augmented_invariant": u_inv,
+            "exported_invariant": u_inv,
+            "invariant": u_inv,
+        }
+        return output, state
 
     def forward(
         self,
@@ -261,12 +320,8 @@ class HDIMPipeline(nn.Module):
 
     def reverse_infer(self, u_target, source_domain, target_domain):
         """Counterfactual: what source would produce this target?"""
-        source_rotor = self.domain_rotors[source_domain]
-        target_rotor = self.domain_rotors[target_domain]
-        u_source_est, truth = self.transfer_engine.reverse_transfer(
-            u_target, source_rotor, target_rotor
-        )
-        return u_source_est, truth
+        u_source_est = self.engine.transfer(u_target, source_domain)
+        return u_source_est, _CoreTruth(freq=1.0, conf=1.0)
 
     def add_domain(self, domain_name: str) -> None:
         """Добавляет новый домен в pipeline в runtime.
@@ -274,14 +329,18 @@ class HDIMPipeline(nn.Module):
         Args:
             domain_name: уникальное имя нового домена.
         """
-        self.domain_encoder.add_domain(domain_name)
-        self.domain_names = self.domain_encoder.domain_names
-        # Update backward compat alias
-        self.domain_rotors = self.domain_encoder.domain_rotors
+        if domain_name in self.engine.domain_rotors:
+            raise ValueError(f"Domain {domain_name!r} already exists")
+        self.engine.domain_rotors[domain_name] = DomainRotationOperator(
+            self.algebra,
+            domain_name=domain_name,
+        )
+        self.domain_names.append(domain_name)
+        self.domain_rotors = self.engine.domain_rotors
 
     def reset_memory(self, strategy: str = 'geometric') -> None:
-        """Сбрасывает stateful память."""
-        self.invariant_processor.reset_memory(strategy=strategy)
+        """Сбрасывает compatibility memory placeholder."""
+        self.memory.reset(strategy=strategy)
 
     def compute_isomorphism_loss(
         self,

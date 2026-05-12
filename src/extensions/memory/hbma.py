@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 if TYPE_CHECKING:
-    from src.models.hdim_model import MSAConfig
+    from src.extensions.memory.config import MSAConfig
 from typing import Optional
 
 import torch
@@ -471,8 +471,8 @@ class SemanticMemory(nn.Module):
             if msa_config is not None:
                 cfg = msa_config
             else:
-                from src.models.hdim_model import MSAConfig as _MSAConfig
-                cfg = _MSAConfig()
+                from src.extensions.memory.config import MSAConfig
+                cfg = MSAConfig()
             self.msa_index = MSASparseIndex(
                 dim=hidden_dim,
                 num_prototypes=num_prototypes,

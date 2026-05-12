@@ -23,8 +23,14 @@ from torch.utils.checkpoint import checkpoint
 
 from .hypercomplex import CliffordAlgebra
 from .domain_operators import DomainRotationOperator, sandwich_transfer
-from .moe import MoERouter
-from .memory import NarsTruth
+
+
+class _CoreTruth:
+    """Minimal truth-value placeholder for core transfer metadata."""
+
+    def __init__(self, freq: float = 1.0, conf: float = 1.0):
+        self.freq = freq
+        self.conf = conf
 
 
 class TransferEngine(nn.Module):
@@ -43,6 +49,7 @@ class TransferEngine(nn.Module):
         algebra: CliffordAlgebra,
         num_experts: int = 4,
         top_k: int = 2,
+        router: Optional[nn.Module] = None,
         router_cls: Optional[type] = None,
         z_loss_weight: float = 0.0,
         n_shared_experts: int = 0,
@@ -55,7 +62,8 @@ class TransferEngine(nn.Module):
             algebra: алгебра Клиффорда для операций
             num_experts: количество экспертов MoE
             top_k: топ-k маршрутизации
-            router_cls: класс роутера MoE (None = SoftMoERouter)
+            router: optional MoE router module; None uses identity routing
+            router_cls: optional router class for explicit legacy MoE construction
             z_loss_weight: weight for router z-loss regularization
             n_shared_experts: number of DeepSeek-V3 style shared experts
         """
@@ -66,21 +74,22 @@ class TransferEngine(nn.Module):
         self.output_dim = output_dim
 
         # Import here to avoid circular dependency
-        from .moe import SoftMoERouter
         from .hdim_pipeline import HDIMDecoder
 
-        if router_cls is None:
-            router_cls = SoftMoERouter
-
-        # MoE router: soft routing к доменным экспертам
-        self.moe: MoERouter = router_cls(
-            input_dim=clifford_dim,
-            num_experts=num_experts,
-            expert_dim=clifford_dim * 2,
-            top_k=top_k,
-            z_loss_weight=z_loss_weight,
-            n_shared_experts=n_shared_experts,
-        )
+        if router is not None:
+            self.router: Optional[nn.Module] = router
+        elif router_cls is not None:
+            self.router = router_cls(
+                input_dim=clifford_dim,
+                num_experts=num_experts,
+                expert_dim=clifford_dim * 2,
+                top_k=top_k,
+                z_loss_weight=z_loss_weight,
+                n_shared_experts=n_shared_experts,
+            )
+        else:
+            self.router = None
+        self.moe = self.router
 
         # Decoder: мультивектор -> выход
         self.decoder = HDIMDecoder(clifford_dim, output_dim)
@@ -123,15 +132,18 @@ class TransferEngine(nn.Module):
             output: выходной тензор [B, output_dim]
             router_state: словарь с состоянием MoE router
         """
-        # MoE routing with optional gradient checkpointing
-        if self._use_gradient_checkpointing and self.training:
+        # Optional MoE routing with identity fallback for core mode
+        if self.router is None:
+            u_route = u_mem
+            router_state = {}
+        elif self._use_gradient_checkpointing and self.training:
             result = checkpoint(
-                self.moe, u_mem,
+                self.router, u_mem,
                 use_reentrant=False,
             )
             u_route, router_state = result  # type: ignore[misc]
         else:
-            u_route, router_state = self.moe(u_mem)
+            u_route, router_state = self.router(u_mem)
 
         if g_source is not None:
             R_src_inv = source_rotor.get_inverse()
@@ -181,7 +193,7 @@ class TransferEngine(nn.Module):
         u_target: torch.Tensor,
         source_rotor: DomainRotationOperator,
         target_rotor: DomainRotationOperator,
-    ) -> tuple[torch.Tensor, "NarsTruth"]:
+    ) -> tuple[torch.Tensor, "_CoreTruth"]:
         """Abductive inference: project from target back to source domain.
 
         NARS backward inference: from conclusion to premises.
@@ -198,7 +210,7 @@ class TransferEngine(nn.Module):
         alignment = (self._rotor_quality(source_rotor) * self._rotor_quality(target_rotor)).clamp(0.0, 1.0)
 
         conf_val = alignment.item() if isinstance(alignment, torch.Tensor) else alignment
-        return g_source, NarsTruth(freq=1.0, conf=conf_val)
+        return g_source, _CoreTruth(freq=1.0, conf=conf_val)
 
     def forward(
         self,
@@ -227,9 +239,9 @@ class TransferEngine(nn.Module):
     @property
     def num_experts(self) -> int:
         """Количество экспертов MoE."""
-        return self.moe.num_experts
+        return getattr(self.router, "num_experts", 0)
 
     @property
     def top_k(self) -> int:
         """Топ-k маршрутизации."""
-        return self.moe.top_k
+        return getattr(self.router, "top_k", 0)

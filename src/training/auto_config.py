@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from src.models.hdim_model import HDIMConfig
-    from src.core.moe import MoEKernelConfig
+    from src.extensions.moe import MoEKernelConfig
     from src.training.experiment_config import ExperimentConfig
 
 
@@ -558,7 +558,7 @@ class AutoConfig:
             >>> cfg = AutoConfig(expert_names=["math", "code", "science"])
             >>> moe_cfg = cfg.to_moe_kernel_config(use_shared_expert=False)
         """
-        from src.core.moe import MoEKernelConfig
+        from src.extensions.moe import MoEKernelConfig
         
         return MoEKernelConfig(
             input_dim=self.clifford_dim,

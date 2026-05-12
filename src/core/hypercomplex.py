@@ -11,12 +11,16 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 
+# Compatibility shim: core algebra moved to algebra.py
+from .algebra import CliffordAlgebra as _CliffordAlgebra
+CliffordAlgebra = _CliffordAlgebra
+
 
 # ============================================================
 #  1. CliffordAlgebra — вырожденная алгебра Cl_{p,q,r}(R)
 # ============================================================
 
-class CliffordAlgebra(nn.Module):
+class _LegacyCliffordAlgebra(nn.Module):
     """
     Вырожденная алгебра Клиффорда Cl_{p,q,r}(R).
 

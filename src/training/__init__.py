@@ -1,21 +1,17 @@
-"""Training package for HypercoplexAI — trainers, datasets, and utilities."""
+"""Streamlined HDIM training exports."""
 
-from src.training.experiment_config import ExperimentConfig
-from src.training.trainer import HDIMTrainer
-from src.training.dataset import (
-    DomainProblemDataset,
-    create_demo_dataset,
-    create_group_aware_split,
-    create_paired_demo_dataset,
-    texts_to_tensor,
+from src.training.invariant_losses import (
+    compute_infonce_loss,
+    compute_iso_loss,
+    compute_pair_iso_loss,
 )
+from src.training.invariant_trainer import InvariantTrainer
+from src.training.trainer import HDIMTrainer
 
 __all__ = [
-    "ExperimentConfig",
+    "InvariantTrainer",
+    "compute_iso_loss",
+    "compute_pair_iso_loss",
+    "compute_infonce_loss",
     "HDIMTrainer",
-    "DomainProblemDataset",
-    "create_demo_dataset",
-    "create_group_aware_split",
-    "create_paired_demo_dataset",
-    "texts_to_tensor",
 ]

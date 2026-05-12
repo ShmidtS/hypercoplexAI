@@ -11,6 +11,7 @@
 import pytest
 import torch
 
+from src.core.engine import HDIMCoreEngine
 from src.core.hdim_pipeline import HDIMPipeline, HDIMEncoder, HDIMDecoder, TransferState
 
 
@@ -45,6 +46,7 @@ class TestPipelineInit:
         # Проверка размерностей
         assert pipeline.clifford_dim == pipeline.algebra.dim
         assert pipeline.memory_type == "titans"
+        assert isinstance(pipeline.engine, HDIMCoreEngine)
 
         # Проверка наличия компонентов
         assert hasattr(pipeline, 'encoder')
@@ -53,6 +55,9 @@ class TestPipelineInit:
         assert hasattr(pipeline, 'invariant_extractor')
         assert hasattr(pipeline, 'moe')
         assert hasattr(pipeline, 'memory')
+        assert pipeline.encoder is pipeline.engine.encoder
+        assert pipeline.domain_rotors is pipeline.engine.domain_rotors
+        assert pipeline.invariant_extractor is pipeline.engine.extractor
 
         # Проверка доменов
         assert len(pipeline.domain_names) == 2
@@ -207,9 +212,9 @@ class TestPipelineMemoryModes:
             update_memory=False,
         )
 
-        # Память не должна обновиться
+        # Core mode ignores legacy memory modes.
         assert state["memory_updated"] is False
-        assert state["memory_mode"] == "retrieve"
+        assert state["memory_mode"] == "none"
 
     def test_pipeline_memory_modes_update(self, pipeline, sample_input):
         """Режим памяти 'update' — чтение и запись."""
@@ -222,9 +227,9 @@ class TestPipelineMemoryModes:
             update_memory=True,
         )
 
-        # Память должна обновиться
-        assert state["memory_updated"] is True
-        assert state["memory_mode"] == "update"
+        # Core mode ignores legacy memory modes.
+        assert state["memory_updated"] is False
+        assert state["memory_mode"] == "none"
 
     def test_pipeline_memory_modes_invalid(self, pipeline, sample_input):
         """Неверный режим памяти вызывает ошибку."""

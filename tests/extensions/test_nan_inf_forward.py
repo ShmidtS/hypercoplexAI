@@ -20,8 +20,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.hypercomplex import CliffordAlgebra
-from src.core.moe import SoftMoERouter
-from src.core.memory import SemanticMemory, HBMAMemory
+from src.extensions.moe import SoftMoERouter
+from src.extensions.memory import SemanticMemory, HBMAMemory
 from src.models.hdim_model import HDIMModel, HDIMConfig
 
 def _cuda_usable():

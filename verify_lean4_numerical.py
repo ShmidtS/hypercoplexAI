@@ -4,8 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from src.core.hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
 from src.core.domain_operators import DomainRotationOperator, sandwich_transfer, InvariantExtractor
-from src.core.memory import TitansMemory, HBMAMemory, WorkingMemory, SemanticMemory, MemoryResult
-from src.core.moe import SoftMoERouter
+from src.extensions.memory import TitansMemory, HBMAMemory, WorkingMemory, SemanticMemory, MemoryResult
+from src.extensions.moe import SoftMoERouter
 from src.models.hdim_model import HDIMPipeline
 
 def make_plane_rotor(ca, i, j, angle):
@@ -664,7 +664,7 @@ results.append(('matryoshka_nesting', status))
 
 # ===== 35. HBMA forward shape preservation and gradient flow =====
 print('\n--- 35. hbma_forward_shape_and_grad ---')
-from src.core.memory import HBMAMemory
+from src.extensions.memory import HBMAMemory
 mem = HBMAMemory(hidden_dim=64, ep_slots=8, sem_prototypes=8, proc_patterns=4)
 mem.train()
 x = torch.randn(2, 64)
@@ -1007,7 +1007,7 @@ results.append(('bivector_exp_general', status))
 
 # ===== 48. z_loss regularization: non-negative and differentiable =====
 print('\n--- 48. z_loss_regularization ---')
-from src.core.moe import SoftMoERouter
+from src.extensions.moe import SoftMoERouter
 all_ok = True
 torch.manual_seed(42)
 router = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128, z_loss_weight=0.01)
@@ -1044,7 +1044,7 @@ results.append(('sandwich_norm_Cl310_hp', status))
 
 # ===== 50. HBMA memory_loss gradient flow =====
 print('\n--- 50. hbma_memory_loss_gradient_flow ---')
-from src.core.memory import HBMAMemory
+from src.extensions.memory import HBMAMemory
 all_ok = True
 for _ in range(5):
     mem = HBMAMemory(hidden_dim=64, ep_slots=8, sem_prototypes=8, proc_patterns=4)
@@ -1299,7 +1299,7 @@ results.append(('grade_projection_idempotent', status))
 
 # ===== 63. SoftMoE: dispatch/combine weight normalization =====
 print('\n--- 63. soft_moe_dispatch_combine_normalize ---')
-from src.core.moe import SoftMoERouter
+from src.extensions.moe import SoftMoERouter
 moe = SoftMoERouter(input_dim=64, num_experts=4, expert_dim=128)
 x = torch.randn(8, 64)
 dispatch, combine, _z_loss = moe._compute_dispatch_combine(x)
@@ -1356,7 +1356,7 @@ results.append(('bivector_eiej_square_negative', status))
 
 # ===== 67. Titans memory: state update changes output =====
 print('\n--- 67. titans_memory_state_update ---')
-from src.core.memory import TitansMemory
+from src.extensions.memory import TitansMemory
 mem = TitansMemory(clifford_dim=32, memory_key_dim=16, hidden_dim=32)
 x = torch.randn(4, 32)
 r1 = mem(x, update_memory=True)
@@ -1427,7 +1427,7 @@ results.append(('matryoshka_nested_quality', status))
 
 # ===== 72. HBMA: working memory FIFO capacity =====
 print('\n--- 72. hbma_working_memory_capacity ---')
-from src.core.memory import HBMAMemory
+from src.extensions.memory import HBMAMemory
 mem = HBMAMemory(hidden_dim=32)
 x = torch.randn(1, 32)
 for i in range(20):
@@ -1636,7 +1636,7 @@ results.append(('infoNCE_lower_bound', status))
 # ===== 83. SoftMoE expert orthogonality loss >= 0 =====
 print('\n--- 83. soft_moe_orthogonality_bound ---')
 all_ok = True
-from src.core.moe import SoftMoERouter
+from src.extensions.moe import SoftMoERouter
 for n_experts in [2, 4, 8]:
     router = SoftMoERouter(input_dim=64, num_experts=n_experts)
     for _ in range(10):
@@ -2371,7 +2371,7 @@ results.append(('hbma_working_slot_reuse', status))
 
 # ===== 116. MoEKernel: combine weights sum to 1 =====
 print('\n--- 116. moe_kernel_combine_sums_to_one ---')
-from src.core.moe import MoEKernel, MoEKernelConfig
+from src.extensions.moe import MoEKernel, MoEKernelConfig
 all_ok = True
 torch.manual_seed(1160)
 cfg116 = MoEKernelConfig(
@@ -2546,7 +2546,7 @@ results.append(('moe_kernel_seq_input', status))
 
 # ===== 126. MoEKernel: domain expert type consistency =====
 print('\n--- 126. moe_kernel_expert_types ---')
-from src.core.moe import MLPExpert as MLPExpert126
+from src.extensions.moe import MLPExpert as MLPExpert126
 all_ok = True
 torch.manual_seed(1260)
 k126 = MoEKernel(cfg116)

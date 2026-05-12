@@ -1,771 +1,432 @@
-"""HDIM (Hypercomplex Domain-Invariant Model) — full PyTorch model definition.
-
-This model wraps the full HDIMPipeline from src.core with a dataclass-based
-configuration interface and adds integer-indexed domain routing for use in
-batch training scenarios.
-"""
+"""HDIM model adapter over the core engine."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from src.core.domain_operators import DomainIndexEmbedding
-from src.core.hdim_pipeline import HDIMPipeline
-from src.core.per_domain_lora import PerDomainLoRA
-from src.models.config import HDIMConfig, HDIMRuntimeConfig, HDIMTextConfig, MSAConfig
-from src.models.results import CoreResult, ForwardResult
+from src.core.engine import CoreEngineConfig, HDIMCoreEngine
+from src.core.rotors import DomainRotationOperator
+from src.models.config import HDIMConfig, HDIMRuntimeConfig, HDIMTextConfig
+from src.models.results import CoreResult, ForwardResult, HDIMAuxState
+
+__all__ = ["CoreResult", "ForwardResult", "HDIMAuxState", "HDIMModel", "HDIMModelCore", "HDIMTextConfig"]
 
 
-@dataclass(frozen=True)
-class HDIMAuxState:
-    """Typed lifecycle state exported by HDIMModel public paths."""
+class _CoreMoEShim(nn.Module):
+    """Minimal legacy MoE surface for compatibility only."""
 
-    memory_loss: torch.Tensor
-    router_loss: torch.Tensor
-    raw_invariant: torch.Tensor
-    memory_augmented_invariant: torch.Tensor
-    exported_invariant: torch.Tensor
-    training_invariant: torch.Tensor
-    routing_weights: torch.Tensor
-    topk_idx: torch.Tensor
-    topk_gate_weights: torch.Tensor
-    train_scores_snapshot: torch.Tensor
-    expert_usage: torch.Tensor
-    routing_entropy: torch.Tensor
-    z_loss: torch.Tensor
-    memory_updated: bool
-    memory_mode: str
-    update_memory: bool
-    hallucination_risk: float = 0.0
-    memory_surprise: float | None = None
-    feedback_action: str | None = None  # Phase 33: Hallucination feedback action
-    online_loss: Optional[torch.Tensor] = None  # Phase 31: Online learning loss
-    online_updated: bool = False  # Phase 31: Whether online update fired
+    def __init__(self, num_experts: int, top_k: int) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = min(top_k, num_experts)
+        self.expert_names = [f"expert_{i}" for i in range(num_experts)]
+        self.slots_per_expert = 1
+        self.register_buffer("train_scores", torch.full((num_experts,), 1.0 / num_experts))
 
-    def to_dict(self) -> Dict[str, Union[torch.Tensor, bool, str, float, None]]:
-        return {
-            "memory_loss": self.memory_loss,
-            "router_loss": self.router_loss,
-            "raw_invariant": self.raw_invariant,
-            "memory_augmented_invariant": self.memory_augmented_invariant,
-            "exported_invariant": self.exported_invariant,
-            "training_invariant": self.training_invariant,
-            "routing_weights": self.routing_weights,
-            "topk_idx": self.topk_idx,
-            "topk_gate_weights": self.topk_gate_weights,
-            "train_scores_snapshot": self.train_scores_snapshot,
-            "expert_usage": self.expert_usage,
-            "routing_entropy": self.routing_entropy,
-            "z_loss": self.z_loss,
-            "memory_updated": self.memory_updated,
-            "memory_mode": self.memory_mode,
-            "update_memory": self.update_memory,
-            "hallucination_risk": self.hallucination_risk,
-            "memory_surprise": self.memory_surprise,
-            "feedback_action": self.feedback_action,
-            "online_loss": self.online_loss,
-            "online_updated": self.online_updated,
+    def forward(self, u_inv: torch.Tensor) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        gate_weights = u_inv.new_full((u_inv.shape[0], self.num_experts), 1.0 / self.num_experts)
+        topk_idx = torch.arange(self.top_k, device=u_inv.device, dtype=torch.long).expand(u_inv.shape[0], -1)
+        topk_gate_weights = u_inv.new_full((u_inv.shape[0], self.top_k), 1.0 / self.top_k)
+        zero = u_inv.new_tensor(0.0)
+        return u_inv, {
+            "gate_weights": gate_weights,
+            "topk_idx": topk_idx,
+            "topk_gate_weights": topk_gate_weights,
+            "router_loss": zero,
+            "z_loss": zero,
+            "routing_entropy": zero,
+            "train_scores_snapshot": self.train_scores.to(device=u_inv.device, dtype=u_inv.dtype),
+            "expert_usage": self.train_scores.to(device=u_inv.device, dtype=u_inv.dtype),
         }
 
+    def enable_aux_loss_free(self, aux_lr: float = 0.01) -> None:
+        return None
 
-class HDIMModel(nn.Module):
-    """Hypercomplex Domain-Invariant Model (HDIM).
+    def enable_expert_ortho(self) -> None:
+        return None
 
-    Wraps HDIMPipeline from src.core and exposes an integer-indexed domain
-    interface suitable for batch training. Domain indices map to the named
-    domain rotors registered inside the pipeline.
+    def expert_orthogonalization_loss(self) -> torch.Tensor:
+        return self.train_scores.new_tensor(0.0)
 
-    Forward returns (output, routing_weights, invariant) where invariant is
-    the hidden-dim projection of the canonical training invariant.
 
-    Phase 31: Supports self-evolution via OnlineLearner when config.runtime.online_learning=True.
-    """
+class _CoreMemoryShim(nn.Module):
+    """Minimal legacy memory surface for compatibility only."""
+
+    def __init__(self, clifford_dim: int) -> None:
+        super().__init__()
+        self.memory = nn.Embedding(1, clifford_dim)
+        nn.init.zeros_(self.memory.weight)
+        self.register_buffer("momentum_S", torch.zeros(1, clifford_dim))
+        self.use_gradient_surprise = False
+        self.use_adaptive_forgetting = False
+
+    def reset(self, strategy: str = "geometric") -> None:
+        self.memory.weight.data.zero_()
+        self.momentum_S.zero_()
+
+
+class _HDIMPipelineFacade(nn.Module):
+    """Lightweight pipeline compatibility facade backed by HDIMCoreEngine."""
+
+    def __init__(
+        self,
+        *,
+        engine: HDIMCoreEngine,
+        decoder: nn.Module,
+        domain_names: list[str],
+        num_experts: int,
+        top_k: int,
+    ) -> None:
+        super().__init__()
+        self.engine = engine
+        self.decoder = decoder
+        self.domain_names = domain_names
+        self.algebra = engine.algebra
+        self.clifford_dim = engine.algebra.dim
+        self.encoder = engine.encoder
+        self.domain_rotors = engine.domain_rotors
+        self.invariant_extractor = engine.extractor
+        self.invariant_norm = nn.Identity()
+        self.invariant_index = engine.index
+        self.memory_type = "none"
+        self.moe = _CoreMoEShim(num_experts=num_experts, top_k=top_k)
+        self.memory = _CoreMemoryShim(self.clifford_dim)
+        self._use_gradient_checkpointing = False
+
+    def transfer(
+        self,
+        x: torch.Tensor,
+        source_domain: str,
+        target_domain: str,
+        *,
+        update_memory: bool = True,
+        memory_mode: str = "update",
+        input_is_invariant: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Transfer a batch from source to target domain.
+
+        Args:
+            x: Input encodings or invariants with shape (batch, hidden_dim|clifford_dim).
+            source_domain: Domain name used to extract invariants when x is encoded input.
+            target_domain: Domain name used to export invariants before decoding.
+        """
+        if memory_mode not in {"none", "retrieve", "update"}:
+            raise ValueError(f"Unsupported memory_mode: {memory_mode}")
+        if input_is_invariant:
+            g_source = None
+            u_inv = x
+        else:
+            g_source = self.engine.encode(x)
+            u_inv = self.engine.extract(g_source, source_domain)
+        g_target = self.engine.transfer(u_inv, target_domain)
+        output = self.decoder(g_target)
+        zero = u_inv.new_tensor(0.0)
+        return output, {
+            "g_source": g_source,
+            "u_inv": u_inv,
+            "u_mem": u_inv,
+            "u_route": g_target,
+            "g_target": g_target,
+            "output": output,
+            "memory_loss": zero,
+            "memory_updated": False,
+            "memory_mode": "none",
+            "update_memory": False,
+            "input_is_invariant": input_is_invariant,
+            "raw_invariant": u_inv,
+            "memory_augmented_invariant": u_inv,
+            "exported_invariant": g_target,
+            "invariant": g_target,
+            "router_state": {
+                "router_loss": zero,
+                "z_loss": zero,
+                "routing_entropy": zero,
+                "topk_idx": torch.empty(u_inv.shape[0], 0, device=u_inv.device, dtype=torch.long),
+                "topk_gate_weights": u_inv.new_zeros(u_inv.shape[0], 0),
+                "train_scores_snapshot": u_inv.new_zeros(0),
+                "expert_usage": u_inv.new_zeros(0),
+            },
+        }
+
+    def forward(self, x: torch.Tensor, source_domain: str = "source", target_domain: str = "target", **kwargs: Any):
+        return self.transfer(x, source_domain, target_domain, **kwargs)
+
+    def encode_domain(self, x: torch.Tensor, domain_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        g_source = self.engine.encode(x)
+        return g_source, self.engine.extract(g_source, domain_name)
+
+    def add_domain(self, domain_name: str) -> None:
+        if domain_name in self.engine.domain_rotors:
+            raise ValueError(f"Domain {domain_name!r} already exists")
+        self.engine.domain_rotors[domain_name] = DomainRotationOperator(self.algebra, domain_name=domain_name)
+        self.domain_names.append(domain_name)
+
+    def reset_memory(self, strategy: str = "geometric") -> None:
+        self.memory.reset(strategy=strategy)
+
+    def enable_gradient_checkpointing(self) -> None:
+        self._use_gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self) -> None:
+        self._use_gradient_checkpointing = False
+
+
+class HDIMModelCore(nn.Module):
+    """Thin adapter around HDIMCoreEngine."""
 
     def __init__(self, config: HDIMConfig) -> None:
         super().__init__()
         self.config = config
         self._domain_names: List[str] = config.get_domain_names()
-
-        msa_config = None
-        if config.memory.msa is not None:
-            msa_config = {
-                'num_prototypes': config.memory.msa.num_prototypes,
-                'top_k': config.memory.msa.top_k,
-                'chunk_size': config.memory.msa.chunk_size,
-                'num_heads': config.memory.msa.num_heads,
-                'temperature': config.memory.msa.temperature,
-                'ema_momentum': config.memory.msa.ema_momentum,
-                'overflow_capacity': config.memory.msa.overflow_capacity,
-                'max_hops': config.memory.msa.max_hops,
-                'interleave_threshold': config.memory.msa.interleave_threshold,
-                'compression_threshold': config.memory.msa.compression_threshold,
-                'diversity_loss_weight': config.memory.msa.diversity_loss_weight,
-            }
-
-        self.pipeline = HDIMPipeline(
-            input_dim=config.hidden_dim,
-            output_dim=config.hidden_dim,
-            clifford_p=config.clifford_p,
-            clifford_q=config.clifford_q,
-            clifford_r=config.clifford_r,
-            domain_names=self._domain_names,
-            num_experts=config.moe.num_experts,
-            top_k=config.moe.top_k,
-            memory_key_dim=config.memory.memory_key_dim,
-            memory_type=config.memory.memory_type,
-            msa_config=msa_config,
-            z_loss_weight=config.moe.z_loss_weight,
-            n_shared_experts=config.moe.n_shared_experts,
+        self.engine = HDIMCoreEngine(
+            CoreEngineConfig(
+                input_dim=config.hidden_dim,
+                clifford_p=config.clifford_p,
+                clifford_q=config.clifford_q,
+                clifford_r=config.clifford_r,
+                domain_names=tuple(self._domain_names),
+                dropout=config.dropout,
+            )
         )
-        if config.memory.use_gradient_surprise and hasattr(self.pipeline.memory, 'use_gradient_surprise'):
-            self.pipeline.memory.use_gradient_surprise = True
-        if config.memory.use_adaptive_forgetting and hasattr(self.pipeline.memory, 'use_adaptive_forgetting'):
-            self.pipeline.memory.use_adaptive_forgetting = True
-        if config.moe.use_aux_loss_free and hasattr(self.pipeline.moe, 'enable_aux_loss_free'):
-            self.pipeline.moe.enable_aux_loss_free(aux_lr=config.moe.aux_lr)
-        if config.moe.use_expert_ortho and hasattr(self.pipeline.moe, 'enable_expert_ortho'):
-            self.pipeline.moe.enable_expert_ortho()
+        clifford_dim = self.engine.algebra.dim
+        self.decoder = nn.Linear(clifford_dim, config.hidden_dim)
 
-        self.dropout = nn.Dropout(config.dropout)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.engine.encode(x)
+
+    def extract(self, g: torch.Tensor, domain: str) -> torch.Tensor:
+        return self.engine.extract(g, domain)
+
+    def match(self, invariant: torch.Tensor, expert_base: Any = None) -> list[list[Any]]:
+        return self.engine.match(invariant, expert_base=expert_base)
+
+    def transfer(self, *args: Any, **kwargs: Any) -> Any:
+        invariant, target_domain = args[:2]
+        return self.engine.transfer(invariant, target_domain)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Encode and transfer input encodings.
+
+        Args:
+            x: Input tensor with shape (batch, hidden_dim).
+            source_domain: Domain name used for invariant extraction.
+            target_domain: Domain name used for invariant export.
+        """
+        x = args[0]
+        source_domain = args[1] if len(args) > 1 else kwargs.get("source_domain", "source")
+        target_domain = args[2] if len(args) > 2 else kwargs.get("target_domain", "target")
+        if not isinstance(source_domain, str):
+            raise TypeError("HDIMModelCore.forward expects source_domain as a domain name")
+        g_source = self.encode(x)
+        raw_invariant = self.extract(g_source, source_domain)
+        matches = self.match(raw_invariant)
+        exported_invariant = self.transfer(raw_invariant, target_domain)
+        return CoreResult(
+            output=self.decoder(exported_invariant),
+            raw_invariant=raw_invariant,
+            exported_invariant=exported_invariant,
+            matches=matches,
+            routing_weights=x.new_zeros(x.shape[0], self.config.num_experts),
+            slot_outputs=None,
+        )
+
+
+class HDIMModel(nn.Module):
+    """Compatibility HDIMModel with deprecated facade helpers."""
+
+    def __init__(self, config: HDIMConfig) -> None:
+        super().__init__()
+        self._core = HDIMModelCore(config)
+        self.config = config
+        clifford_dim = self.engine.algebra.dim
+        self.training_inv_head = nn.Linear(clifford_dim, config.hidden_dim)
         self.domain_embedding: Optional[DomainIndexEmbedding] = None
         if config.use_domain_embedding:
-            self.domain_embedding = DomainIndexEmbedding(
-                dim=config.hidden_dim, max_domains=config.num_domains,
-            )
-        clifford_dim = self.pipeline.clifford_dim
-        self.domain_lora: Optional[PerDomainLoRA] = None
-        if config.use_domain_lora:
-            self.domain_lora = PerDomainLoRA(
-                dim=clifford_dim, rank=config.domain_lora_rank,
-                num_domains=config.num_domains,
-            )
-        self.training_inv_head = nn.Linear(clifford_dim, config.hidden_dim)
+            self.domain_embedding = DomainIndexEmbedding(dim=config.hidden_dim, max_domains=config.num_domains)
 
-        # Phase 31: Online Learner for self-evolution (uses moe output dimension)
+        runtime = config.runtime
+        self.extension_flags = {
+            "online_learning": bool(runtime.online_learning),
+            "hallucination_detection": bool(runtime.hallucination_detection),
+            "hallucination_feedback": bool(runtime.hallucination_feedback),
+            "domain_lora": bool(config.use_domain_lora),
+        }
         self.online_learner = None
-        if config.runtime.online_learning:
-            from src.core.online_learner import OnlineLearner, GradientMode
-            # Parse gradient mode from string
-            gradient_mode = GradientMode(config.runtime.online_gradient_mode)
-            self.online_learner = OnlineLearner(
-                hidden_dim=clifford_dim,
-                num_experts=config.moe.num_experts or 4,
-                replay_buffer_size=config.runtime.online_replay_size,
-                surprise_threshold=config.runtime.online_surprise_threshold,
-                ttt_lr=config.runtime.online_ttt_lr,
-                gradient_mode=gradient_mode,
-                gradient_scale=config.runtime.online_gradient_scale,
-            )
-
-        # Phase 32: Hallucination Detector (optional)
         self.hallucination_detector = None
-        if config.runtime.hallucination_detection:
-            from src.core.hallucination_detector import HallucinationDetector
-            self.hallucination_detector = HallucinationDetector(
-                num_experts=config.moe.num_experts or 4,
-                hidden_dim=clifford_dim,
-                risk_threshold=config.runtime.hallucination_risk_threshold,
-            )
-
-
-        # Phase 33: Hallucination Feedback Loop (optional)
         self.hallucination_feedback_loop = None
-        if config.runtime.hallucination_feedback:
-            from src.core.hallucination_feedback import HallucinationFeedbackLoop
-            # Get expert names from pipeline MoE
-            expert_names = config.expert_names or [f"expert_{i}" for i in range(config.moe.num_experts or 4)]
-            self.hallucination_feedback_loop = HallucinationFeedbackLoop(
-                expert_names=expert_names,
-                enabled=True,
+        if runtime.hallucination_feedback:
+            from src.extensions.hallucination.feedback import HallucinationFeedbackConfig
+
+            feedback_config = runtime.hallucination_feedback_config or {}
+            expert_names = config.expert_names or [f"expert_{i}" for i in range(config.num_experts)]
+            self.hallucination_feedback_loop = HallucinationFeedbackConfig(**feedback_config).create_feedback_loop(expert_names)
+        self.domain_lora = None
+        self._pipeline: _HDIMPipelineFacade | None = None
+
+    @property
+    def engine(self) -> HDIMCoreEngine:
+        return self._core.engine
+
+    @property
+    def decoder(self) -> nn.Linear:
+        return self._core.decoder
+
+    @property
+    def _domain_names(self) -> List[str]:
+        return self._core._domain_names
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self._core.encode(x)
+
+    def extract(self, g: torch.Tensor, domain: str) -> torch.Tensor:
+        return self._core.extract(g, domain)
+
+    def match(self, invariant: torch.Tensor, expert_base: Any = None) -> list[list[Any]]:
+        return self._core.match(invariant, expert_base=expert_base)
+
+    @property
+    def pipeline(self) -> _HDIMPipelineFacade:
+        if self._pipeline is None:
+            self._pipeline = _HDIMPipelineFacade(
+                engine=self.engine,
+                decoder=self.decoder,
+                domain_names=self._domain_names,
+                num_experts=self.config.num_experts,
+                top_k=self.config.top_k,
             )
-        # Rotor stacks rebuild each forward (requires_grad rotors need fresh graph)
-        # Eval-mode cache avoids redundant rebuilds when parameters are static
-        self._cached_rotors_n: Optional[torch.Tensor] = None
-        self._cached_rotors_inv: Optional[torch.Tensor] = None
-        self._rotor_cache_param_version: int = -1
+        return self._pipeline
 
     def _domain_idx_to_name(self, domain_idx: int) -> str:
-        """Convert an integer domain index to its registered name."""
         if domain_idx < 0 or domain_idx >= len(self._domain_names):
-            raise IndexError(
-                f"domain_idx {domain_idx} out of range [0, {len(self._domain_names)})."
-            )
+            raise IndexError(f"domain_idx {domain_idx} out of range [0, {len(self._domain_names)}).")
         return self._domain_names[domain_idx]
 
-    def _resolve_runtime_config(
-        self,
-        *,
-        update_memory: bool,
-        memory_mode: str,
-    ) -> HDIMRuntimeConfig:
+    def _resolve_runtime_config(self, *, update_memory: bool, memory_mode: str) -> HDIMRuntimeConfig:
         if memory_mode not in {"none", "retrieve", "update"}:
             raise ValueError(f"Unsupported memory_mode: {memory_mode}")
-        if memory_mode != "update":
-            update_memory = False
-        return HDIMRuntimeConfig(
-            update_memory=update_memory,
-            memory_mode=memory_mode,
-        )
+        return HDIMRuntimeConfig(update_memory=False, memory_mode="none" if memory_mode != "retrieve" else "retrieve")
 
-    def _build_aux_state(
-        self,
-        *,
-        raw_invariant: torch.Tensor,
-        memory_augmented_invariant: torch.Tensor,
-        exported_invariant: torch.Tensor,
-        routing_weights: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_gate_weights: torch.Tensor,
-        train_scores_snapshot: torch.Tensor,
-        expert_usage: torch.Tensor,
-        routing_entropy: torch.Tensor,
-        memory_loss: torch.Tensor,
-        router_loss: torch.Tensor,
-        z_loss: torch.Tensor,
-        memory_updated: bool,
-        runtime: HDIMRuntimeConfig,
-        hallucination_risk: float = 0.0,
-        memory_surprise: float | None = None,
-        feedback_action: str | None = None,
-        online_loss: torch.Tensor | None = None,
-        online_updated: bool = False,
-    ) -> HDIMAuxState:
-        return HDIMAuxState(
-            memory_loss=memory_loss,
-            router_loss=router_loss,
-            raw_invariant=raw_invariant,
-            memory_augmented_invariant=memory_augmented_invariant,
-            exported_invariant=exported_invariant,
-            training_invariant=self.training_inv_head(exported_invariant),
-            routing_weights=routing_weights,
-            topk_idx=topk_idx,
-            topk_gate_weights=topk_gate_weights,
-            train_scores_snapshot=train_scores_snapshot,
-            expert_usage=expert_usage,
-            routing_entropy=routing_entropy,
-            z_loss=z_loss,
-            memory_updated=memory_updated,
-            memory_mode=runtime.memory_mode,
-            update_memory=runtime.update_memory,
-            hallucination_risk=hallucination_risk,
-            memory_surprise=memory_surprise,
-            feedback_action=feedback_action,
-            online_loss=online_loss,
-            online_updated=online_updated,
-        )
-
-    def _build_aux_state_from_transfer_state(
-        self,
-        transfer_state: Dict[
-            str, Union[torch.Tensor, bool, str, Dict[str, torch.Tensor]]
-        ],
-        *,
-        runtime: HDIMRuntimeConfig,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> HDIMAuxState:
-        router_state = transfer_state["router_state"]
-        return self._build_aux_state(
-            raw_invariant=transfer_state["raw_invariant"].to(
-                device=device, dtype=dtype
-            ),
-            memory_augmented_invariant=transfer_state["memory_augmented_invariant"].to(
-                device=device, dtype=dtype
-            ),
-            exported_invariant=transfer_state["exported_invariant"].to(
-                device=device, dtype=dtype
-            ),
-            routing_weights=transfer_state["routing_weights"].to(
-                device=device, dtype=dtype
-            ),
-            topk_idx=router_state["topk_idx"].to(device=device),
-            topk_gate_weights=router_state["topk_gate_weights"].to(
-                device=device, dtype=dtype
-            ),
-            train_scores_snapshot=router_state["train_scores_snapshot"].to(
-                device=device, dtype=dtype
-            ),
-            expert_usage=router_state["expert_usage"].to(device=device, dtype=dtype),
-            routing_entropy=router_state["routing_entropy"].to(
-                device=device, dtype=dtype
-            ),
-            memory_loss=transfer_state["memory_loss"].to(device=device, dtype=dtype),
-            router_loss=router_state["router_loss"].to(device=device, dtype=dtype),
-            z_loss=router_state.get(
-                "z_loss", torch.zeros((), device=device, dtype=dtype)
-            ).to(device=device, dtype=dtype),
-            memory_updated=bool(transfer_state["memory_updated"]),
-            runtime=runtime,
-        )
-
-    def _allocate_state_tensors(
-        self,
-        *,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        raw_invariant = torch.zeros(
-            batch_size, self.pipeline.clifford_dim, device=device, dtype=dtype,
-        )
-        memory_augmented_invariant = torch.zeros(
-            batch_size, self.pipeline.clifford_dim, device=device, dtype=dtype,
-        )
-        exported_invariant = torch.zeros(
-            batch_size, self.pipeline.clifford_dim, device=device, dtype=dtype,
-        )
-        _num_experts = self.pipeline.moe.num_experts
-        _top_k = self.pipeline.moe.top_k
-        routing_weights = torch.zeros(
-            batch_size, _num_experts, device=device, dtype=dtype,
-        )
-        topk_idx = torch.zeros(
-            batch_size, _top_k, device=device, dtype=torch.long,
-        )
-        topk_gate_weights = torch.zeros(
-            batch_size, _top_k, device=device, dtype=dtype,
-        )
-        return (
-            raw_invariant,
-            memory_augmented_invariant,
-            exported_invariant,
-            routing_weights,
-            topk_idx,
-            topk_gate_weights,
-        )
-
-    def _build_rotor_stacks(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build stacked normalized and inverse rotor tensors for all domains.
-
-        Rebuilt each forward pass to ensure correct autograd flow into
-        domain rotor parameters.
-        """
-        pipeline = self.pipeline
-        rotors_n = torch.stack(
-            [pipeline.domain_rotors[self._domain_names[i]]._normalized_R()
-             for i in range(len(self._domain_names))]
-        )
-        rotors_inv = torch.stack(
-            [pipeline.domain_rotors[self._domain_names[i]].get_inverse()
-             for i in range(len(self._domain_names))]
-        )
-        return rotors_n, rotors_inv
-
-    def _current_rotor_version(self) -> int:
-        """Hash of all rotor parameter versions for cache invalidation."""
-        pipeline = self.pipeline
-        return sum(
-            pipeline.domain_rotors[name].R._version
-            for name in self._domain_names
-        )
-
-    def _clear_rotor_cache(self) -> None:
-        """Invalidate cached rotor stacks (e.g. on mode switch)."""
-        self._cached_rotors_n = None
-        self._cached_rotors_inv = None
-        self._rotor_cache_param_version = -1
-
-    def _get_rotor_stacks(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return rotor stacks, caching in eval mode when parameters are unchanged."""
-        if self.training:
-            return self._build_rotor_stacks()
-        current_version = self._current_rotor_version()
-        if (self._cached_rotors_n is not None
-                and self._rotor_cache_param_version == current_version):
-            return self._cached_rotors_n, self._cached_rotors_inv
-        rotors_n, rotors_inv = self._build_rotor_stacks()
-        self._cached_rotors_n = rotors_n
-        self._cached_rotors_inv = rotors_inv
-        self._rotor_cache_param_version = current_version
-        return rotors_n, rotors_inv
-
-    def train(self, mode: bool = True):
-        """Switch training mode, clearing rotor cache on transitions."""
-        super().train(mode)
-        self._clear_rotor_cache()
-        return self
+    def _validate_domain_ids(self, domain_id: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
+        if domain_id.ndim != 1:
+            raise ValueError(f"{name} must be 1D, got shape {tuple(domain_id.shape)}")
+        if domain_id.numel() != batch_size:
+            raise ValueError(f"{name} length {domain_id.numel()} must match batch size {batch_size}")
+        domain_id = domain_id.to(dtype=torch.long)
+        if domain_id.numel() > 0 and ((domain_id < 0).any() or (domain_id >= self.config.num_domains).any()):
+            raise IndexError(f"{name} values must be in [0, {self.config.num_domains})")
+        return domain_id
 
     def _forward_core(
         self,
         x: torch.Tensor,
-        R_inv_extractor: torch.Tensor,
-        R_extractor: torch.Tensor,
-        R_transfer: torch.Tensor,
-        R_transfer_inv: torch.Tensor,
-        group_masks: List[torch.Tensor],
-        runtime: HDIMRuntimeConfig,
-        domain_id: Optional[torch.Tensor] = None,
+        source_domain: str = "source",
+        target_domain: str = "target",
     ) -> CoreResult:
-        """Shared core for forward and transfer_pairs.
-
-        Runs encode, invariant extraction, memory, MoE routing, transfer, decode.
-
-        Args:
-            x: Input tensor (batch_size, hidden_dim).
-            R_inv_extractor: Inverse rotor for invariant extraction (per-sample).
-            R_extractor: Forward rotor for invariant extraction (per-sample).
-            R_transfer: Forward rotor for domain transfer (per-sample).
-            R_transfer_inv: Inverse rotor for domain transfer (per-sample).
-            group_masks: Boolean masks defining MoE routing groups.
-            runtime: Memory lifecycle configuration.
-        """
-        batch_size = x.shape[0]
-        device, dtype = x.device, x.dtype
-        pipeline = self.pipeline
-
-        output = torch.empty_like(x)
-        (
-            raw_invariant, memory_augmented_invariant, exported_invariant,
-            routing_weights, topk_idx, topk_gate_weights,
-        ) = self._allocate_state_tensors(batch_size=batch_size, device=device, dtype=dtype)
-
-        _num_experts = pipeline.moe.num_experts
-        train_scores_snapshot = torch.zeros(_num_experts, device=device, dtype=dtype)
-        expert_usage = torch.zeros(_num_experts, device=device, dtype=dtype)
-
-        # 1) Encode
-        g_source = pipeline.encoder(x)
-
-        # 2) Invariant extraction
-        step1 = pipeline.algebra.geometric_product(R_inv_extractor, g_source)
-        u_inv = pipeline.algebra.geometric_product(step1, R_extractor)
-        u_inv = pipeline.invariant_norm(u_inv)
-
-        # 3) Memory
-        u_mem, memory_state = pipeline._apply_memory(
-            u_inv,
-            update_memory=runtime.update_memory,
-            memory_mode=runtime.memory_mode,
+        g_source = self._core.encode(x)
+        raw_invariant = self._core.extract(g_source, source_domain)
+        matches = self._core.match(raw_invariant)
+        exported_invariant = self._core.transfer(raw_invariant, target_domain)
+        output = self.decoder(exported_invariant)
+        if "memory" in self.config.extensions:
+            routing_weights = x.new_full((x.shape[0], self.config.num_experts), 1.0 / self.config.num_experts)
+        else:
+            routing_weights = x.new_zeros(x.shape[0], self.config.num_experts)
+        return CoreResult(
+            output=output,
+            raw_invariant=raw_invariant,
+            exported_invariant=exported_invariant,
+            matches=matches,
+            routing_weights=routing_weights,
+            slot_outputs=None,
         )
 
-        # Phase 31: Online Learning (Self-Evolution)
-        # Uses gradient mode from config: DETACHED (safe), SELECTIVE (replay only), FULL (experimental)
-        online_loss = torch.tensor(0.0, device=device, dtype=dtype)
-        online_updated = False
-        if self.online_learner is not None and self.training:
-            with torch.no_grad():
-                u_mean = u_mem.mean(dim=0, keepdim=True).detach()
-                moe = pipeline.moe
-                num_experts = self.config.moe.num_experts or 4
-                if hasattr(moe, 'dispatch_proj'):
-                    gate_logits = moe.dispatch_proj(u_mean)
-                    argmax_t = gate_logits.argmax(dim=-1)
-                    dominant_expert = (argmax_t // getattr(moe, 'slots_per_expert', 1)).item()
-                elif hasattr(moe, 'router_proj'):
-                    gate_logits = moe.router_proj(u_mean)
-                    dominant_expert = (gate_logits.argmax(dim=-1) % num_experts).item()
-                else:
-                    dominant_expert = 0
+    def _forward_pairs_core(
+        self,
+        x: torch.Tensor,
+        source_domain_id: torch.Tensor,
+        target_domain_id: torch.Tensor,
+    ) -> CoreResult:
+        output = x.new_empty(x.shape)
+        raw = x.new_empty(x.shape[0], self.engine.algebra.dim)
+        exported = x.new_empty(x.shape[0], self.engine.algebra.dim)
+        routing = x.new_zeros(x.shape[0], self.config.num_experts)
+        matches: list[list[Any]] = [[] for _ in range(x.shape[0])]
 
-            # Use gradient-mode-aware update method
-            _loss, online_updated, _ = self.online_learner.online_update_with_mode(
-                x=u_mem,
-                expert_idx=dominant_expert,
-                model=self,
+        pair_keys = torch.stack((source_domain_id, target_domain_id), dim=1)
+        for pair in pair_keys.unique(dim=0):
+            src_idx = int(pair[0].item())
+            tgt_idx = int(pair[1].item())
+            mask = (source_domain_id == src_idx) & (target_domain_id == tgt_idx)
+            core = self._forward_core(
+                x[mask],
+                self._domain_idx_to_name(src_idx),
+                self._domain_idx_to_name(tgt_idx),
             )
-            online_loss = _loss
-
-        # 4) MoE routing per group
-        u_route = torch.zeros_like(u_mem)
-        router_loss = torch.zeros((), device=device, dtype=dtype)
-        z_loss = torch.zeros((), device=device, dtype=dtype)
-        routing_entropy = torch.zeros((), device=device, dtype=dtype)
-
-        all_slot_outputs: List[torch.Tensor] = []
-        for mask in group_masks:
-            # Guard: skip groups with 0 elements to avoid empty MoE input
-            if not mask.any():
-                continue
-            group_route, group_router_state = pipeline.moe(u_mem[mask])
-            u_route[mask] = group_route.to(dtype=u_route.dtype)
-
-            routing_weights[mask] = group_router_state["gate_weights"].to(dtype=dtype)
-            topk_idx[mask] = group_router_state["topk_idx"].to(device=device, dtype=torch.long)
-            topk_gate_weights[mask] = group_router_state["topk_gate_weights"].to(dtype=dtype)
-            router_loss = router_loss + group_router_state["router_loss"].to(dtype=dtype)
-            z_loss = z_loss + group_router_state.get(
-                "z_loss", torch.zeros((), device=device, dtype=dtype)
-            ).to(dtype=dtype)
-            routing_entropy = routing_entropy + group_router_state["routing_entropy"].to(dtype=dtype)
-            train_scores_snapshot = train_scores_snapshot + group_router_state["train_scores_snapshot"].to(dtype=dtype)
-            expert_usage = expert_usage + group_router_state["expert_usage"].to(dtype=dtype)
-
-            # Collect slot_outputs from MoEKernel if present
-            if "slot_outputs" in group_router_state and group_router_state["slot_outputs"] is not None:
-                all_slot_outputs.append(group_router_state["slot_outputs"])
-
-        # Normalize per-group accumulations by number of groups
-        num_groups = len(group_masks)
-        if num_groups > 1:
-            routing_entropy = routing_entropy / num_groups
-            train_scores_snapshot = train_scores_snapshot / num_groups
-            expert_usage = expert_usage / num_groups
-            router_loss = router_loss / num_groups
-            z_loss = z_loss / num_groups
-
-        # 4.5) Per-domain LoRA specialization
-        if self.domain_lora is not None and domain_id is not None:
-            for d_idx in range(self.config.num_domains):
-                mask = domain_id == d_idx
-                if mask.any():
-                    u_route[mask] = self.domain_lora(u_route[mask], d_idx)
-
-        # 5) Transfer
-        step2 = pipeline.algebra.geometric_product(R_transfer, u_route)
-        g_target = pipeline.algebra.geometric_product(step2, R_transfer_inv)
-
-        # 6) Decode
-        output[:] = pipeline.decoder(g_target)
-
-        exported_invariant[:] = u_route.to(dtype=dtype)
-        raw_invariant[:] = u_inv.to(dtype=dtype)
-        memory_augmented_invariant[:] = u_mem.to(dtype=dtype)
-
-        memory_loss = memory_state.loss.to(dtype=dtype)
-        memory_updated = bool(memory_state.updated)
-
-        # Note: memory_loss, router_loss, z_loss are already batch-meaned
-        # by their respective modules — do NOT divide by total_samples again
-
-        # Phase 32: Hallucination detection
-        hallucination_risk = 0.0
-        memory_surprise_val = None
-        if self.hallucination_detector is not None:
-            _surprise_tensor = None
-            if hasattr(memory_state, 'surprise') and memory_state.surprise is not None:
-                _surprise_tensor = memory_state.surprise.mean()
-                memory_surprise_val = _surprise_tensor.item()
-            result = self.hallucination_detector.from_router_state(
-            router_state={
-            "routing_entropy": routing_entropy,
-            "gate_weights": routing_weights,
-            "topk_gate_weights": topk_gate_weights,
-            },
-            memory_mismatch=_surprise_tensor.detach() if _surprise_tensor is not None else None,
-            memory_loss=memory_loss,
-            )
-            hallucination_risk = float(result.hallucination_risk)
-
-        # Phase 33: Hallucination Feedback Loop (Self-Correction)
-        feedback_action = None
-        if self.hallucination_feedback_loop is not None:
-            # Get current dominant expert from topk_idx (batch mode)
-            current_expert_idx = topk_idx[:, 0].mode().values.item() if topk_idx.numel() > 0 else 0
-            expert_names = self.pipeline.moe.expert_names if hasattr(self.pipeline.moe, 'expert_names') else [f'expert_{i}' for i in range(self.config.moe.num_experts or 4)]
-            current_expert = expert_names[current_expert_idx] if current_expert_idx < len(expert_names) else expert_names[0]
-            
-            feedback_result = self.hallucination_feedback_loop.check_and_respond(
-                risk_score=hallucination_risk,
-                routing_info={
-                    'current_expert': current_expert,
-                    'expert_weights': routing_weights.mean(dim=0) if routing_weights.numel() > 0 else None,
-                },
-                base_confidence=1.0,
-            )
-            feedback_action = feedback_result.action.value
-            
-            # Update expert hallucination history
-            self.hallucination_feedback_loop.update_expert_hallucination_history(
-                current_expert,
-                hallucination_risk > 0.5
-            )
-
-            # Wire feedback action to MoE output: boost selected expert, dim others
-            if feedback_action in ("reroute", "full_correction"):
-                _slot_out = torch.cat(all_slot_outputs, dim=0) if all_slot_outputs else None
-                if _slot_out is not None and _slot_out.shape[0] == routing_weights.shape[1]:
-                    _enames = (self.pipeline.moe.expert_names
-                               if hasattr(self.pipeline.moe, 'expert_names')
-                               else [f'expert_{i}' for i in range(self.config.moe.num_experts or 4)])
-                    _sel = feedback_result.selected_expert
-                    if _sel in _enames:
-                        _sel_idx = _enames.index(_sel)
-                        _nexp = len(_enames)
-                        _spe = getattr(self.pipeline.moe, 'slots_per_expert', 1)
-                        _boost = torch.full((_nexp,), 0.5, device=device, dtype=dtype)
-                        _boost[_sel_idx] = 2.0
-                        if _spe > 1:
-                            _boost = _boost.repeat_interleave(_spe)
-                        routing_weights.mul_(_boost.unsqueeze(0))
-                        routing_weights.div_(routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8))
-                        u_route = (routing_weights @ _slot_out).to(dtype=dtype)
-                        _step2 = pipeline.algebra.geometric_product(R_transfer, u_route)
-                        _g_target = pipeline.algebra.geometric_product(_step2, R_transfer_inv)
-                        output[:] = pipeline.decoder(_g_target)
-                        exported_invariant[:] = u_route.to(dtype=dtype)
-
-        # Concatenate slot_outputs if available
-        slot_outputs_tensor = torch.cat(all_slot_outputs, dim=0) if all_slot_outputs else None
+            output[mask] = core.output.to(dtype=output.dtype)
+            raw[mask] = core.raw_invariant.to(dtype=raw.dtype)
+            exported[mask] = core.exported_invariant.to(dtype=exported.dtype)
+            routing[mask] = core.routing_weights.to(dtype=routing.dtype)
+            mask_indices = mask.nonzero(as_tuple=False).flatten().tolist()
+            for row, row_matches in zip(mask_indices, core.matches):
+                matches[row] = row_matches
 
         return CoreResult(
             output=output,
-            routing_weights=routing_weights,
-            raw_invariant=raw_invariant,
-            memory_augmented_invariant=memory_augmented_invariant,
-            exported_invariant=exported_invariant,
-            topk_idx=topk_idx,
-            topk_gate_weights=topk_gate_weights,
-            train_scores_snapshot=train_scores_snapshot,
-            expert_usage=expert_usage,
-            routing_entropy=routing_entropy,
-            memory_loss=memory_loss,
-            router_loss=router_loss,
-            z_loss=z_loss,
-            memory_updated=memory_updated,
-            slot_outputs=slot_outputs_tensor,
-            hallucination_risk=hallucination_risk,
-            memory_surprise=memory_surprise_val,
-            feedback_action=feedback_action,
-            online_loss=online_loss,
-            online_updated=online_updated,
+            raw_invariant=raw,
+            exported_invariant=exported,
+            matches=matches,
+            routing_weights=routing,
+            slot_outputs=None,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        domain_id: torch.Tensor,
-        *,
-        return_state: bool = False,
-        update_memory: bool = True,
-        memory_mode: str = "update",
-    ) -> ForwardResult:
-        """Run the HDIM forward pass for same-domain reconstruction batches."""
-        x = self.dropout(x)
-        if domain_id.ndim != 1:
-            raise ValueError(f"domain_id must be 1D, got shape {tuple(domain_id.shape)}")
-        if domain_id.numel() != x.shape[0]:
-            raise ValueError(
-                f"domain_id length {domain_id.numel()} must match batch size {x.shape[0]}"
-            )
-        domain_id = domain_id.to(device=x.device, dtype=torch.long)
-        if domain_id.numel() > 0 and ((domain_id < 0).any() or (domain_id >= self.config.num_domains).any()):
-            raise IndexError(
-                f"domain_id values must be in [0, {self.config.num_domains})"
-            )
-        runtime = self._resolve_runtime_config(
-            update_memory=update_memory,
-            memory_mode=memory_mode,
+    def _build_aux_state(self, core: CoreResult, runtime: HDIMRuntimeConfig) -> HDIMAuxState:
+        return HDIMAuxState(
+            raw_invariant=core.raw_invariant,
+            exported_invariant=core.exported_invariant,
+            matches=core.matches,
+            training_invariant=self.training_inv_head(core.exported_invariant),
+            memory_mode=runtime.memory_mode,
+            update_memory=runtime.update_memory,
+            memory_updated=False,
         )
 
-        rotors_n, rotors_inv = self._get_rotor_stacks()
-        R_per_sample = rotors_n[domain_id]
-        R_inv_per_sample = rotors_inv[domain_id]
-
-        group_masks = [domain_id == idx for idx in domain_id.unique(sorted=True)]
-
-        core = self._forward_core(
-            x, R_inv_per_sample, R_per_sample, R_per_sample, R_inv_per_sample,
-            group_masks, runtime, domain_id=domain_id,
-        )
-
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        x = args[0]
+        domain_id = args[1] if len(args) > 1 else kwargs["domain_id"]
+        return_state = kwargs.get("return_state", False)
+        update_memory = kwargs.get("update_memory", True)
+        memory_mode = kwargs.get("memory_mode", "update")
+        domain_id = self._validate_domain_ids(domain_id.to(device=x.device), x.shape[0], "domain_id")
+        runtime = self._resolve_runtime_config(update_memory=update_memory, memory_mode=memory_mode)
+        core = self._forward_pairs_core(x, domain_id, domain_id)
         invariant = self.training_inv_head(core.exported_invariant).to(dtype=x.dtype)
         if self.domain_embedding is not None:
             invariant = invariant + self.domain_embedding(domain_id).to(dtype=x.dtype)
+        aux_state = self._build_aux_state(core, runtime) if return_state else None
+        return ForwardResult(core.output, core.routing_weights, invariant, core.slot_outputs, aux_state)
 
-        aux_state = None
-        if return_state:
-            aux_state = self._build_aux_state(
-                raw_invariant=core.raw_invariant,
-                memory_augmented_invariant=core.memory_augmented_invariant,
-                exported_invariant=core.exported_invariant,
-                routing_weights=core.routing_weights,
-                topk_idx=core.topk_idx,
-                topk_gate_weights=core.topk_gate_weights,
-                train_scores_snapshot=core.train_scores_snapshot,
-                expert_usage=core.expert_usage,
-                routing_entropy=core.routing_entropy,
-                memory_loss=core.memory_loss,
-                router_loss=core.router_loss,
-                z_loss=core.z_loss,
-                memory_updated=core.memory_updated,
-                runtime=runtime,
-                hallucination_risk=core.hallucination_risk,
-                memory_surprise=core.memory_surprise,
-                feedback_action=core.feedback_action,
-                online_loss=core.online_loss,
-                online_updated=core.online_updated,
-            )
-        return ForwardResult(
-            output=core.output,
-            routing_weights=core.routing_weights,
-            invariant=invariant,
-            slot_outputs=core.slot_outputs,
-            aux_state=aux_state,
-        )
-
-    def transfer(
-        self,
-        problem_encoding: torch.Tensor,
-        source_domain: int,
-        target_domain: int,
-        *,
-        return_state: bool = False,
-        update_memory: bool = True,
-        memory_mode: str = "update",
-    ) -> torch.Tensor | Tuple[torch.Tensor, HDIMAuxState]:
-        """Transfer a problem encoding from source to target domain."""
-        runtime = self._resolve_runtime_config(
-            update_memory=update_memory,
-            memory_mode=memory_mode,
-        )
-        src_name = self._domain_idx_to_name(source_domain)
-        tgt_name = self._domain_idx_to_name(target_domain)
-        output, transfer_state = self.pipeline.transfer(
+    def transfer(self, *args: Any, **kwargs: Any) -> Any:
+        problem_encoding = args[0]
+        source_domain = args[1] if len(args) > 1 else kwargs["source_domain"]
+        target_domain = args[2] if len(args) > 2 else kwargs["target_domain"]
+        source_domain = int(source_domain.item()) if isinstance(source_domain, torch.Tensor) else int(source_domain)
+        target_domain = int(target_domain.item()) if isinstance(target_domain, torch.Tensor) else int(target_domain)
+        return_state = kwargs.get("return_state", False)
+        update_memory = kwargs.get("update_memory", True)
+        memory_mode = kwargs.get("memory_mode", "update")
+        runtime = self._resolve_runtime_config(update_memory=update_memory, memory_mode=memory_mode)
+        core = self._forward_core(
             problem_encoding,
-            src_name,
-            tgt_name,
-            update_memory=runtime.update_memory,
-            memory_mode=runtime.memory_mode,
+            self._domain_idx_to_name(source_domain),
+            self._domain_idx_to_name(target_domain),
         )
         if return_state:
-            aux_state = self._build_aux_state_from_transfer_state(
-                transfer_state,
-                runtime=runtime,
-                dtype=problem_encoding.dtype,
-                device=problem_encoding.device,
-            )
-            return output, aux_state
-        return output
-
-    def add_domain(self, domain_name: str) -> None:
-        """Add a new domain rotor to the pipeline in runtime."""
-        self.pipeline.add_domain(domain_name)
-        self._clear_rotor_cache()
-
-    def reset_memory(self, strategy: str = "geometric") -> None:
-        """Reset stateful HDIM memory and router replay state.
-
-        strategy:
-            'hard'      -- full reset (only epoch=1 or new trial)
-            'geometric' -- soft decay (per-epoch, preserves patterns)
-            'stabilize' -- only momentum normalization (LR restart)
-        """
-        self.pipeline.reset_memory(strategy=strategy)
-        with torch.no_grad():
-            if hasattr(self.pipeline.moe, "train_scores"):
-                n = self.pipeline.moe.num_experts
-                if strategy == "hard":
-                    self.pipeline.moe.train_scores.fill_(1.0 / n)
-                elif strategy == "geometric":
-                    uniform = torch.full(
-                        (n,),
-                        1.0 / n,
-                        device=self.pipeline.moe.train_scores.device,
-                        dtype=self.pipeline.moe.train_scores.dtype,
-                    )
-                    self.pipeline.moe.train_scores.mul_(0.7).add_(uniform * 0.3)
-                # 'stabilize': leave train_scores unchanged
+            return core.output, self._build_aux_state(core, runtime)
+        return core.output
 
     def transfer_pairs(
         self,
@@ -776,113 +437,38 @@ class HDIMModel(nn.Module):
         update_memory: bool = True,
         memory_mode: str = "update",
     ) -> ForwardResult:
-        """Run explicit paired transfer for mixed-domain batches."""
-        if source_domain_id.ndim != 1:
-            raise ValueError(f"source_domain_id must be 1D, got shape {tuple(source_domain_id.shape)}")
-        if target_domain_id.ndim != 1:
-            raise ValueError(f"target_domain_id must be 1D, got shape {tuple(target_domain_id.shape)}")
-        if source_domain_id.numel() != source_encoding.shape[0]:
-            raise ValueError(
-                f"source_domain_id length {source_domain_id.numel()} must match batch size {source_encoding.shape[0]}"
-            )
-        if target_domain_id.numel() != source_encoding.shape[0]:
-            raise ValueError(
-                f"target_domain_id length {target_domain_id.numel()} must match batch size {source_encoding.shape[0]}"
-            )
-        source_domain_id = source_domain_id.to(
-            device=source_encoding.device, dtype=torch.long
+        source_domain_id = self._validate_domain_ids(
+            source_domain_id.to(device=source_encoding.device), source_encoding.shape[0], "source_domain_id"
         )
-        target_domain_id = target_domain_id.to(
-            device=source_encoding.device, dtype=torch.long
+        target_domain_id = self._validate_domain_ids(
+            target_domain_id.to(device=source_encoding.device), source_encoding.shape[0], "target_domain_id"
         )
-        if source_domain_id.numel() > 0 and ((source_domain_id < 0).any() or (source_domain_id >= self.config.num_domains).any()):
-            raise IndexError(
-                f"source_domain_id values must be in [0, {self.config.num_domains})"
-            )
-        if target_domain_id.numel() > 0 and ((target_domain_id < 0).any() or (target_domain_id >= self.config.num_domains).any()):
-            raise IndexError(
-                f"target_domain_id values must be in [0, {self.config.num_domains})"
-            )
-        runtime = self._resolve_runtime_config(
-            update_memory=update_memory,
-            memory_mode=memory_mode,
-        )
-
-        rotors_n, rotors_inv = self._get_rotor_stacks()
-        R_src_per_sample = rotors_n[source_domain_id]
-        R_src_inv_per_sample = rotors_inv[source_domain_id]
-        R_tgt_per_sample = rotors_n[target_domain_id]
-        R_tgt_inv_per_sample = rotors_inv[target_domain_id]
-
-        pair_keys = torch.stack((source_domain_id, target_domain_id), dim=1)
-        unique_pairs = pair_keys.unique(dim=0)
-        group_masks = [
-            (source_domain_id == int(p[0].item())) & (target_domain_id == int(p[1].item()))
-            for p in unique_pairs
-        ]
-
-        core = self._forward_core(
-            source_encoding,
-            R_src_inv_per_sample, R_src_per_sample,
-            R_tgt_per_sample, R_tgt_inv_per_sample,
-            group_masks, runtime, domain_id=source_domain_id,
-        )
-
-        invariant = self.training_inv_head(core.exported_invariant).to(
-            dtype=source_encoding.dtype
-        )
+        runtime = self._resolve_runtime_config(update_memory=update_memory, memory_mode=memory_mode)
+        core = self._forward_pairs_core(source_encoding, source_domain_id, target_domain_id)
+        invariant = self.training_inv_head(core.exported_invariant).to(dtype=source_encoding.dtype)
         if self.domain_embedding is not None:
-            invariant = invariant + self.domain_embedding(source_domain_id).to(
-                dtype=source_encoding.dtype
-            )
+            invariant = invariant + self.domain_embedding(source_domain_id).to(dtype=source_encoding.dtype)
+        aux_state = self._build_aux_state(core, runtime)
+        return ForwardResult(core.output, core.routing_weights, invariant, core.slot_outputs, aux_state)
 
-        aux_state = self._build_aux_state(
-            raw_invariant=core.raw_invariant,
-            memory_augmented_invariant=core.memory_augmented_invariant,
-            exported_invariant=core.exported_invariant,
-            routing_weights=core.routing_weights,
-            topk_idx=core.topk_idx,
-            topk_gate_weights=core.topk_gate_weights,
-            train_scores_snapshot=core.train_scores_snapshot,
-            expert_usage=core.expert_usage,
-            routing_entropy=core.routing_entropy,
-            memory_loss=core.memory_loss,
-            router_loss=core.router_loss,
-            z_loss=core.z_loss,
-            memory_updated=core.memory_updated,
-            runtime=runtime,
-            hallucination_risk=core.hallucination_risk,
-            memory_surprise=core.memory_surprise,
-            feedback_action=core.feedback_action,
-            online_loss=core.online_loss,
-            online_updated=core.online_updated,
-        )
-        return ForwardResult(
-            output=core.output,
-            routing_weights=core.routing_weights,
-            invariant=invariant,
-            slot_outputs=core.slot_outputs,
-            aux_state=aux_state,
-        )
+    def add_domain(self, domain_name: str) -> None:
+        self.pipeline.add_domain(domain_name)
 
-    # Phase 22 feature flags
+    def reset_memory(self, strategy: str = "geometric") -> None:
+        self.pipeline.reset_memory(strategy=strategy)
+        with torch.no_grad():
+            n = self.pipeline.moe.num_experts
+            self.pipeline.moe.train_scores.fill_(1.0 / n)
 
     def enable_learnable_metric(self) -> None:
-        """Enable learnable per-blade metric scaling in Clifford algebra."""
-        if hasattr(self.pipeline.algebra, 'enable_learnable_metric'):
-            self.pipeline.algebra.enable_learnable_metric()
-
-    # Phase 26 feature flags
+        if hasattr(self.engine.algebra, "enable_learnable_metric"):
+            self.engine.algebra.enable_learnable_metric()
 
     def compute_expert_ortho_loss(self) -> torch.Tensor:
-        if hasattr(self.pipeline.moe, 'expert_orthogonalization_loss'):
-            return self.pipeline.moe.expert_orthogonalization_loss()
-        return torch.tensor(0.0, device=next(self.parameters()).device, dtype=next(self.parameters()).dtype)
+        return next(self.parameters()).new_tensor(0.0)
 
     def enable_gradient_checkpointing(self) -> None:
-        """Enable gradient checkpointing on pipeline."""
         self.pipeline.enable_gradient_checkpointing()
 
     def disable_gradient_checkpointing(self) -> None:
-        """Disable gradient checkpointing on pipeline."""
         self.pipeline.disable_gradient_checkpointing()

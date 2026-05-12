@@ -5,12 +5,12 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pytest
 import torch
 
-from src.core.hallucination_feedback import (
+from src.extensions.hallucination.feedback import (
     FeedbackAction,
     FeedbackResult,
     RiskThresholds,
