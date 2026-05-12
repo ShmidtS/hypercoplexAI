@@ -8,6 +8,7 @@ from .online_lora import (
     OnlineLoRAManager,
     wrap_with_online_lora,
 )
+from .per_domain_lora import PerDomainLoRA
 
 __all__ = [
     "OnlineLoRA",
@@ -15,5 +16,6 @@ __all__ = [
     "OnlineLoRAConv",
     "OnlineLoRALinear",
     "OnlineLoRAManager",
+    "PerDomainLoRA",
     "wrap_with_online_lora",
 ]

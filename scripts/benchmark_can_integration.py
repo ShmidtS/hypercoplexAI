@@ -23,8 +23,8 @@ import torch.nn as nn
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.core.clifford_interaction import CliffordInteractionLayer, CliffordFFN
 from src.extensions.moe import MoEKernel, MoEKernelConfig, MLPExpert
+from src.extensions.moe.clifford_interaction import CliffordInteractionLayer, CliffordFFN
 
 
 @dataclass

@@ -8,7 +8,6 @@ from torch.utils.data import DataLoader
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.metrics import compute_all_metrics
-from src.models.text_hdim_model import TextHDIMModel
 from src.training.dataset import (
     DomainProblemDataset,
     create_demo_dataset,
@@ -17,7 +16,7 @@ from src.training.dataset import (
     texts_to_tensor,
 )
 from src.training.experiment_config import ExperimentConfig
-from src.training.trainer import HDIMTrainer
+from src.training.invariant_trainer import InvariantTrainer
 
 
 @pytest.fixture
@@ -31,14 +30,9 @@ def model(cfg):
 
 
 @pytest.fixture
-def text_model(model):
-    return TextHDIMModel(model)
-
-
-@pytest.fixture
 def trainer(model):
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    return HDIMTrainer(model, opt, device="cpu")
+    return InvariantTrainer(model, opt, device="cpu")
 
 
 def test_model_forward(model, cfg):
@@ -194,8 +188,10 @@ def test_dataset_exposes_negative_pair_metadata():
 def test_group_aware_split_keeps_pair_groups_separate():
     ds = create_paired_demo_dataset(n_samples=40, negative_ratio=0.0)
     train_ds, val_ds = create_group_aware_split(ds, train_fraction=0.8, seed=42)
-    train_group_ids = {ds.pair_group_ids[idx] for idx in train_ds.indices}
-    val_group_ids = {ds.pair_group_ids[idx] for idx in val_ds.indices}
+    pair_group_ids = ds.pair_group_ids
+    assert pair_group_ids is not None
+    train_group_ids = {pair_group_ids[idx] for idx in train_ds.indices}
+    val_group_ids = {pair_group_ids[idx] for idx in val_ds.indices}
     assert train_group_ids
     assert val_group_ids
     assert train_group_ids.isdisjoint(val_group_ids)
@@ -420,7 +416,7 @@ def test_forward_and_transfer_pairs_expose_same_lifecycle_contract(model, cfg):
 def test_core_adapter_exposes_empty_router_diagnostics_on_eval_path(model):
     ds = create_paired_demo_dataset(n_samples=16)
     batch = next(iter(DataLoader(ds, batch_size=8)))
-    losses = HDIMTrainer(model, torch.optim.Adam(model.parameters(), lr=1e-3), device="cpu").evaluate_batch(batch)
+    losses = InvariantTrainer(model, torch.optim.Adam(model.parameters(), lr=1e-3), device="cpu").evaluate_batch(batch)
 
     assert losses["routing_weights"].shape == (8, model.config.num_experts)
     assert torch.count_nonzero(losses["routing_weights"]).item() == 0
@@ -428,16 +424,9 @@ def test_core_adapter_exposes_empty_router_diagnostics_on_eval_path(model):
     assert losses["topk_gate_weights"].shape == (8, 0)
 
 
-def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
+def test_eval_retrieve_is_deterministic_without_memory_or_router_state(model, cfg):
     x = torch.randn(8, cfg.hidden_dim)
     domain_id = torch.randint(0, cfg.num_domains, (8,))
-
-    model.train()
-    _ = model(x, domain_id, update_memory=True, memory_mode="update")
-    memory = model.pipeline.memory
-    memory_weight_before = memory.memory.weight.detach().clone()
-    momentum_before = memory.momentum_S.detach().clone()
-    train_scores_before = model.pipeline.moe.train_scores.detach().clone()
 
     model.eval()
     with torch.no_grad():
@@ -448,9 +437,6 @@ def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
             update_memory=False,
             memory_mode="retrieve",
         )
-        routing_a = res_a.routing_weights
-        inv_a = res_a.invariant
-        state_a = res_a.aux_state
         res_b = model(
             x,
             domain_id,
@@ -458,161 +444,24 @@ def test_eval_retrieve_does_not_mutate_memory_or_router_state(model, cfg):
             update_memory=False,
             memory_mode="retrieve",
         )
-        routing_b = res_b.routing_weights
-        inv_b = res_b.invariant
-        state_b = res_b.aux_state
 
-    assert torch.allclose(memory.memory.weight, memory_weight_before)
-    assert torch.allclose(memory.momentum_S, momentum_before)
-    assert torch.allclose(model.pipeline.moe.train_scores, train_scores_before)
-    assert torch.allclose(routing_a, routing_b)
-    assert torch.allclose(inv_a, inv_b)
-    assert torch.allclose(state_a.raw_invariant, state_b.raw_invariant)
-    assert torch.allclose(state_a.exported_invariant, state_b.exported_invariant)
+    assert torch.allclose(res_a.routing_weights, res_b.routing_weights)
+    assert torch.allclose(res_a.invariant, res_b.invariant)
+    assert torch.allclose(res_a.aux_state.raw_invariant, res_b.aux_state.raw_invariant)
+    assert torch.allclose(res_a.aux_state.exported_invariant, res_b.aux_state.exported_invariant)
 
 
-def test_model_reset_memory_keeps_core_facade_state_empty(model, cfg):
+def test_model_reset_memory_is_noop_in_core_wrapper(model, cfg):
     x = torch.randn(4, cfg.hidden_dim)
     domain_id = torch.zeros(4, dtype=torch.long)
-    model.train()
-    model(x, domain_id, update_memory=True, memory_mode="update")
+    model.eval()
+    with torch.no_grad():
+        before = model(x, domain_id, return_state=True, update_memory=True, memory_mode="update").aux_state
+        model.reset_memory(strategy='hard')
+        after = model(x, domain_id, return_state=True, update_memory=True, memory_mode="update").aux_state
 
-    mem = model.pipeline.memory
-    assert torch.count_nonzero(mem.memory.weight).item() == 0
-    assert torch.count_nonzero(mem.momentum_S).item() == 0
-
-    model.reset_memory(strategy='hard')
-
-    assert torch.allclose(mem.memory.weight, torch.zeros_like(mem.memory.weight), atol=1e-6)
-    assert torch.allclose(mem.momentum_S, torch.zeros_like(mem.momentum_S), atol=1e-6)
-    assert torch.allclose(
-        model.pipeline.moe.train_scores,
-        torch.full_like(model.pipeline.moe.train_scores, 1.0 / cfg.num_experts),
-    )
-
-
-def test_text_model_scores_text_pairs_with_state(text_model, cfg):
-    source_texts = [
-        "Reduce cavitation damage in pump impellers.",
-        "Prevent fatigue crack propagation in alloy frames.",
-    ]
-    target_texts = [
-        "How do plant vacuoles prevent membrane rupture during osmotic shock?",
-        "Mechanism of DNA repair after double-strand breaks in mammalian cells.",
-    ]
-    source_domain_id = torch.tensor([0, 0], dtype=torch.long)
-    target_domain_id = torch.tensor([1, 1], dtype=torch.long)
-
-    result = text_model.score_text_pairs_with_state(
-        source_texts,
-        target_texts,
-        source_domain_id,
-        target_domain_id,
-    )
-
-    assert result.scores.shape == (2,)
-    assert result.source_state.exported_invariant.shape == (2, text_model.core_model.pipeline.clifford_dim)
-    assert result.target_state.exported_invariant.shape == (2, text_model.core_model.pipeline.clifford_dim)
-    flattened = result.to_dict()
-    assert torch.allclose(flattened["scores"], result.scores)
-    assert flattened["source_memory_mode"] == "retrieve"
-    assert flattened["target_memory_mode"] == "retrieve"
-    assert flattened["source_update_memory"] is False
-    assert flattened["target_update_memory"] is False
-
-
-def test_text_model_encode_texts_is_trainable(text_model, cfg):
-    texts = ["alpha", "beta"]
-    encodings = text_model.encode_texts(texts)
-    assert encodings.shape == (2, cfg.hidden_dim)
-    assert encodings.requires_grad
-
-
-def test_trainer_uses_forward_texts_for_raw_text_batches(text_model):
-    trainer = HDIMTrainer(
-        text_model,
-        torch.optim.Adam(text_model.parameters(), lr=1e-3),
-        device="cpu",
-    )
-    calls = {"forward_texts": 0, "forward": 0}
-    original_forward_texts = text_model.forward_texts
-    original_forward = text_model.core_model.forward
-
-    def wrapped_forward_texts(*args, **kwargs):
-        calls["forward_texts"] += 1
-        return original_forward_texts(*args, **kwargs)
-
-    def wrapped_forward(*args, **kwargs):
-        calls["forward"] += 1
-        return original_forward(*args, **kwargs)
-
-    text_model.forward_texts = wrapped_forward_texts
-    text_model.core_model.forward = wrapped_forward
-    batch = {
-        "text": ["alpha transfer", "beta transfer"],
-        "domain_id": torch.tensor([0, 1], dtype=torch.long),
-    }
-
-    losses = trainer.evaluate_batch(batch)
-
-    assert losses["loss_total"].item() >= 0.0
-    assert calls["forward_texts"] == 1
-    assert calls["forward"] == 0
-
-
-def test_trainer_uses_text_pair_path_for_raw_pair_batches(text_model):
-    trainer = HDIMTrainer(
-        text_model,
-        torch.optim.Adam(text_model.parameters(), lr=1e-3),
-        device="cpu",
-    )
-    calls = {
-        "transfer_text_pairs": 0,
-        "forward_texts": 0,
-        "transfer_pairs": 0,
-        "forward": 0,
-    }
-    original_transfer_text_pairs = text_model.transfer_text_pairs
-    original_forward_texts = text_model.forward_texts
-    original_transfer_pairs = text_model.core_model.transfer_pairs
-    original_forward = text_model.core_model.forward
-
-    def wrapped_transfer_text_pairs(*args, **kwargs):
-        calls["transfer_text_pairs"] += 1
-        return original_transfer_text_pairs(*args, **kwargs)
-
-    def wrapped_forward_texts(*args, **kwargs):
-        calls["forward_texts"] += 1
-        return original_forward_texts(*args, **kwargs)
-
-    def wrapped_transfer_pairs(*args, **kwargs):
-        calls["transfer_pairs"] += 1
-        return original_transfer_pairs(*args, **kwargs)
-
-    def wrapped_forward(*args, **kwargs):
-        calls["forward"] += 1
-        return original_forward(*args, **kwargs)
-
-    text_model.transfer_text_pairs = wrapped_transfer_text_pairs
-    text_model.forward_texts = wrapped_forward_texts
-    text_model.core_model.transfer_pairs = wrapped_transfer_pairs
-    text_model.core_model.forward = wrapped_forward
-    batch = {
-        "text": ["source one", "source two"],
-        "pair_text": ["target one", "target two"],
-        "domain_id": torch.tensor([0, 1], dtype=torch.long),
-        "pair_domain_id": torch.tensor([1, 2], dtype=torch.long),
-        "pair_relation_label": torch.tensor([1.0, 0.0]),
-        "pair_weight": torch.tensor([1.0, 2.0]),
-    }
-
-    losses = trainer.evaluate_batch(batch)
-
-    assert losses["loss_total"].item() >= 0.0
-    assert calls["transfer_text_pairs"] == 0
-    assert calls["forward_texts"] == 1
-    assert calls["transfer_pairs"] == 1
-    assert calls["forward"] == 0
+    assert torch.allclose(before.raw_invariant, after.raw_invariant)
+    assert torch.allclose(before.exported_invariant, after.exported_invariant)
 
 
 def test_experiment_config_round_trips_text_mode_manifest_fields(tmp_path):

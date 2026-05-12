@@ -11,6 +11,7 @@ from .kernel import (
     _create_mlp_expert,
 )
 from .soft_router import SoftMoERouter
+from .clifford_interaction import CliffordInteractionExpert
 from .utils import (
     load_balance_loss,
     entropy_load_balance_loss,
@@ -29,6 +30,7 @@ __all__ = [
     "MLPExpert",
     "EXPERT_CONFIGS",
     "SoftMoERouter",
+    "CliffordInteractionExpert",
     "load_balance_loss",
     "entropy_load_balance_loss",
     "z_loss",

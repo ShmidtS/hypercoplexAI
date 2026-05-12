@@ -13,20 +13,29 @@ import sys
 import torch
 from torch.utils.data import DataLoader
 
+TRAINING_DEFAULTS = {
+    "epochs": 5,
+    "batch_size": 8,
+    "learning_rate": 1e-3,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "negative_ratio": 0.5,
+    "train_fraction": 0.8,
+    "seed": 42,
+    "description": "",
+    "accum_steps": 1,
+}
+
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.metrics import compute_all_metrics
-from src.models.model_factory import build_text_hdim_model
-from src.models.text_hdim_model import TextHDIMModel
 from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
     create_paired_demo_dataset,
 )
 from src.training.real_dataset import load_real_pairs_dataset, split_real_pairs
-from src.training.auto_config import TRAINING_DEFAULTS
 from src.training.experiment_config import ExperimentConfig
+from src.training.invariant_trainer import InvariantTrainer
 from src.training.results_logger import append_ledger_row
-from src.training.trainer import HDIMTrainer
 
 
 def _coerce_override(raw_value: str) -> Any:
@@ -122,35 +131,19 @@ def _build_config(args: argparse.Namespace, experiment: ExperimentConfig | None 
 def _build_model(
     cfg: HDIMConfig,
     args: argparse.Namespace,
-) -> HDIMModel | TextHDIMModel:
-    """Build the model using model_factory when advanced flags are set."""
-    soft_router: bool = getattr(args, "soft_router", False)
-
-    needs_text = args.text_mode or soft_router
-
-    if needs_text:
-        return build_text_hdim_model(
-            cfg,
-            soft_router=soft_router,
-        )
-
-    # Plain baseline path (identical to pre-Phase-2 behaviour)
-    core_model = HDIMModel(cfg)
-    return TextHDIMModel(core_model) if args.text_mode else core_model
+) -> HDIMModel:
+    return HDIMModel(cfg)
 
 
 def _build_trainer(
     model: HDIMModel,
     optimizer: torch.optim.Optimizer,
     args: argparse.Namespace,
-) -> HDIMTrainer:
-    trainer_kwargs: dict[str, Any] = {
-        "device": args.device,
-        "accum_steps": args.accum_steps,
-    }
+) -> InvariantTrainer:
+    trainer_kwargs: dict[str, Any] = {"device": args.device}
     for key, value in _parse_overrides(args.trainer_override).items():
         trainer_kwargs[key] = value
-    return HDIMTrainer(model, optimizer, **trainer_kwargs)
+    return InvariantTrainer(model, optimizer, **trainer_kwargs)
 
 
 def _build_run_summary(
@@ -239,23 +232,23 @@ def main() -> None:
         "--config", type=Path, default=None,
         help="Optional experiment manifest JSON path.",
     )
-    parser.add_argument("--epochs", type=int, default=TRAINING_DEFAULTS.epochs)
-    parser.add_argument("--batch_size", type=int, default=TRAINING_DEFAULTS.batch_size)
-    parser.add_argument("--lr", type=float, default=TRAINING_DEFAULTS.learning_rate)
-    parser.add_argument("--device", default=TRAINING_DEFAULTS.device)
+    parser.add_argument("--epochs", type=int, default=TRAINING_DEFAULTS["epochs"])
+    parser.add_argument("--batch_size", type=int, default=TRAINING_DEFAULTS["batch_size"])
+    parser.add_argument("--lr", type=float, default=TRAINING_DEFAULTS["learning_rate"])
+    parser.add_argument("--device", default=TRAINING_DEFAULTS["device"])
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument(
         "--use_pairs", action="store_true",
         help="Use paired cross-domain supervision dataset",
     )
-    parser.add_argument("--negative_ratio", type=float, default=TRAINING_DEFAULTS.negative_ratio)
-    parser.add_argument("--train_fraction", type=float, default=TRAINING_DEFAULTS.train_fraction)
-    parser.add_argument("--seed", type=int, default=TRAINING_DEFAULTS.seed)
+    parser.add_argument("--negative_ratio", type=float, default=TRAINING_DEFAULTS["negative_ratio"])
+    parser.add_argument("--train_fraction", type=float, default=TRAINING_DEFAULTS["train_fraction"])
+    parser.add_argument("--seed", type=int, default=TRAINING_DEFAULTS["seed"])
     parser.add_argument(
         "--text_mode", action="store_true",
-        help="Train through TextHDIMModel wrapper",
+        help="Keep manifest compatibility; training uses HDIMModel directly",
     )
-    parser.add_argument("--description", default=TRAINING_DEFAULTS.description)
+    parser.add_argument("--description", default=TRAINING_DEFAULTS["description"])
     parser.add_argument(
         "--model_override", action="append", default=[],
         help="Model override in key=value format",
@@ -289,7 +282,7 @@ def main() -> None:
         help="Explicitly disable AMP even on CUDA.",
     )
     parser.add_argument(
-        "--accum_steps", type=int, default=TRAINING_DEFAULTS.accum_steps,
+        "--accum_steps", type=int, default=TRAINING_DEFAULTS["accum_steps"],
         help="Gradient accumulation steps (effective batch = batch_size * accum_steps).",
     )
     parser.add_argument(
@@ -356,20 +349,22 @@ def main() -> None:
             dataset, train_fraction=args.train_fraction, seed=args.seed
         )
     num_workers = 2 if device.type == "cuda" else 0
+    loader_kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        **({"persistent_workers": True, "prefetch_factor": 2} if num_workers > 0 else {}),
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        **({"persistent_workers": True, "prefetch_factor": 2} if num_workers > 0 else {}),
+        **loader_kwargs,
     )
 
     accum_steps = args.accum_steps

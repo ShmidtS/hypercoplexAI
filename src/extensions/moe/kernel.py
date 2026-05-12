@@ -207,7 +207,7 @@ class MLPExpert(nn.Module):
         if pre_hook is not None:
             self.pre_hook = pre_hook
         elif use_can:
-            from src.core.clifford_interaction import CliffordInteractionLayer
+            from src.extensions.moe.clifford_interaction import CliffordInteractionLayer
             self.pre_hook = CliffordInteractionLayer(dim=input_dim, dropout=dropout)
         else:
             self.pre_hook = None

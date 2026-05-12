@@ -1,5 +1,5 @@
 # HDIM — Hypercomplex Domain Isomorphism Machine
-*Версия: 30.0+ | Дата: 2026-04-09 | **РЕКОРД: score=1.1814** (Run 18, ep13, temp=0.10, λ_pair=0.40, margin=1.0224) | Phase 30+: MoEKernel + Hallucination detection + Online learning + Memory persistence | Numerical Python verification 161/163 PASS + pytest 754 PASS (10 skipped)*
+*Версия: 30.0+ | Дата: 2026-04-09 | **РЕКОРД: score=1.1814** (Run 18, ep13, temp=0.10, λ_pair=0.40, margin=1.0224) | Phase 30+: MoEKernel + Hallucination detection + Online learning + Memory persistence | Run pytest and numerical verification for current status*
 
 ---
 
@@ -80,9 +80,7 @@ $$L_{balance} = -\sum_i \sum_j sim(x_i, x_j) \cdot sim(r_i, r_j)$$
 | `MemoryPersistence` | `src/core/memory_persistence.py` | Atomic checkpoint + backup rotation |
 | `MSAAttention` | `src/core/msa_attention.py` | Memory Sparse Attention |
 | `SBERTEncoder` | `src/models/sbert_encoder.py` | **Simple MLP** 768→384→256 |
-| `HDIMModel` | `src/models/hdim_model.py` | Batch-facing API |
-| `TextHDIMModel` | `src/models/text_hdim_model.py` | Text entry wrapper |
-| `build_*_model` | `src/models/model_factory.py` | Единственная точка сборки моделей |
+| `HDIMModel` | `src/models/hdim_model.py` | Thin core wrapper |
 | `HDIMTrainer` | `src/training/trainer.py` | Focal-InfoNCE + AnglE + SupCon + HardNeg + temp scheduling |
 | `gpu_train.py` | `scripts/gpu_train.py` | Основной скрипт обучения |
 
@@ -618,7 +616,6 @@ loss = -(log(sim_diag) - log_denom[pos_indices]).mean()
 | B15 | `domain_operators.py` | R не нормализовалась перед rotation → numerical drift | `R = R / R.norm()` после каждого обновления |
 | B16 | `domain_operators.py` | Несогласованная нормализация R в forward/inverse | Единый нормализационный паттерн во всех операциях |
 | B17 | `hdim_model.py` | Loss не нормирован по размеру группы экспертов | Деление на `group_size` при агрегации loss |
-| B29 | `model_factory.py` | `z_loss_weight` не пробрасывался в конструктор модели | Добавлен passthrough параметра `z_loss_weight` в build-функции |
 | B33 | `trainer.py` | `_log_temp` не регистрировался как buffer → не сохранялся в checkpoint | `self.register_buffer('_log_temp', ...)` |
 | B37 | `gpu_train.py` | T_0 вычислялся без учёта `warmup_epochs` → первый цикл короче | `T_0 = base_T_0 + warmup_epochs` |
 
@@ -849,7 +846,7 @@ Real-model benchmark (SBERT + real_pairs_v10.json, 5 эп):
 | pair_margin | 0.000 | 0.902 | ∞ |
 | train_loss (ep5) | 0.930 | 0.274 | -71% |
 
-Numerical Python verification/tests: 161/163 PASS in `verify_lean4_numerical.py` (2 FAIL float32 tolerance). pytest: 754 PASS (10 skipped).
+Numerical Python verification lives in `formalization/verify_numerical.py`; run it and pytest for current status.
 
 ### Phase 29 — TitansMemory RAG API (2026-03-19)
 
@@ -905,9 +902,7 @@ src/core/
 
 src/models/
   hdim_model.py           — HDIMModel (batch API, domain-aware)
-  text_hdim_model.py      — TextHDIMModel (text wrapper, encode_texts)
   sbert_encoder.py        — SBERTEncoder + SimpleMLP 768→384→hidden
-  model_factory.py        — build_hdim_model, build_text_hdim_model, build_sbert_hdim_model, build_modernbert_hdim_model
   modern_text_encoder.py  — ModernBertEncoder, GatedMLPEncoder, HybridEncoder, MatryoshkaProjection
   metrics.py              — compute_all_metrics, PRIMARY_SCORE, AFR, DRS
 

@@ -3,7 +3,6 @@
 Covers:
 - MatryoshkaProjection: multi-scale output, target_dim slicing, dimension validation
 - GatedMLPEncoder: forward pass, shape consistency, trainable
-- TextHDIMModel + Matryoshka integration: encode_texts_matryoshka, multi-scale loss
 - HybridEncoder: architecture selection based on config
 """
 
@@ -20,7 +19,6 @@ from src.models.modern_text_encoder import (
     ModernEncoderConfig,
     HybridEncoder,
 )
-from src.models.text_hdim_model import TextHDIMModel
 
 
 # ─── MatryoshkaProjection ────────────────────────────────────────────────
@@ -138,60 +136,6 @@ class TestGatedMLPEncoder:
             assert out.shape[0] == 2, f"Failed for num_layers={n}"
 
 
-# ─── TextHDIMModel + Matryoshka Integration ──────────────────────────────
-
-class TestTextHDIMMatryoshka:
-    @pytest.fixture
-    def text_model(self):
-        cfg = HDIMConfig(hidden_dim=64, num_experts=2, num_domains=2)
-        model = HDIMModel(cfg)
-        return TextHDIMModel(model)
-
-    def test_encode_texts_matryoshka_returns_tuple(self, text_model):
-        texts = ["hello world", "test sentence"]
-        result = text_model.encode_texts_matryoshka(texts, device="cpu")
-        assert isinstance(result, tuple)
-        full, scales = result
-        assert isinstance(full, torch.Tensor)
-        # scales may be None if encoder doesn't support matryoshka
-        if scales is not None:
-            assert isinstance(scales, dict)
-            assert len(scales) >= 1
-
-    def test_encode_texts_matryoshka_scale_shapes(self, text_model):
-        texts = ["hello", "world"]
-        full, scales = text_model.encode_texts_matryoshka(texts, device="cpu")
-        assert full.shape[0] == 2  # batch size
-        if scales is not None:
-            for dim, tensor in scales.items():
-                assert tensor.dim() == 2
-                assert tensor.shape[0] == 2
-                assert tensor.shape[1] == dim
-
-    def test_encode_texts_standard(self, text_model):
-        texts = ["hello world", "test"]
-        result = text_model.encode_texts(texts, device="cpu")
-        assert isinstance(result, torch.Tensor)
-        assert result.shape[0] == 2
-
-    def test_matryoshka_gradient(self, text_model):
-        """Verify gradients flow through text encoder projections."""
-        texts = ["hello world", "test sentence"]
-        full, scales = text_model.encode_texts_matryoshka(texts, device="cpu")
-        # Sum full encoding and backprop
-        loss = full.sum()
-        if scales is not None:
-            loss = loss + sum(t.sum() for t in scales.values())
-        loss.backward()
-        # Check that at least some parameters received gradients
-        has_grad = False
-        for p in text_model.parameters():
-            if p.grad is not None and p.grad.abs().sum() > 0:
-                has_grad = True
-                break
-        assert has_grad, "No gradients flowed through text encoder"
-
-
 # ─── HybridEncoder ─────────────────────────────────────────────────────────
 
 class TestHybridEncoder:
@@ -217,22 +161,3 @@ class TestHybridEncoder:
         has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in enc.parameters())
         assert has_grad
 
-
-# ─── Matryoshka in HDIM Trainer ──────────────────────────────────────────
-
-class TestMatryoshkaTrainerIntegration:
-    def test_matryoshka_embeddings_in_batch(self):
-        """Verify that matryoshka embeddings can be injected into a batch dict."""
-        cfg = HDIMConfig(hidden_dim=64, num_domains=2)
-        model = HDIMModel(cfg)
-        text_model = TextHDIMModel(model)
-        texts = ["hello world", "test sentence"]
-        full, scales = text_model.encode_texts_matryoshka(texts, device="cpu")
-        if scales is not None:
-            batch = {"matryoshka_embeddings": scales}
-            assert isinstance(batch["matryoshka_embeddings"], dict)
-            assert all(isinstance(v, torch.Tensor) for v in batch["matryoshka_embeddings"].values())
-        else:
-            # Without matryoshka support, encode still works
-            enc = text_model.encode_texts(texts, device="cpu")
-            assert enc.shape[0] == 2

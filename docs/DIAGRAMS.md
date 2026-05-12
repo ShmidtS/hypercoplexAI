@@ -11,7 +11,7 @@
 1. [Глобальная архитектура](#1-глобальная-архитектура)
 2. [Core Pipeline Flow](#2-core-pipeline-flow)
 3. [Training Loop Flow](#3-training-loop-flow)
-4. [Model Factory Flow](#4-model-factory-flow)
+4. [Model Assembly Flow](#4-model-assembly-flow)
 5. [API Sequence Diagrams](#5-api-sequence-diagrams)
 6. [Loss Computation Flow](#6-loss-computation-flow)
 7. [Memory Flow (Titans)](#7-memory-flow-titans)
@@ -42,9 +42,8 @@ graph TB
     end
 
     subgraph Models["Model Layer"]
-        FACTORY["model_factory<br/>build_*() functions"]
         HDIM["HDIMModel<br/>Core wrapper"]
-        TEXT["TextHDIMModel<br/>Text wrapper"]
+        TEXTADAPTER["TextAdapter<br/>Text bridge"]
         SBERT["SBERTEncoder<br/>Frozen + projection"]
         MODERN["ModernBertEncoder<br/>ModernBERT backbone"]
         GMLP["GatedMLPEncoder<br/>Gated MLP"]
@@ -82,20 +81,18 @@ graph TB
 
     %% Training connections
     TRAINER --> HDIM
-    TRAINER --> TEXT
     RUNNER --> TRAINER
     DATA --> TRAINER
     CONFIG --> RUNNER
 
     %% Model connections
-    FACTORY --> HDIM
-    FACTORY --> TEXT
-    TEXT --> SBERT
-    TEXT --> MODERN
-    TEXT --> GMLP
-    TEXT --> SIMPLE
-    TEXT --> ADVANCED
+    TEXTADAPTER --> SBERT
+    TEXTADAPTER --> MODERN
+    TEXTADAPTER --> GMLP
+    TEXTADAPTER --> SIMPLE
+    TEXTADAPTER --> ADVANCED
     HDIM --> PIPELINE
+    TEXTADAPTER --> PIPELINE
     METRICS --> TRAINER
 
     %% Core connections
@@ -124,7 +121,7 @@ graph TB
 
     class GPU,CLI,DEMO scriptStyle
     class TRAINER,RUNNER,DATA,CONFIG trainingStyle
-    class FACTORY,HDIM,TEXT,SBERT,MODERN,GMLP,SIMPLE,ADVANCED,METRICS modelStyle
+    class HDIM,TEXTADAPTER,SBERT,MODERN,GMLP,SIMPLE,ADVANCED,METRICS modelStyle
     class PIPELINE,ALG,DOMAIN,INV,MEM,HBMAMEM,MOE,MOEK,MSR,ENC,DEC,HALL,HFL,SEP,OLL,OLORA,CNORM,MSA,MPERS coreStyle
 ```
 
@@ -335,13 +332,13 @@ classDiagram
         +reset_memory(strategy)
     }
 
-    class TextHDIMModel {
-        +HDIMModel core_model
-        +Module text_encoder
+    class TextAdapter {
+        +Module encoder
+        +HDIMCoreEngine engine
         +encode_texts(texts)
-        +forward_texts(texts, domain_id)
-        +transfer_texts(texts, source, target)
-        +score_text_pairs_with_state()
+        +encode(texts)
+        +extract_texts(texts, domain)
+        +match_texts(texts, domain, top_k)
     }
 
     class SBERTEncoder {
@@ -368,10 +365,10 @@ classDiagram
     %% Model relations
     HDIMModel --> HDIMPipeline : wraps
     HDIMModel --> HDIMConfig : configured by
-    TextHDIMModel --> HDIMModel : wraps
-    TextHDIMModel --> SBERTEncoder : uses
-    TextHDIMModel --> ModernBertEncoder : uses
-    TextHDIMModel --> GatedMLPEncoder : uses
+    TextAdapter --> HDIMPipeline : uses engine
+    TextAdapter --> SBERTEncoder : uses
+    TextAdapter --> ModernBertEncoder : uses
+    TextAdapter --> GatedMLPEncoder : uses
 ```
 
 ---
@@ -527,8 +524,8 @@ flowchart LR
 flowchart TD
     subgraph Init["Initialization"]
         CFG["ExperimentConfig<br/>epochs, batch_size, lr, λs"]
-        FACT["model_factory<br/>build_sbert_hdim_model()"]
-        MODEL["HDIMModel / TextHDIMModel"]
+        FACT["HDIMModel(cfg)"]
+        MODEL["HDIMModel"]
         OPT["Optimizer<br/>AdamW(lr, weight_decay)"]
         SCALER["GradScaler<br/>AMP"]
     end
@@ -667,232 +664,86 @@ flowchart TD
 
 ---
 
-## 4. Model Factory Flow
+## 4. Model Assembly Flow
 
-### 4.1 Factory Functions
+### 4.1 Core Model Assembly
 
 ```mermaid
 flowchart LR
     subgraph Config["Configuration"]
-        HC["HDIMConfig<br/>(hidden_dim, num_domains,<br/>num_experts, top_k, ...)"]
+        HC["HDIMConfig<br/>(hidden_dim, num_domains,<br/>clifford signature, extensions)"]
         EC["ExperimentConfig<br/>(epochs, batch_size,<br/>lr, λs, flags)"]
     end
 
-    subgraph Factories["Factory Functions"]
-        F1["build_hdim_model(cfg)"]
-        F2["build_text_hdim_model(cfg,<br/>advanced_encoder=False,<br/>hierarchical_memory=False,<br/>soft_router=False,<br/>modular_moe=False,<br/>z_loss_weight=0.0)"]
-        F3["build_sbert_hdim_model(cfg,<br/>freeze_sbert=True,<br/>soft_router=True,<br/>...)"]
-        F4["model_from_experiment_config(exp)"]
+    subgraph Models["Models"]
+        HDIM["HDIMModel(cfg)<br/>thin wrapper"]
+        ENGINE["HDIMCoreEngine<br/>encode/extract/match/transfer"]
     end
 
-    subgraph Models["Output Models"]
-        M1["HDIMModel<br/>(core)"]
-        M2["TextHDIMModel<br/>+ SimpleTextEncoder"]
-        M3["TextHDIMModel<br/>+ AdvancedTextEncoder"]
-        M4["TextHDIMModel<br/>+ SBERTEncoder"]
-        M5["TextHDIMModel<br/>+ ModernBertEncoder"]
-        M6["TextHDIMModel<br/>+ GatedMLPEncoder"]
+    subgraph Text["Optional Text Adapter"]
+        ADAPTER["TextAdapter<br/>encoder + engine"]
+        SIMPLE["SimpleTextEncoder"]
+        SBERT["SBERTEncoder"]
+        MODERN["ModernBertEncoder"]
+        GMLP["GatedMLPEncoder"]
     end
 
-    HC --> F1 --> M1
-    HC --> F2 --> M2
-    HC --> F2 --> M3
-    HC --> F3 --> M4
-    HC --> F3 --> M5
-    HC --> F3 --> M6
-    EC --> F4 --> M1 & M2 & M4
-
-    subgraph Patches["Patches"]
-        P1["_patch_hierarchical_memory()"]
-        P2["_patch_soft_router()"]
-        P3["_patch_modular_moe()"]
-        P4["_patch_advanced_encoder()"]
-    end
-
-    F2 -.->|"hierarchical_memory=True"| P1
-    F2 -.->|"soft_router=True"| P2
-    F2 -.->|"modular_moe=True"| P3
-    F2 -.->|"advanced_encoder=True"| P4
-```
-
-### 4.2 TextHDIMModel Assembly
-
-```mermaid
-flowchart TD
-    subgraph Input["Input"]
-        CFG["HDIMConfig"]
-        FLAGS["Flags:<br/>soft_router=False<br/>freeze_sbert=True<br/>advanced_encoder=False"]
-    end
-
-    subgraph Core["Core Model Assembly"]
-        HDIM["HDIMModel(cfg)"]
-        PIPE["HDIMPipeline<br/>(encoder, decoder,<br/>domain_rotors, memory, moe)"]
-
-        subgraph CoreComponents["Core Components"]
-            ALG["CliffordAlgebra<br/>(p=3, q=1, r=0)"]
-            ENC["HDIMEncoder<br/>(input_dim, clifford_dim)"]
-            DEC["HDIMDecoder<br/>(clifford_dim, output_dim)"]
-            ROT["ModuleDict[str,<br/>DomainRotationOperator]"]
-            INV["InvariantExtractor"]
-            MEM["TitansMemoryModule"]
-            HBMAMEM["HBMAMemory<br/>(optional, memory_type='hbma')"]
-            MOE["SoftMoERouter"]
-            MOEK["MoEKernel<br/>(optional, modular_moe=True)"]
-        end
-    end
-
-    subgraph Text["Text Model Assembly"]
-        TEXT["TextHDIMModel(core_model)"]
-
-        subgraph EncoderChoice["Text Encoder Choice"]
-            SIMPLE["SimpleTextEncoder<br/>(trainable)"]
-            ADV["AdvancedTextEncoder<br/>(Transformer+RoPE)"]
-            SBERT["SBERTEncoder<br/>(frozen+proj)"]
-            MODERN["ModernBertEncoder<br/>(ModernBERT backbone)"]
-            GMLP["GatedMLPEncoder<br/>(Gated MLP)"]
-        end
-    end
-
-    subgraph Output["Final Model"]
-        MODEL["TextHDIMModel<br/>{core_model, text_encoder}"]
-    end
-
-    CFG --> HDIM --> PIPE
-    PIPE --> ALG & ENC & DEC & ROT & INV & MEM & HBMAMEM & MOE & MOEK
-
-    CFG --> TEXT
-    FLAGS -->|"default"| SIMPLE
-    FLAGS -->|"advanced_encoder=True"| ADV
-    FLAGS -->|"pretrained_encoder"| SBERT
-    FLAGS -->|"modern_encoder"| MODERN
-    FLAGS -->|"gated_encoder"| GMLP
-    TEXT --> MODEL
-    HDIM --> TEXT
-    SIMPLE & ADV & SBERT & MODERN & GMLP --> TEXT
+    HC --> HDIM --> ENGINE
+    EC --> HC
+    SIMPLE & SBERT & MODERN & GMLP --> ADAPTER --> ENGINE
 ```
 
 ---
 
 ## 5. API Sequence Diagrams
 
-### 5.1 Forward Texts
+### 5.1 Text Encoding
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant TextModel as TextHDIMModel
-    participant Encoder as SBERTEncoder
-    participant Core as HDIMModel
-    participant Pipeline as HDIMPipeline
+    participant Adapter as TextAdapter
+    participant Encoder as SimpleTextEncoder
+    participant Engine as HDIMCoreEngine
 
-    User->>TextModel: forward_texts(texts, domain_id)
-
-    rect rgb(200, 220, 240)
-        Note over TextModel,Encoder: Encoding Phase
-        TextModel->>Encoder: encode_texts(texts, device)
-        Encoder-->>TextModel: encodings (B, hidden_dim)
-    end
-
-    rect rgb(220, 240, 200)
-        Note over TextModel,Core: Core Processing
-        TextModel->>Core: forward(encodings, domain_id)
-        Core->>Pipeline: transfer(encodings, domain, domain)
-    end
-
-    rect rgb(240, 220, 200)
-        Note over Pipeline: Same-Domain Transfer
-        Pipeline->>Pipeline: encode_domain(x, domain)
-        Pipeline->>Pipeline: _apply_memory(u_inv)
-        Pipeline->>Pipeline: moe(u_mem)
-        Pipeline->>Pipeline: decoder(g_target)
-    end
-
-    Pipeline-->>Core: output, state_dict
-    Core-->>TextModel: output, routing_weights, invariant
-    TextModel-->>User: output, routing_weights, invariant
+    User->>Adapter: encode(texts)
+    Adapter->>Adapter: encode_texts(texts)
+    Adapter->>Encoder: forward(texts, device, dtype)
+    Encoder-->>Adapter: embeddings (B, hidden_dim)
+    Adapter->>Engine: encode(embeddings)
+    Engine-->>Adapter: G multivectors
+    Adapter-->>User: G multivectors
 ```
 
-### 5.2 Transfer Texts
+### 5.2 Text Invariant Extraction
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant TextModel as TextHDIMModel
-    participant Encoder as SBERTEncoder
-    participant Core as HDIMModel
-    participant Pipeline as HDIMPipeline
+    participant Adapter as TextAdapter
+    participant Engine as HDIMCoreEngine
 
-    User->>TextModel: transfer_texts(texts, source_domain, target_domain)
-
-    rect rgb(200, 220, 240)
-        Note over TextModel,Encoder: Encoding Phase
-        TextModel->>Encoder: encode_texts(texts, device)
-        Encoder-->>TextModel: encodings (B, hidden_dim)
-    end
-
-    rect rgb(220, 240, 200)
-        Note over TextModel,Core: Core Processing
-        TextModel->>Core: transfer(encodings, source_domain, target_domain)
-        Core->>Pipeline: transfer(x, source_domain, target_domain)
-    end
-
-    rect rgb(240, 220, 200)
-        Note over Pipeline: Invariant Extraction
-        Pipeline->>Pipeline: encoder(x) → g_source
-        Pipeline->>Pipeline: invariant_extractor(g_source, R_source) → u_inv
-        Pipeline->>Pipeline: invariant_norm(u_inv)
-    end
-
-    rect rgb(240, 200, 220)
-        Note over Pipeline: Memory + Routing
-        Pipeline->>Pipeline: memory.retrieve_and_update(key, u_inv) → u_mem
-        Pipeline->>Pipeline: moe(u_mem) → u_route
-    end
-
-    rect rgb(200, 240, 240)
-        Note over Pipeline: Transfer + Decode
-        Pipeline->>Pipeline: sandwich_transfer(g_source, R_src, R_tgt, u_route) → g_target
-        Pipeline->>Pipeline: decoder(g_target) → output
-    end
-
-    Pipeline-->>Core: output, state_dict
-    Core-->>TextModel: output, routing, invariant, aux_state
-    TextModel-->>User: output, routing, invariant, aux_state
+    User->>Adapter: extract_texts(texts, domain)
+    Adapter->>Adapter: encode(texts)
+    Adapter->>Engine: extract(G, domain)
+    Engine-->>Adapter: U_inv
+    Adapter-->>User: U_inv
 ```
 
-### 5.3 Score Text Pairs
+### 5.3 Text Matching
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant TextModel as TextHDIMModel
-    participant Core as HDIMModel
+    participant Adapter as TextAdapter
+    participant Engine as HDIMCoreEngine
+    participant Index as InvariantIndex
 
-    User->>TextModel: score_text_pairs_with_state(source_texts, target_texts, source_domain, target_domain)
-
-    rect rgb(220, 240, 200)
-        Note over TextModel: Encoding
-        TextModel->>TextModel: encode_texts(source_texts) → source_enc
-        TextModel->>TextModel: encode_texts(target_texts) → target_enc
-    end
-
-    rect rgb(200, 220, 240)
-        Note over Core: Source Transfer
-        TextModel->>Core: transfer(source_enc, source_domain, source_domain)
-        Core-->>TextModel: source_state {exported_invariant, ...}
-    end
-
-    rect rgb(200, 240, 220)
-        Note over Core: Target Transfer
-        TextModel->>Core: transfer(target_enc, source_domain, target_domain)
-        Core-->>TextModel: target_state {exported_invariant, ...}
-    end
-
-    rect rgb(240, 220, 200)
-        Note over TextModel: Scoring
-        TextModel->>TextModel: cos_sim(source_state.invariant, target_state.invariant)
-        TextModel-->>User: scores, source_state, target_state
-    end
+    User->>Adapter: match_texts(texts, domain, top_k)
+    Adapter->>Adapter: extract_texts(texts, domain)
+    Adapter->>Index: search(U_inv, top_k)
+    Index-->>Adapter: ranked AnalogyMatch lists
+    Adapter-->>User: matches
 ```
 
 ---
@@ -1459,19 +1310,18 @@ flowchart TD
 - [`src/core/moe_kernel.py`](../src/core/moe_kernel.py) -- `MoEKernel`, `MoEKernelConfig`, `MoEKernelState`
 - [`src/core/moe_kernel_adapter.py`](../src/core/moe_kernel_adapter.py) -- `MoEKernelAdapter`
 - [`src/core/maxscore_router.py`](../src/core/maxscore_router.py) -- `MaxScoreRouter`, `RouterResult`, `RouterCheckpoint`
-- [`src/core/hallucination_detector.py`](../src/core/hallucination_detector.py) -- `HallucinationDetector`
-- [`src/core/hallucination_feedback.py`](../src/core/hallucination_feedback.py) -- `HallucinationFeedbackLoop`
-- [`src/core/semantic_entropy_probe.py`](../src/core/semantic_entropy_probe.py) -- `SemanticEntropyProbe`
+- [`src/extensions/hallucination/detector.py`](../src/extensions/hallucination/detector.py) -- `HallucinationDetector`
+- [`src/extensions/hallucination/feedback.py`](../src/extensions/hallucination/feedback.py) -- `HallucinationFeedbackLoop`
+- [`src/extensions/hallucination/semantic_entropy_probe.py`](../src/extensions/hallucination/semantic_entropy_probe.py) -- `SemanticEntropyProbe`
 - [`src/core/online_learner.py`](../src/core/online_learner.py) -- `OnlineLearner`
-- [`src/core/online_lora.py`](../src/core/online_lora.py) -- `OnlineLoRA`
+- [`src/extensions/lora/online_lora.py`](../src/extensions/lora/online_lora.py) -- `OnlineLoRA`
 - [`src/core/continual_norm.py`](../src/core/continual_norm.py) -- `ContinualNorm`
 - [`src/core/hdim_pipeline.py`](../src/core/hdim_pipeline.py) -- `HDIMPipeline`
 
 ### Model Layer
 - [`src/models/hdim_model.py`](../src/models/hdim_model.py) -- `HDIMConfig`
 - [`src/models/hdim_model.py`](../src/models/hdim_model.py) -- `HDIMModel`
-- [`src/models/text_hdim_model.py`](../src/models/text_hdim_model.py) -- `TextHDIMModel`
-- [`src/models/model_factory.py`](../src/models/model_factory.py) -- `build_sbert_hdim_model()`
+- [`src/adapters/text.py`](../src/adapters/text.py) -- `TextAdapter`, `SimpleTextEncoder`
 - [`src/models/modern_text_encoder.py`](../src/models/modern_text_encoder.py) -- `ModernBertEncoder`, `GatedMLPEncoder`
 
 ### Training Layer

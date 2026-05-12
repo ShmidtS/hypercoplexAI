@@ -416,9 +416,7 @@ class TestSurpriseSignalIntegration:
         model = HDIMModel(config)
         model.eval()
 
-        # Enable gradient surprise on the memory module
-        if hasattr(model.pipeline.memory, 'use_gradient_surprise'):
-            model.pipeline.memory.use_gradient_surprise = True
+        assert not hasattr(model.pipeline, "memory")
 
         x = torch.randn(2, 64)
         domain_id = torch.tensor([0, 1])
@@ -448,9 +446,7 @@ class TestSurpriseSignalIntegration:
         model = HDIMModel(config)
         model.eval()
 
-        # Enable gradient surprise
-        if hasattr(model.pipeline.memory, 'titans'):
-            model.pipeline.memory.titans.use_gradient_surprise = True
+        assert not hasattr(model.pipeline, "memory")
 
         x = torch.randn(2, 64)
         domain_id = torch.tensor([0, 1])

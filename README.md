@@ -2,13 +2,13 @@
 
 [Python 3.10+](https://www.python.org/downloads/)
 [PyTorch 2.0+](https://pytorch.org/)  
-[Lean4](verify_lean4_numerical.py)
+[Lean4](formalization/verify_numerical.py)
 [Tests](tests/)
 [![Project Status](https://img.shields.io/badge/status-active-success.svg)](https://github.com/hypercoplex/hdim/issues) • [Contributing](CONTRIBUTING.md)
 
 > **Best Score:** 1.1814 (Run 18, epoch 13, temp=0.10, lambda_pair=0.40) — `pair_margin=1.0224`, `STS=0.537`
 > **Phase 30+:** MoEKernel + Hallucination detection + Online learning
-> **Numerical validation:** pytest 754 PASS (10 skipped) | Lean4 161/163 PASS
+> **Numerical validation:** pytest suite and Lean4 formalization available; run verification commands below for current status
 > **Features:** MoEKernel (math/language/code/science) + SharedExpert + AuxLossFree + ExpertOrtho + HallucinationDetector + OnlineLearner + OnlineLoRA
 
 ---
@@ -130,9 +130,9 @@ G_B = R_B ⊗ U_inv ⊗ R_B⁻¹
 
 This reconstructs the target domain representation from the invariant.
 
-### Verification: 163 Numerical Tests (161 PASS, 2 FAIL float32)
+### Verification
 
-All mathematical properties are numerically verified in `verify_lean4_numerical.py` (tolerance-based Python tests):
+Mathematical properties are numerically verified in `formalization/verify_numerical.py` (tolerance-based Python checks):
 
 
 | Category              | Theorems | Status         |
@@ -148,7 +148,7 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 | Training Losses       | 5        | PASS           |
 | Memory Adapters       | 5        | PASS           |
 | **MoEKernel (Ph.28)** | **11**   | PASS           |
-| **Total**             | **163**  | **161 PASS, 2 FAIL (float32 tolerance)** |
+| **Total**             | Run `python formalization/verify_numerical.py` for current status | |
 
 
 ---
@@ -257,24 +257,24 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 | **CliffordAlgebra**        | Cl(3,1,0) implementation with Cayley-table geometric product | `src/core/hypercomplex.py`          |
 | **DomainRotationOperator** | Learnable rotor for domain transformations                   | `src/core/domain_operators.py`      |
 | **InvariantExtractor**     | Sandwich product: R⁻¹⊗G⊗R                                    | `src/core/domain_operators.py`      |
-| **TitansMemoryModule**     | Test-Time Training memory (fp32-safe)                        | `src/core/titans_memory.py`         |
-| **HBMAMemory**             | 4-system memory (Working, Episodic, Semantic, Procedural)    | `src/core/hbma_memory.py`           |
-| **SoftMoERouter**          | Soft MoE with SharedExpert + AuxLossFree                     | `src/core/soft_moe_router.py`       |
-| **MoEKernel**              | Full MoE kernel: math/language/code/science domain experts   | `src/core/moe_kernel.py`            |
-| **MaxScoreRouter**         | Module not yet implemented. See issue/placeholder.           | `src/core/maxscore_router.py`       |
-| **MoEKernelAdapter**       | Adapts MoEKernel to MoERouter interface                      | `src/core/moe_kernel_adapter.py`    |
-| **HDIMPipeline**           | End-to-end pipeline orchestrator                             | `src/core/hdim_pipeline.py`         |
-| **HallucinationDetector**  | 5-signal weighted risk detection (entropy, confidence, mismatch, semantic, eigen) | `src/core/hallucination_detector.py` |
-| **HallucinationFeedbackLoop** | Risk-based rerouting, confidence adjustment, memory consolidation | `src/core/hallucination_feedback.py` |
-| **SemanticEntropyProbe**   | Linear probe for uncertainty quantification (Kossen ICLR 2024) | `src/core/semantic_entropy_probe.py` |
-| **OnlineLearner**          | Continual learning with gradient modes (detached/selective/full) | `src/core/online_learner.py`       |
-| **OnlineLoRA**             | Task-free low-rank adaptation (Wei et al. WACV 2025)         | `src/core/online_lora.py`          |
-| **ContinualNorm**          | Module not yet implemented. See issue/placeholder.           | `src/core/continual_norm.py`       |
-| **MemoryPersistence**      | Module not yet implemented. See issue/placeholder.           | `src/core/memory_persistence.py`   |
-| **MSAAttention**           | Module not yet implemented. See issue/placeholder.           | `src/core/msa_attention.py`        |
-| **TransferEngine**         | MoE routing + sandwich transfer + decode                      | `src/core/transfer_engine.py`      |
-| **DomainEncoder**          | Encoder + rotors + invariant extraction                       | `src/core/domain_encoder.py`       |
-| **InvariantProcessor**     | Memory-based invariant processing through MemoryInterface     | `src/core/invariant_processor.py`  |
+| **InvariantIndex**         | Invariant search index                                      | `src/core/invariant_index.py`     |
+| **CoreEngineConfig**       | Core engine configuration                                   | `src/core/engine.py`              |
+| **HDIMCoreEngine**         | Minimal encode/extract/match/transfer engine                | `src/core/engine.py`              |
+
+### Extensions Layer
+
+| Component                  | Description                                                  | File                                      |
+| -------------------------- | ------------------------------------------------------------ | ----------------------------------------- |
+| **TitansMemoryModule**     | Test-Time Training memory                                    | `src/extensions/memory/titans.py`         |
+| **HBMAMemory**             | 4-system memory (Working, Episodic, Semantic, Procedural)    | `src/extensions/memory/hbma.py`           |
+| **SoftMoERouter**          | Soft MoE routing                                             | `src/extensions/moe/soft_router.py`       |
+| **MoEKernel**              | Full MoE kernel: math/language/code/science domain experts   | `src/extensions/moe/kernel.py`            |
+| **CliffordInteraction**    | Clifford interaction layer                                   | `src/extensions/moe/clifford_interaction.py` |
+| **InvariantProcessor**     | Memory-based invariant processing                            | `src/extensions/memory/invariant_processor.py` |
+| **HallucinationDetector**  | 5-signal weighted risk detection                             | `src/extensions/hallucination/detector.py` |
+| **HallucinationFeedbackLoop** | Risk-based feedback loop                                  | `src/extensions/hallucination/feedback.py` |
+| **SemanticEntropyProbe**   | Linear probe for uncertainty quantification                  | `src/extensions/hallucination/semantic_entropy_probe.py` |
+| **OnlineLoRA**             | Task-free low-rank adaptation                                | `src/extensions/lora/online_lora.py`      |
 
 
 ### Model Layer
@@ -282,8 +282,7 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 
 | Component         | Description                                    | File                                |
 | ----------------- | ---------------------------------------------- | ----------------------------------- |
-| **HDIMModel**     | Core HDIM model with configurable architecture | `src/models/hdim_model.py:117`      |
-| **TextHDIMModel** | Text-to-embedding wrapper                      | `src/models/text_hdim_model.py:191` |
+| **HDIMModel**     | Core HDIM model wrapper                        | `src/models/hdim_model.py`          |
 | **SBERTEncoder**  | Frozen SBERT encoder wrapper                   | `src/models/sbert_encoder.py`       |
 | **ModernBertEncoder** | ModernBERT with Matryoshka multi-scale     | `src/models/modern_text_encoder.py` |
 
@@ -293,7 +292,8 @@ All mathematical properties are numerically verified in `verify_lean4_numerical.
 
 | Component       | Description                        | File                         |
 | --------------- | ---------------------------------- | ---------------------------- |
-| **HDIMTrainer** | Full training loop with all losses | `src/training/trainer.py` |
+| **InvariantTrainer** | Active training loop | `src/training/invariant_trainer.py` |
+| **HDIMTrainer** | Legacy training loop | `src/training/trainer.py` |
 
 
 ---
@@ -385,11 +385,9 @@ optuna  # for auto_tune
 ### Minimal Example
 
 ```python
-from src.models.model_factory import build_sbert_hdim_model
-from src.models.hdim_model import HDIMConfig
+from src.models.hdim_model import HDIMConfig, HDIMModel
 import torch
 
-# Configure model
 config = HDIMConfig(
     hidden_dim=256,
     num_domains=4,
@@ -399,35 +397,19 @@ config = HDIMConfig(
     clifford_p=3,  # Cl(3,1,0)
     clifford_q=1,
     clifford_r=0,
-    domain_names=["physics", "chemistry", "biology", "engineering"],
+    domain_names=("physics", "chemistry", "biology", "engineering"),
 )
 
-# Build model
-model = build_sbert_hdim_model(
-    config,
-    soft_router=True,      # Use SoftMoERouter (recommended)
-    freeze_sbert=True,     # Freeze SBERT encoder (recommended)
-    z_loss_weight=0.01,    # MoE anti-collapse
-)
-
-# Encode texts
-texts = [
-    "Cavitation erosion in hydraulic turbines causes surface damage",
-    "Ultrasonic plaque removal uses cavitation bubbles",
-]
-encodings = model.encode_texts(texts, device="cuda")
-
-# Cross-domain transfer
+model = HDIMModel(config).to("cuda")
+encodings = torch.randn(2, config.hidden_dim, device="cuda")
 domain_id = torch.tensor([0, 1], device="cuda")      # physics, chemistry
 target_domain = torch.tensor([1, 0], device="cuda")  # chemistry, physics
 
-output, routing, invariant, state = model.transfer_text_pairs(
-    texts, domain_id, target_domain
-)
+result = model.transfer_pairs(encodings, domain_id, target_domain)
 
-print(f"Output shape: {output.shape}")           # (2, hidden_dim)
-print(f"Routing weights: {routing['weights']}")  # Expert assignments
-print(f"Invariant norm: {invariant.norm()}")    # Should equal input norm
+print(f"Output shape: {result.output.shape}")
+print(f"Routing weights shape: {result.routing_weights.shape}")
+print(f"Invariant norm: {result.invariant.norm()}")
 ```
 
 ---
@@ -530,10 +512,10 @@ python scripts/auto_tune.py \
 ### Run All Tests
 
 ```bash
-# Numerical verification (163 tests, 161 PASS, 2 FAIL float32)
-python verify_lean4_numerical.py
+# Numerical verification
+python formalization/verify_numerical.py
 
-# pytest suite (754 tests PASS, 10 skipped)
+# pytest suite
 python -m pytest tests/ -v
 
 # Real-model verification (MoEKernel on SBERT + real_pairs_v10.json)
@@ -550,7 +532,7 @@ python -c "from src.core.hypercomplex import CliffordAlgebra; \
 
 ```python
 # Run specific category
-python verify_lean4_numerical.py --category sandwich
+python formalization/verify_numerical.py --category sandwich
 
 # Categories:
 # - algebra         (associativity, distributivity, anticommutativity)
@@ -569,42 +551,52 @@ python verify_lean4_numerical.py --category sandwich
 hypercoplexAI/
 ├── src/
 │   ├── core/
-│   │   ├── hypercomplex.py           # CliffordAlgebra, QuaternionLinear
-│   │   ├── domain_operators.py       # DomainRotationOperator, InvariantExtractor
-│   │   ├── hdim_pipeline.py          # HDIMPipeline orchestrator
-│   │   ├── titans_memory.py          # TitansMemoryModule (TTT, RAG freeze)
-│   │   ├── hbma_memory.py            # HBMAMemory (4-system memory)
-│   │   ├── soft_moe_router.py        # SoftMoERouter (Phase 26)
-│   │   ├── moe_kernel.py             # MoEKernel domain experts (Phase 28)
-│   │   ├── moe_kernel_adapter.py     # MoEKernelRouterAdapter drop-in
-│   │   ├── clifford_interaction.py   # CliffordInteractionLayer (CAN)
-│   │   ├── msa_attention.py          # MSA sparse attention (not yet implemented)
-│   │   ├── maxscore_router.py        # MaxScoreRouter (Wang ACL 2025) (not yet implemented)
-│   │   ├── hallucination_detector.py # HallucinationDetector (5-signal)
-│   │   ├── hallucination_feedback.py # HallucinationFeedbackLoop
-│   │   ├── semantic_entropy_probe.py # SemanticEntropyProbe
-│   │   ├── online_learner.py         # OnlineLearner (continual learning)
-│   │   ├── online_lora.py            # OnlineLoRA (task-free LoRA)
-│   │   ├── continual_norm.py        # ContinualNorm (streaming norm) (not yet implemented)
-│   │   ├── memory_persistence.py     # MemoryPersistence (atomic checkpoint) (not yet implemented)
-│   │   ├── memory_interface.py       # MemoryInterface ABC
-│   │   ├── transfer_engine.py        # TransferEngine
-│   │   ├── transfer_state.py         # TransferState dataclass
-│   │   ├── domain_encoder.py         # DomainEncoder
-│   │   ├── invariant_processor.py   # InvariantProcessor
-│   │   ├── moe_interface.py          # MoERouter ABC
-│   │   └── auto_config.py            # AutoConfig utilities
+│   │   ├── algebra.py                # CliffordAlgebra
+│   │   ├── rotors.py                 # DomainRotationOperator
+│   │   ├── invariants.py             # InvariantExtractor, sandwich_transfer
+│   │   ├── invariant_index.py        # InvariantIndex
+│   │   ├── engine.py                 # CoreEngineConfig, HDIMCoreEngine
+│   │   ├── hypercomplex.py           # compatibility exports
+│   │   ├── domain_operators.py       # compatibility exports
+│   │   ├── hdim_pipeline.py          # compatibility wrapper
+│   │   ├── domain_encoder.py         # compatibility wrapper
+│   │   ├── transfer_engine.py        # compatibility wrapper
+│   │   └── transfer_state.py         # TransferState dataclass
+│   ├── extensions/
+│   │   ├── memory/
+│   │   │   ├── titans.py             # TitansMemoryModule
+│   │   │   ├── hbma.py               # HBMAMemory
+│   │   │   ├── interface.py          # MemoryInterface ABC
+│   │   │   ├── invariant_processor.py # InvariantProcessor
+│   │   │   ├── msa.py                # MSA memory
+│   │   │   └── sparse_index.py       # Sparse retrieval index
+│   │   ├── moe/
+│   │   │   ├── kernel.py             # MoEKernel domain experts
+│   │   │   ├── soft_router.py        # SoftMoERouter
+│   │   │   ├── interface.py          # MoERouter ABC
+│   │   │   └── clifford_interaction.py # CliffordInteractionLayer
+│   │   ├── hallucination/
+│   │   │   ├── detector.py           # HallucinationDetector
+│   │   │   ├── feedback.py           # HallucinationFeedbackLoop
+│   │   │   └── semantic_entropy_probe.py # SemanticEntropyProbe
+│   │   └── lora/
+│   │       ├── online_lora.py        # OnlineLoRA
+│   │       └── per_domain_lora.py    # Per-domain LoRA
 │   ├── models/
-│   │   ├── hdim_model.py        # HDIMModel, HDIMConfig
-│   │   ├── text_hdim_model.py   # TextHDIMModel
-│   │   ├── sbert_encoder.py     # SBERTEncoder wrapper
-│   │   ├── modern_text_encoder.py # ModernBertEncoder, GatedMLPEncoder, HybridEncoder
-│   │   ├── metrics.py           # compute_all_metrics, analogy_feasibility_rate
-│   │   └── model_factory.py     # build_*() functions
+│   │   ├── hdim_model.py             # HDIMModel wrapper
+│   │   ├── config.py                 # HDIMConfig
+│   │   ├── results.py                # result containers
+│   │   ├── sbert_encoder.py          # SBERTEncoder wrapper
+│   │   ├── modern_text_encoder.py    # ModernBertEncoder, GatedMLPEncoder, HybridEncoder
+│   │   └── metrics.py                # compute_all_metrics, analogy_feasibility_rate
+│   ├── adapters/
+│   │   └── text.py                   # TextAdapter, SimpleTextEncoder
 │   └── training/
-│       ├── trainer.py           # HDIMTrainer (all losses)
-│       ├── dataset.py           # DomainProblemDataset
-│       └── real_dataset.py      # RealPairsDataset
+│       ├── train.py                  # active training entrypoint
+│       ├── invariant_trainer.py      # InvariantTrainer
+│       ├── trainer.py                # legacy trainer
+│       ├── dataset.py                # DomainProblemDataset
+│       └── real_dataset.py           # RealPairsDataset
 ├── scripts/
 │   ├── gpu_train.py             # PRIMARY training script
 │   ├── auto_tune.py             # Optuna hyperparameter search (v27)
@@ -640,11 +632,12 @@ hypercoplexAI/
 │   ├── test_checkpoint_variants.py  # Checkpoint loading
 │   ├── test_all_modules.py          # Full module smoke test
 │   └── test_triton_performance.py    # Triton kernel benchmarks
-│   # Total: 754 tests PASS (10 skipped)
+│   # Run python -m pytest for current suite status
 ├── docs/
 │   ├── ARCHITECTURE.md          # Full architecture documentation
 │   └── DIAGRAMS.md              # Mermaid diagrams
-├── verify_lean4_numerical.py    # 159 theorem verification
+├── formalization/
+│   └── verify_numerical.py      # Numerical theorem verification
 ├── HDIM.md                      # Technical specification
 └── README.md                    # This file
 ```
@@ -754,11 +747,10 @@ training_config = {
 | Shared Expert        | `src/core/moe_kernel.py` (use_shared_expert) |
 | Titans Memory        | `src/core/titans_memory.py`           |
 | HBMA Adapter         | `src/core/hbma_memory.py`             |
-| Hallucination Detect | `src/core/hallucination_detector.py`  |
+| Hallucination Detect | `src/extensions/hallucination/detector.py` |
 | Online Learning      | `src/core/online_learner.py`          |
-| Memory Persistence   | `src/core/memory_persistence.py` (not yet implemented) |
-| MaxScore Router      | `src/core/maxscore_router.py` (not yet implemented) |
-| MSA Attention        | `src/core/msa_attention.py` (not yet implemented) |
+| MoE Kernel           | `src/extensions/moe/kernel.py`        |
+| Memory Extensions    | `src/extensions/memory/`              |
 
 
 ---
@@ -830,8 +822,8 @@ class CliffordInteractionExpert(nn.Module):
 TitansMemory.freeze_memory() for deterministic embeddings in RAG pipelines.
 
 ```python
-model = build_sbert_hdim_model(config)
-model.freeze_memory()  # Deterministic output for RAG
+model = HDIMModel(config)
+model.reset_memory()  # Compatibility no-op in the streamlined core
 ```
 
 ### Security Fix

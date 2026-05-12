@@ -1,6 +1,6 @@
 import torch
 
-from src.training.trainer import HDIMTrainer
+from src.training.invariant_trainer import InvariantTrainer
 
 
 def test_moe_kernel_checkpoint_migration():
@@ -11,7 +11,7 @@ def test_moe_kernel_checkpoint_migration():
         "pipeline.moe.some_other": torch.randn(4, 4),
     }
 
-    migrated = HDIMTrainer._migrate_checkpoint_state_dict(old_state)
+    migrated = InvariantTrainer._migrate_checkpoint_state_dict(old_state)
 
     assert "pipeline.moe.router_proj.weight" in migrated
     assert "pipeline.moe.experts.0.net.0.weight" in migrated

@@ -121,8 +121,9 @@ class InvariantProcessor(nn.Module):
         Args:
             strategy: стратегия сброса (geometric/hard)
         """
-        if self.memory is not None:
-            self.memory.reset(strategy=strategy)
+        memory: Any = self.memory
+        if memory is not None:
+            memory.reset(strategy=strategy)
 
     def get_memory_loss(self) -> torch.Tensor:
         """Возвращает текущий auxiliary loss памяти.
@@ -130,6 +131,7 @@ class InvariantProcessor(nn.Module):
         Returns:
             Скалярный тензор с memory loss
         """
-        if self.memory is None:
+        memory: Any = self.memory
+        if memory is None:
             return torch.tensor(0.0)
-        return self.memory.memory_loss()
+        return memory.memory_loss()

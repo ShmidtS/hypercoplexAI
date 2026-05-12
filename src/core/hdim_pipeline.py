@@ -28,7 +28,7 @@ from .hypercomplex import CliffordAlgebra
 from .domain_operators import sandwich_transfer
 from .invariant_index import InvariantIndex
 from .domain_encoder import DomainEncoder
-from .invariant_processor import InvariantProcessor, InvariantMemoryState
+from src.extensions.memory.invariant_processor import InvariantProcessor, InvariantMemoryState
 from .transfer_engine import TransferEngine
 from .transfer_state import TransferState
 

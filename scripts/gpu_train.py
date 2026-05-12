@@ -10,7 +10,7 @@ HDIM GPU Training Script с AMP, gradient checkpointing и live monitoring.
   - Checkpoint сохранение каждые N эпох и по лучшей валидации
   - Поддержка SoftMoERouter и frozen SBERT encoder
   - Совместим с ExperimentConfig
-  - Использует model_factory как единственный источник сборки моделей
+  - Собирает HDIMModel напрямую
 
 Запуск:
   python scripts/gpu_train.py --pretrained_encoder --soft_router --use_pairs --amp --real_pairs data/real_pairs_v10.json --epochs 60 --device cuda
@@ -41,9 +41,8 @@ from torch.utils.data import DataLoader
 # Add repo root to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.hdim_model import HDIMConfig
+from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.models.metrics import compute_all_metrics
-from src.models.model_factory import build_hdim_model, build_text_hdim_model, build_sbert_hdim_model, build_modernbert_hdim_model, _patch_moe_kernel
 from src.training.dataset import (
     create_demo_dataset,
     create_group_aware_split,
@@ -144,72 +143,12 @@ def detect_device(requested: str) -> torch.device:
 
 
 def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
-    """Собирает модель через model_factory — единственный источник истины."""
-    if getattr(args, 'modernbert_encoder', False):
-        matryoshka_dims = None
-        _mkr_str = getattr(args, 'modernbert_matryoshka_dims', None)
-        if _mkr_str:
-            matryoshka_dims = [int(d.strip()) for d in _mkr_str.split(',') if d.strip()]
-        model = build_modernbert_hdim_model(
-            cfg,
-            soft_router=args.soft_router,
-            modernbert_model_name=getattr(args, 'modernbert_model_name', 'answerdotai/ModernBERT-base'),
-            freeze_modernbert=getattr(args, 'freeze_modernbert', True),
-            use_cls_pooling=getattr(args, 'modernbert_use_cls_pooling', True),
-            max_length=getattr(args, 'modernbert_max_length', 512),
-            matryoshka_dims=matryoshka_dims,
-            z_loss_weight=getattr(args, 'lambda_z', 0.0),
-        )
-        print("Components: ModernBERT(answerdotai/ModernBERT-base) + Linear Projection")
-        if matryoshka_dims:
-            print(f"  + Matryoshka dims: {matryoshka_dims}")
-        if args.soft_router:
-            print("  + SoftMoERouter")
-        return model
-
-    if getattr(args, 'pretrained_encoder', False):
-        unfreeze_layers = None
-        _unfreeze_str = getattr(args, 'unfreeze_sbert_layers', None)
-        if _unfreeze_str:
-            unfreeze_layers = [s.strip() for s in _unfreeze_str.split(',') if s.strip()]
-        _freeze_frac = getattr(args, 'freeze_sbert_bottom_frac', None)
-        model = build_sbert_hdim_model(
-            cfg,
-            soft_router=args.soft_router,
-            unfreeze_layers=unfreeze_layers,
-            freeze_bottom_frac=_freeze_frac,
-            projection_hidden=getattr(args, 'sbert_projection_hidden', None),
-            z_loss_weight=getattr(args, 'lambda_z', 0.0),
-        )
-        print("Components: SBERT(paraphrase-multilingual-mpnet-base-v2) + SimpleMLP")
-        if unfreeze_layers:
-            print(f"  + Partial SBERT unfreeze: {unfreeze_layers}")
-        if _freeze_frac is not None:
-            print(f"  + Freeze bottom {_freeze_frac*100:.0f}% SBERT layers")
-        if args.soft_router:
-            print("  + SoftMoERouter")
-            if getattr(args, 'moe_kernel', False):
-                use_can = getattr(args, 'can_experts', False)
-                _patch_moe_kernel(
-                    model.core_model,
-                    expert_names=["math", "language", "code", "science"],
-                    z_loss_weight=getattr(args, 'lambda_z', 0.01),
-                    ortho_loss_weight=getattr(args, 'lambda_expert_ortho', 0.01),
-                    use_can_experts=use_can,
-                )
-                expert_type = "CAN" if use_can else "FFN"
-                print(f" + MoEKernel ({expert_type} experts: math/language/code/science)")
-        return model
-
-    if args.soft_router:
-        model = build_text_hdim_model(
-            cfg,
-            soft_router=True,
-            z_loss_weight=getattr(args, 'lambda_z', 0.0),
-        )
-        print("Components: SimpleTextEncoder + SoftMoERouter")
-        return model
-    return build_hdim_model(cfg)
+    """Собирает core HDIMModel напрямую."""
+    if getattr(args, "pretrained_encoder", False) or getattr(args, "modernbert_encoder", False):
+        print("WARNING: text encoder wrappers were removed; using HDIMModel over provided encodings")
+    if getattr(args, "soft_router", False) or getattr(args, "moe_kernel", False):
+        print("WARNING: MoE router plugins are external; using core HDIMModel")
+    return HDIMModel(cfg)
 
 
 class GPUTrainingMonitor:
@@ -837,12 +776,12 @@ def main() -> None:
                         help="Enable gradient checkpointing to reduce activation memory")
     # Model arch
     parser.add_argument("--hidden_dim", type=int, default=None,
-                        help="Model hidden dim (None=auto from encoder_type via AutoConfig)")
+                        help="Model hidden dim (None=default from encoder_type)")
     parser.add_argument("--num_experts", type=int, default=None,
-                        help="Number of experts (None=auto from expert_names via AutoConfig)")
+                        help="Number of experts (None=4)")
     parser.add_argument("--encoder_type", type=str, default="sbert",
                         choices=["sbert", "modernbert", "custom"],
-                        help="Encoder type for AutoConfig (sbert=768, modernbert=768)")
+                        help="Encoder type for default hidden_dim (sbert=768, modernbert=768)")
     parser.add_argument("--num_domains", type=int, default=4)
     parser.add_argument("--clifford_p", type=int, default=4,
                         help="Clifford algebra positive bases (default=4, Cl(4,1,0) dim=32)")
@@ -1009,17 +948,11 @@ def main() -> None:
 
     device = detect_device(args.device)
 
-    # AutoConfig: derive hidden_dim and num_experts if not provided
     encoder_type = getattr(args, 'encoder_type', 'sbert')
-    if args.hidden_dim is None or args.num_experts is None:
-        from src.training.auto_config import AutoConfig
-        auto_cfg = AutoConfig(encoder_type=encoder_type, num_experts=args.num_experts, strict_validation=False)
-        hidden_dim = args.hidden_dim if args.hidden_dim is not None else auto_cfg.hidden_dim_resolved
-        num_experts = args.num_experts if args.num_experts is not None else auto_cfg.num_experts_resolved
-        print(f"AutoConfig: encoder_type={encoder_type} -> hidden_dim={hidden_dim}, num_experts={num_experts}")
-    else:
-        hidden_dim = args.hidden_dim
-        num_experts = args.num_experts
+    default_hidden_dims = {"sbert": 768, "modernbert": 768, "custom": 64}
+    hidden_dim = args.hidden_dim if args.hidden_dim is not None else default_hidden_dims[encoder_type]
+    num_experts = args.num_experts if args.num_experts is not None else 4
+    print(f"Config: encoder_type={encoder_type} -> hidden_dim={hidden_dim}, num_experts={num_experts}")
 
     _dropout_override = getattr(args, 'dropout', None)
     cfg = HDIMConfig(

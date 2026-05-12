@@ -2,6 +2,7 @@
 
 from .config import MemoryConfig, MSAConfig
 from .interface import MemoryInterface, MemoryResult
+from .invariant_processor import InvariantMemoryState, InvariantProcessor
 from .titans import TitansMemory, TitansMemoryModule
 from .hbma import (
     HBMAMemory,
@@ -24,6 +25,8 @@ __all__ = [
     "MSAConfig",
     "MemoryInterface",
     "MemoryResult",
+    "InvariantMemoryState",
+    "InvariantProcessor",
     "TitansMemory",
     "TitansMemoryModule",
     "HBMAMemory",

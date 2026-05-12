@@ -22,7 +22,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.models.hdim_model import HDIMConfig, HDIMModel
-from src.core.hallucination_detector import HallucinationDetector
+from src.extensions.hallucination.detector import HallucinationDetector
 from src.core.online_learner import OnlineLearner
 
 

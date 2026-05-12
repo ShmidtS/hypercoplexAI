@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from src.core.clifford_interaction import CliffordInteractionLayer, CliffordInteractionExpert, CliffordFFN
+from src.extensions.moe.clifford_interaction import CliffordInteractionLayer, CliffordInteractionExpert, CliffordFFN
 
 
 class TestCliffordInteractionLayer:

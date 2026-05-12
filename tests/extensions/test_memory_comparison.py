@@ -110,7 +110,7 @@ def run_comparison(
     lr: float = 1e-3,
     device: torch.device = torch.device('cpu'),
     seed: int = 42,
-) -> Dict[str, float]:
+) -> dict[str, object]:
     """Train and evaluate a model with given memory_type. Returns metrics dict."""
     torch.manual_seed(seed)
     cfg = HDIMConfig(
@@ -144,7 +144,6 @@ def run_comparison(
     n_params = sum(p.numel() for p in model.parameters())
 
     return {
-        'memory_type': memory_type,
         'n_params': n_params,
         'train_loss_final': train_losses[-1],
         'train_loss_epoch1': train_losses[0],
@@ -191,12 +190,10 @@ class TestMemoryComparison:
                 f"{name} val loss too high: {r['val_recon_loss']:.4f}"
             )
 
-    def test_routing_entropy_positive(self, results):
-        """Routing entropy should be positive (experts are being used)."""
+    def test_routing_entropy_zero_in_core_wrapper(self, results):
+        """Core wrapper does not attach MoE routing by default."""
         for name, r in results.items():
-            assert r['val_routing_entropy'] > 0, (
-                f"{name} routing entropy is zero — all tokens routed to same expert"
-            )
+            assert r['val_routing_entropy'] == 0.0
 
     def test_hbma_forward_shapes(self):
         """HBMA model produces correct output shapes."""

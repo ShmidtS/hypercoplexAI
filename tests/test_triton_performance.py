@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import time
 from typing import Tuple
 
-from src.core.clifford_interaction import CliffordInteractionLayer
+from src.extensions.moe.clifford_interaction import CliffordInteractionLayer
 
 
 class TestTritonCorrectness:

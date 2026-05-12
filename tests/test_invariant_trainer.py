@@ -1,4 +1,3 @@
-import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -6,7 +5,6 @@ from src.core.engine import CoreEngineConfig, HDIMCoreEngine
 from src.models.hdim_model import HDIMConfig, HDIMModel
 from src.training.invariant_losses import compute_pair_iso_loss
 from src.training.invariant_trainer import InvariantTrainer
-from src.training.trainer import HDIMTrainer
 
 
 def _batch(hidden_dim: int = 64, batch_size: int = 4) -> dict:
@@ -61,10 +59,3 @@ def test_pair_iso_loss_computes_positive():
 
     assert loss.item() > 0.0
 
-
-def test_deprecated_trainer_warns():
-    model = HDIMModel(HDIMConfig(hidden_dim=64, num_domains=2))
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    with pytest.warns(DeprecationWarning):
-        HDIMTrainer(model, optimizer, device="cpu")

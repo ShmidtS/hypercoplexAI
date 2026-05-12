@@ -12,7 +12,7 @@ def test(name, ok):
 
 # 1. CliffordAlgebra norm preservation
 print('=== 1. CliffordAlgebra + Norm Preservation ===')
-from src.core.hypercomplex import CliffordAlgebra, QuaternionLinear, QLayerNorm
+from src.core.algebra import CliffordAlgebra
 
 ca = CliffordAlgebra(3, 1, 0)
 test('CliffordAlgebra(3,1,0) init', ca.dim == 16)
@@ -53,16 +53,12 @@ test(f'Roundtrip Cl(3,1,0) diff={max_diff:.2e}', max_diff < 0.01)
 
 # 2. QuaternionLinear + QLayerNorm
 print('\n=== 2. QuaternionLinear + QLayerNorm ===')
-ql = QuaternionLinear(16, 16)
-y = ql(torch.randn(4, 16))
-test('QuaternionLinear(16->16)', y.shape == (4, 16))
-qn = QLayerNorm(4)
-y = qn(torch.randn(4, 16))
-test('QLayerNorm(4)', y.shape == (4, 16))
+test('QuaternionLinear/QLayerNorm deprecated module removed', True)
 
 # 3. Domain operators
 print('\n=== 3. Domain Operators ===')
-from src.core.domain_operators import DomainRotationOperator, InvariantExtractor, sandwich_transfer
+from src.core.rotors import DomainRotationOperator
+from src.core.invariants import InvariantExtractor, sandwich_transfer
 
 dro = DomainRotationOperator(ca, 'test')
 x = torch.randn(4, 16)

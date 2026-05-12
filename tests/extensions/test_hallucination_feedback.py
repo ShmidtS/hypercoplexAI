@@ -401,7 +401,7 @@ class TestHDIMIntegration:
 
         assert model.hallucination_feedback_loop is None
 
-    def test_feedback_enabled_in_config(self):
+    def test_feedback_config_flag_does_not_attach_extension_in_core_wrapper(self):
         from src.models.hdim_model import HDIMConfig, HDIMModel
 
         config = HDIMConfig(
@@ -411,7 +411,8 @@ class TestHDIMIntegration:
         )
         model = HDIMModel(config)
 
-        assert model.hallucination_feedback_loop is not None
+        assert model.extension_flags["hallucination_feedback"] is True
+        assert model.hallucination_feedback_loop is None
 
     def test_feedback_action_in_aux_state(self):
         from src.models.hdim_model import HDIMConfig, HDIMModel
