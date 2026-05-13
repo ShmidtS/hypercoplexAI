@@ -78,6 +78,14 @@ class MoEKernel(MoERouter):
         self.input_dim = config.input_dim
         self.expert_names = config.expert_names
 
+        if config.routing_seed is None:
+            self._initialize_parameters(config)
+        else:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(config.routing_seed)
+                self._initialize_parameters(config)
+
+    def _initialize_parameters(self, config: MoEKernelConfig) -> None:
         # --- Router projection: input → slot logits ---
         self.router_proj = nn.Linear(config.input_dim, self.num_slots, bias=False)
         nn.init.normal_(self.router_proj.weight, std=0.02)
