@@ -38,6 +38,7 @@ class MoEKernelConfig:
     use_expert_ortho: bool = True
     aux_lr: float = 0.001
     dropout: float = 0.1
+    routing_seed: int | None = 0
     expert_names: Optional[List[str]] = None
     use_can_experts: bool = False
     # Deprecated: auto-dispatch is always enabled; kept for backward compatibility with tests
