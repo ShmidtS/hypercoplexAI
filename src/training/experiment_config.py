@@ -104,6 +104,8 @@ class ExperimentConfig:
     log_interval: int = 10
     checkpoint_dir: str = "checkpoints"
     data_path: str = "data"
+    compile_model: bool = False
+    compile_mode: str = "default"
 
     # ------------------------------------------------------------------ #
     # Serialisation helpers (unchanged from Phase 1)

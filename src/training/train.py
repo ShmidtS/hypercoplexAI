@@ -76,6 +76,8 @@ def _build_run_summary(
             "negative_ratio": args.negative_ratio,
             "train_fraction": args.train_fraction,
             "seed": args.seed,
+            "compile_model": args.compile_model,
+            "compile_mode": args.compile_mode,
         },
         "validation": val_metrics,
         "quality": quality_metrics,
@@ -102,6 +104,15 @@ def _build_datasets(args: argparse.Namespace, cfg: HDIMConfig):
     return create_group_aware_split(dataset, train_fraction=args.train_fraction, seed=args.seed)
 
 
+def _maybe_compile_model(model: HDIMModel, args: argparse.Namespace) -> HDIMModel:
+    if not args.compile_model:
+        return model
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile requested but unavailable in this PyTorch build")
+    logger.info(f"torch.compile enabled with mode={args.compile_mode}")
+    return torch.compile(model, mode=args.compile_mode)
+
+
 def main() -> None:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
@@ -124,11 +135,18 @@ def main() -> None:
     parser.add_argument("--negative_ratio", type=float, default=TRAINING_DEFAULTS["negative_ratio"])
     parser.add_argument("--train_fraction", type=float, default=TRAINING_DEFAULTS["train_fraction"])
     parser.add_argument("--seed", type=int, default=TRAINING_DEFAULTS["seed"])
+    parser.add_argument("--compile_model", action="store_true", default=False)
+    parser.add_argument(
+        "--compile_mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="default",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
     cfg = _build_config(args)
     model = HDIMModel(cfg)
+    model = _maybe_compile_model(model, args)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     trainer = InvariantTrainer(model, optimizer, device=device)
     train_ds, val_ds = _build_datasets(args, cfg)
