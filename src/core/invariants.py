@@ -2,7 +2,6 @@
 HDIM — focused invariant extraction and transfer helpers.
 """
 
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -34,7 +33,7 @@ def sandwich_transfer(
     G_source: torch.Tensor,
     R_source: DomainRotationOperator,
     R_target: DomainRotationOperator,
-    invariant_override: Optional[torch.Tensor] = None,
+    invariant_override: torch.Tensor | None = None,
 ):
     """Переносит мультивектор через общий инвариант в целевой домен."""
     if invariant_override is None:

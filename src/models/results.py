@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -140,7 +140,7 @@ class CoreResult:
     exported_invariant: torch.Tensor
     matches: list[list[Any]]
     routing_weights: torch.Tensor
-    slot_outputs: Optional[torch.Tensor] = None
+    slot_outputs: torch.Tensor | None = None
 
     @property
     def memory_augmented_invariant(self) -> torch.Tensor:
@@ -170,6 +170,6 @@ class ForwardResult:
     output: torch.Tensor
     routing_weights: torch.Tensor
     invariant: torch.Tensor
-    slot_outputs: Optional[torch.Tensor]
-    aux_state: Optional[Any]
-    encodings: Optional[torch.Tensor] = None
+    slot_outputs: torch.Tensor | None
+    aux_state: Any | None
+    encodings: torch.Tensor | None = None

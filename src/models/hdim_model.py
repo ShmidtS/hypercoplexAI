@@ -2,26 +2,51 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+import math
+from typing import Any
+from typing import Literal
+from typing import cast
 
 import torch
 import torch.nn as nn
 
-from src.core.domain_operators import DomainIndexEmbedding
-from src.core.engine import CoreEngineConfig, HDIMCoreEngine
-from src.models.config import HDIMConfig, HDIMRuntimeConfig, HDIMTextConfig
-from src.models.results import CoreResult, ForwardResult, HDIMAuxState
+from src.core.engine import CoreEngineConfig
+from src.core.engine import HDIMCoreEngine
+from src.models.config import HDIMConfig
+from src.models.config import HDIMRuntimeConfig
+from src.models.config import HDIMTextConfig
+from src.models.results import CoreResult
+from src.models.results import ForwardResult
+from src.models.results import HDIMAuxState
 
-__all__ = ["CoreResult", "ForwardResult", "HDIMAuxState", "HDIMModel", "HDIMModelCore", "HDIMTextConfig"]
+__all__ = ["CoreResult", "ForwardResult", "HDIMAuxState", "HDIMModel", "HDIMTextConfig"]
 
 
-class HDIMModelCore(nn.Module):
-    """Thin adapter around HDIMCoreEngine."""
+class DomainIndexEmbedding(nn.Module):
+    """Sinusoidal embedding over domain indices."""
+
+    def __init__(self, dim: int, max_domains: int = 4):
+        super().__init__()
+        half_dim = dim // 2
+        freq = torch.exp(-math.log(10000.0) * torch.arange(half_dim, dtype=torch.float32) / half_dim)
+        positions = torch.arange(max_domains, dtype=torch.float32).unsqueeze(1)
+        angles = positions * freq.unsqueeze(0)
+        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+        if dim % 2 == 1:
+            emb = torch.cat([emb, torch.zeros(max_domains, 1)], dim=1)
+        self.register_buffer("embedding", emb)
+
+    def forward(self, domain_id: torch.Tensor) -> torch.Tensor:
+        return self.embedding[domain_id]
+
+
+class HDIMModel(nn.Module):
+    """Compatibility wrapper that delegates structural work to HDIMCoreEngine."""
 
     def __init__(self, config: HDIMConfig) -> None:
         super().__init__()
         self.config = config
-        self._domain_names: List[str] = config.get_domain_names()
+        self._domain_names: list[str] = config.get_domain_names()
         self.engine = HDIMCoreEngine(
             CoreEngineConfig(
                 input_dim=config.hidden_dim,
@@ -32,79 +57,16 @@ class HDIMModelCore(nn.Module):
                 dropout=config.dropout,
             )
         )
+        self.project_in = self.engine.encoder
         self.decoder = nn.Linear(self.engine.algebra.dim, config.hidden_dim)
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.engine.encode(x)
-
-    def extract(self, g: torch.Tensor, domain: str) -> torch.Tensor:
-        return self.engine.extract(g, domain)
-
-    def match(self, invariant: torch.Tensor, expert_base: Any = None) -> list[list[Any]]:
-        return self.engine.match(invariant, expert_base=expert_base)
-
-    def transfer(self, invariant: torch.Tensor, target_domain: str) -> torch.Tensor:
-        return self.engine.transfer(invariant, target_domain)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        source_domain: str = "source",
-        target_domain: str = "target",
-    ) -> CoreResult:
-        if not isinstance(source_domain, str):
-            raise TypeError("HDIMModelCore.forward expects source_domain as a domain name")
-        g_source = self.encode(x)
-        raw_invariant = self.extract(g_source, source_domain)
-        matches = self.match(raw_invariant)
-        exported_invariant = self.transfer(raw_invariant, target_domain)
-        return CoreResult(
-            output=self.decoder(exported_invariant),
-            raw_invariant=raw_invariant,
-            exported_invariant=exported_invariant,
-            matches=matches,
-            routing_weights=x.new_zeros(x.shape[0], self.config.num_experts),
-            slot_outputs=None,
-        )
-
-
-class HDIMModel(nn.Module):
-    """Compatibility wrapper that delegates structural work to HDIMCoreEngine."""
-
-    def __init__(self, config: HDIMConfig) -> None:
-        super().__init__()
-        self._core = HDIMModelCore(config)
-        self.config = config
         self.training_inv_head = nn.Linear(self.engine.algebra.dim, config.hidden_dim)
-        self.domain_embedding: Optional[DomainIndexEmbedding] = None
+        self.domain_embedding: DomainIndexEmbedding | None = None
         if config.use_domain_embedding:
             self.domain_embedding = DomainIndexEmbedding(dim=config.hidden_dim, max_domains=config.num_domains)
-        self.extension_flags = {
-            "online_learning": bool(config.runtime.online_learning),
-            "hallucination_detection": bool(config.runtime.hallucination_detection),
-            "hallucination_feedback": bool(config.runtime.hallucination_feedback),
-            "domain_lora": bool(config.use_domain_lora),
-        }
-        self.online_learner = None
-        self.hallucination_detector = None
-        self.hallucination_feedback_loop = None
-        self.domain_lora = None
         self._use_gradient_checkpointing = False
 
     @property
-    def engine(self) -> HDIMCoreEngine:
-        return self._core.engine
-
-    @property
-    def decoder(self) -> nn.Linear:
-        return self._core.decoder
-
-    @property
-    def _domain_names(self) -> List[str]:
-        return self._core._domain_names
-
-    @property
-    def pipeline(self) -> "HDIMModel":
+    def pipeline(self) -> HDIMModel:
         return self
 
     @property
@@ -128,26 +90,29 @@ class HDIMModel(nn.Module):
         return self.engine.index
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self._core.encode(x)
+        return self.engine.encode(x)
 
     def extract(self, g: torch.Tensor, domain: str) -> torch.Tensor:
-        return self._core.extract(g, domain)
+        return self.engine.extract(g, domain)
 
     def match(self, invariant: torch.Tensor, expert_base: Any = None) -> list[list[Any]]:
-        return self._core.match(invariant, expert_base=expert_base)
+        return self.engine.match(invariant, expert_base=expert_base)
 
     def transfer_invariant(self, invariant: torch.Tensor, target_domain: str) -> torch.Tensor:
-        return self._core.transfer(invariant, target_domain)
+        return self.engine.transfer(invariant, target_domain)
 
     def _domain_idx_to_name(self, domain_idx: int) -> str:
         if domain_idx < 0 or domain_idx >= len(self._domain_names):
             raise IndexError(f"domain_idx {domain_idx} out of range [0, {len(self._domain_names)}).")
         return self._domain_names[domain_idx]
 
-    def _resolve_runtime_config(self, *, update_memory: bool, memory_mode: str) -> HDIMRuntimeConfig:
+    def _runtime_config(self, update_memory: bool, memory_mode: str) -> HDIMRuntimeConfig:
         if memory_mode not in {"none", "retrieve", "update"}:
             raise ValueError(f"Unsupported memory_mode: {memory_mode}")
-        return HDIMRuntimeConfig(update_memory=False, memory_mode="none" if memory_mode != "retrieve" else "retrieve")
+        return HDIMRuntimeConfig(
+            update_memory=update_memory,
+            memory_mode=cast("Literal['none', 'retrieve', 'update']", memory_mode),
+        )
 
     def _validate_domain_ids(self, domain_id: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
         if domain_id.ndim != 1:
@@ -236,7 +201,7 @@ class HDIMModel(nn.Module):
         update_memory = kwargs.get("update_memory", True)
         memory_mode = kwargs.get("memory_mode", "update")
         domain_id = self._validate_domain_ids(domain_id.to(device=x.device), x.shape[0], "domain_id")
-        runtime = self._resolve_runtime_config(update_memory=update_memory, memory_mode=memory_mode)
+        runtime = self._runtime_config(update_memory, memory_mode)
         core = self._forward_pairs_core(x, domain_id, domain_id)
         invariant = self.training_inv_head.forward(core.exported_invariant).to(dtype=x.dtype)
         domain_embedding = self.domain_embedding
@@ -254,7 +219,7 @@ class HDIMModel(nn.Module):
         return_state = kwargs.get("return_state", False)
         update_memory = kwargs.get("update_memory", True)
         memory_mode = kwargs.get("memory_mode", "update")
-        runtime = self._resolve_runtime_config(update_memory=update_memory, memory_mode=memory_mode)
+        runtime = self._runtime_config(update_memory, memory_mode)
         core = self._forward_core(
             problem_encoding,
             self._domain_idx_to_name(source_domain),
@@ -279,7 +244,7 @@ class HDIMModel(nn.Module):
         target_domain_id = self._validate_domain_ids(
             target_domain_id.to(device=source_encoding.device), source_encoding.shape[0], "target_domain_id"
         )
-        runtime = self._resolve_runtime_config(update_memory=update_memory, memory_mode=memory_mode)
+        runtime = self._runtime_config(update_memory, memory_mode)
         core = self._forward_pairs_core(source_encoding, source_domain_id, target_domain_id)
         invariant = self.training_inv_head.forward(core.exported_invariant).to(dtype=source_encoding.dtype)
         domain_embedding = self.domain_embedding

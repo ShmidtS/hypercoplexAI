@@ -1,9 +1,9 @@
-from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 
-from .types import AnalogyMatch, InvariantRecord
+from .types import AnalogyMatch
+from .types import InvariantRecord
 
 
 class InvariantIndex:
@@ -11,10 +11,10 @@ class InvariantIndex:
         self.device = device
         self.records: dict[str, InvariantRecord] = {}
         self._keys: list[str] = []
-        self._vectors: Optional[torch.Tensor] = None
+        self._vectors: torch.Tensor | None = None
         self._dirty = False
 
-    def add(self, key: str, invariant: torch.Tensor, metadata: Optional[dict] = None) -> None:
+    def add(self, key: str, invariant: torch.Tensor, metadata: dict | None = None) -> None:
         """Store an invariant vector and mark the search cache dirty.
 
         Args:
@@ -41,7 +41,7 @@ class InvariantIndex:
         self._vectors = F.normalize(vectors, dim=-1)
         self._dirty = False
 
-    def search(self, query: torch.Tensor, top_k: int = 5) -> List[List[AnalogyMatch]]:
+    def search(self, query: torch.Tensor, top_k: int = 5) -> list[list[AnalogyMatch]]:
         if query.dim() == 1:
             query = query.unsqueeze(0)
 
@@ -62,7 +62,7 @@ class InvariantIndex:
             return [[] for _ in range(batch_size)]
         top_scores, top_indices = torch.topk(scores, k=k, dim=-1)
 
-        results: List[List[AnalogyMatch]] = []
+        results: list[list[AnalogyMatch]] = []
         for batch_scores, batch_indices in zip(top_scores, top_indices):
             matches = []
             for score, index in zip(batch_scores, batch_indices):

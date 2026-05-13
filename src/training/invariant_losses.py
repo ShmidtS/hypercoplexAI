@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -73,7 +73,7 @@ def compute_infonce_loss(
 def compute_pair_iso_loss(
     training_invariant: torch.Tensor,
     iso_target: torch.Tensor,
-    batch: Dict[str, Any],
+    batch: dict[str, Any],
     negative_margin: float = 1.0,
     device: torch.device | None = None,
     has_pairs: bool = True,

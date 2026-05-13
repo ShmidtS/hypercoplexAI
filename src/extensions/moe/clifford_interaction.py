@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
 
-from src.core.hypercomplex import CliffordAlgebra
+from src.core.algebra import CliffordAlgebra
 
 # Triton acceleration not available
 TRITON_AVAILABLE = False

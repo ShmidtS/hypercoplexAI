@@ -1,29 +1,10 @@
-"""Real cross-domain pairs dataset for HDIM training.
-
-Загружает JSON-файл с размеченными позитивными/негативными парами
-из разных доменов для обучения HDIM на реальных данных.
-
-Формат JSON:
-[
-  {
-    "source_text": str,
-    "source_domain": int,
-    "target_text": str,
-    "target_domain": int,
-    "relation": "positive" | "negative",
-    "group_id": int,
-    "family": str
-  },
-  ...
-]
-"""
+"""Real cross-domain pairs dataset for HDIM training."""
 
 from __future__ import annotations
 
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -47,7 +28,7 @@ class RealPairsDataset(Dataset):
 
     def __init__(
         self,
-        pairs: List[Dict],
+        pairs: list[dict],
         *,
         augment_factor: int = 1,
         seed: int = 42,
@@ -61,14 +42,8 @@ class RealPairsDataset(Dataset):
         self.negative_ratio = negative_ratio
         self._items = self._build_items(seed)
 
-    def _build_items(self, seed: int) -> List[Dict]:
-        """Build flat list of items from pairs.
-
-        Каждая пара порождает:
-        - source → target (forward, positive)
-        - target → source (backward, positive)
-        - synthetic negatives: src из группы A paired с tgt из группы B (cross-group)
-        """
+    def _build_items(self, seed: int) -> list[dict]:
+        """Build flat list of items from pairs."""
         rng = random.Random(seed)
         items = []
         for pair in self.pairs:
@@ -133,7 +108,7 @@ class RealPairsDataset(Dataset):
     def __len__(self) -> int:
         return len(self._items)
 
-    def __getitem__(self, idx: int) -> Dict:
+    def __getitem__(self, idx: int) -> dict:
         item = self._items[idx]
         label = 1.0 if item["relation"] == "positive" else 0.0
         return {
@@ -179,11 +154,11 @@ def split_real_pairs(
     dataset: RealPairsDataset,
     train_fraction: float = 0.8,
     seed: int = 42,
-) -> Tuple[torch.utils.data.Subset, torch.utils.data.Subset]:
+) -> tuple[torch.utils.data.Subset, torch.utils.data.Subset]:
     """Split by group_id to avoid leakage."""
     from collections import defaultdict
 
-    groups: Dict[int, List[int]] = defaultdict(list)
+    groups: dict[int, list[int]] = defaultdict(list)
     for idx in range(len(dataset)):
         item = dataset._items[idx]
         groups[item["group_id"]].append(idx)
@@ -191,9 +166,9 @@ def split_real_pairs(
     group_ids = list(groups.keys())
     random.Random(seed).shuffle(group_ids)
 
-    target_train = int(round(train_fraction * len(dataset)))
-    train_indices: List[int] = []
-    val_indices: List[int] = []
+    target_train = round(train_fraction * len(dataset))
+    train_indices: list[int] = []
+    val_indices: list[int] = []
 
     for gid in group_ids:
         if len(train_indices) < target_train:

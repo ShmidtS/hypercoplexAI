@@ -5,17 +5,20 @@ from __future__ import annotations
 import hashlib
 import random
 from collections import defaultdict
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING
 
 import torch
-from torch.utils.data import Dataset
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+from torch.utils.data import Dataset
 
 # ---------------------------------------------------------------------------
 # Simple character-level tokeniser / embedder
 # ---------------------------------------------------------------------------
 
-def _text_to_embedding(text: str, dim: int, seed: Optional[int] = None) -> torch.Tensor:
+
+def _text_to_embedding(text: str, dim: int, seed: int | None = None) -> torch.Tensor:
     """Convert a text string to a fixed-size float embedding.
 
     Uses a deterministic hash-based projection so the same text always
@@ -47,7 +50,7 @@ def texts_to_tensor(
     texts: Sequence[str],
     dim: int,
     *,
-    seed: Optional[int] = None,
+    seed: int | None = None,
 ) -> torch.Tensor:
     """Encode raw texts into a batch tensor for the minimal text-mode scaffold."""
     if len(texts) == 0:
@@ -59,6 +62,7 @@ def texts_to_tensor(
 # Dataset
 # ---------------------------------------------------------------------------
 
+
 class DomainProblemDataset(Dataset):
     """Dataset of domain-labelled problem samples for HDIM training.
 
@@ -69,12 +73,12 @@ class DomainProblemDataset(Dataset):
 
     def __init__(
         self,
-        samples: List[Tuple[str, int]],
+        samples: list[tuple[str, int]],
         embed_dim: int = 64,
-        pair_indices: Optional[List[int]] = None,
-        pair_group_ids: Optional[List[int]] = None,
-        pair_relation_types: Optional[List[str]] = None,
-        pair_weights: Optional[List[float]] = None,
+        pair_indices: list[int] | None = None,
+        pair_group_ids: list[int] | None = None,
+        pair_relation_types: list[str] | None = None,
+        pair_weights: list[float] | None = None,
     ) -> None:
         assert embed_dim % 4 == 0, f"embed_dim must be divisible by 4, got {embed_dim}"
         self.samples = samples
@@ -83,10 +87,8 @@ class DomainProblemDataset(Dataset):
         self.pair_group_ids = pair_group_ids
         self.pair_relation_types = pair_relation_types
         self.pair_weights = pair_weights
-        self._encodings: List[torch.Tensor] = [
-            _text_to_embedding(text, embed_dim) for text, _ in samples
-        ]
-        self._labels: List[int] = [label for _, label in samples]
+        self._encodings: list[torch.Tensor] = [_text_to_embedding(text, embed_dim) for text, _ in samples]
+        self._labels: list[int] = [label for _, label in samples]
 
         if self.pair_indices is not None:
             if len(self.pair_indices) != len(self.samples):
@@ -135,7 +137,7 @@ class DomainProblemDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         item = {
             "text": self.samples[idx][0],
             "encoding": self._encodings[idx].float(),
@@ -165,7 +167,7 @@ class DomainProblemDataset(Dataset):
 # Demo factory
 # ---------------------------------------------------------------------------
 
-_DOMAIN_TEMPLATES: Dict[int, List[str]] = {
+_DOMAIN_TEMPLATES: dict[int, list[str]] = {
     0: [
         "How to reduce cavitation damage in pump impellers?",
         "Minimise thermal stress in turbine blades under cyclic loading.",
@@ -200,9 +202,9 @@ _DOMAIN_TEMPLATES: Dict[int, List[str]] = {
 def _generate_demo_samples(
     n_samples: int,
     num_domains: int,
-) -> Tuple[List[Tuple[str, int]], List[int]]:
-    samples: List[Tuple[str, int]] = []
-    variant_ids: List[int] = []
+) -> tuple[list[tuple[str, int]], list[int]]:
+    samples: list[tuple[str, int]] = []
+    variant_ids: list[int] = []
     per_domain = n_samples // num_domains
     remainder = n_samples % num_domains
 
@@ -248,14 +250,14 @@ def create_paired_demo_dataset(
 
     samples, variant_ids = _generate_demo_samples(n_samples, num_domains)
 
-    variant_to_indices: Dict[int, List[int]] = {}
+    variant_to_indices: dict[int, list[int]] = {}
     for idx, variant_id in enumerate(variant_ids):
         variant_to_indices.setdefault(variant_id, []).append(idx)
 
-    pair_indices: List[int] = []
-    pair_relation_types: List[str] = []
-    pair_group_ids: List[int] = []
-    pair_weights: List[float] = []
+    pair_indices: list[int] = []
+    pair_relation_types: list[str] = []
+    pair_group_ids: list[int] = []
+    pair_weights: list[float] = []
     next_negative_group_id = max(variant_ids, default=-1) + 1
 
     for idx, (_, domain_id) in enumerate(samples):
@@ -314,7 +316,7 @@ def create_group_aware_split(
     dataset: DomainProblemDataset,
     train_fraction: float = 0.8,
     seed: int = 42,
-) -> Tuple[torch.utils.data.Subset, torch.utils.data.Subset]:
+) -> tuple[torch.utils.data.Subset, torch.utils.data.Subset]:
     """Split dataset by pair groups/families to avoid template leakage across splits."""
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train_fraction must be between 0 and 1")
@@ -325,15 +327,15 @@ def create_group_aware_split(
         val_size = len(dataset) - train_size
         return torch.utils.data.random_split(dataset, [train_size, val_size], generator=generator)
 
-    groups: Dict[int, List[int]] = defaultdict(list)
+    groups: dict[int, list[int]] = defaultdict(list)
     for idx, group_id in enumerate(dataset.pair_group_ids):
         groups[group_id].append(idx)
 
     group_ids = list(groups.keys())
     random.Random(seed).shuffle(group_ids)
-    target_train_size = int(round(train_fraction * len(dataset)))
-    train_indices: List[int] = []
-    val_indices: List[int] = []
+    target_train_size = round(train_fraction * len(dataset))
+    train_indices: list[int] = []
+    val_indices: list[int] = []
 
     for position, group_id in enumerate(group_ids):
         group_indices = groups[group_id]
@@ -342,13 +344,7 @@ def create_group_aware_split(
 
         if not train_indices:
             destination = train_indices
-        elif not val_indices and remaining_groups == 0:
-            destination = val_indices
-        elif len(train_indices) >= target_train_size:
-            destination = val_indices
-        elif train_needed <= 0:
-            destination = val_indices
-        elif not val_indices and len(group_indices) > train_needed and remaining_groups > 0:
+        elif (not val_indices and remaining_groups == 0) or len(train_indices) >= target_train_size or train_needed <= 0 or (not val_indices and len(group_indices) > train_needed and remaining_groups > 0):
             destination = val_indices
         else:
             destination = train_indices

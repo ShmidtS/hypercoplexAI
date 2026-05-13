@@ -19,7 +19,7 @@ class DomainRotationOperator(nn.Module):
     Численно (для стабильности градиентов):
       epsilon используется только в _normalized_R при делении на ||R||,
       чтобы избежать NaN когда ||R|| ≈ 0 во время обучения.
-      get_inverse НЕ добавляет epsilon — она принимает уже нормализованный ротор.
+      get_inverse does not add epsilon; it receives an already normalized rotor.
     """
 
     def __init__(

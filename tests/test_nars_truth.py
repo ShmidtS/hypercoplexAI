@@ -285,7 +285,7 @@ class TestSoftMoERouterAlignment:
 
         This is the actual path hdim_pipeline reads from.
         """
-        from src.core.hypercomplex import CliffordAlgebra
+        from src.core.algebra import CliffordAlgebra
         from src.core.transfer_engine import TransferEngine
         algebra = CliffordAlgebra(p=3, q=1, r=0)
         clifford_dim = algebra.dim
@@ -298,7 +298,7 @@ class TestSoftMoERouterAlignment:
         )
         engine.eval()
         u_mem = torch.randn(1, clifford_dim)
-        from src.core.domain_operators import DomainRotationOperator
+        from src.core.rotors import DomainRotationOperator
         source_rotor = DomainRotationOperator(
             algebra=algebra,
             domain_name="source",

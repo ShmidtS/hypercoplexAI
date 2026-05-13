@@ -6,15 +6,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING
+from typing import Any
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
 class TransferState:
     """Состояние трансфера между доменами."""
-    g_source: Optional[torch.Tensor]
+    g_source: torch.Tensor | None
     u_inv: torch.Tensor
     u_mem: torch.Tensor
     u_route: torch.Tensor
@@ -23,14 +25,14 @@ class TransferState:
     memory_loss: torch.Tensor
     memory_retrieved: torch.Tensor
     memory_updated: bool
-    memory_alpha: Optional[torch.Tensor]
-    memory_eta: Optional[torch.Tensor]
-    memory_theta: Optional[torch.Tensor]
-    router_state: Dict[str, Any]
+    memory_alpha: torch.Tensor | None
+    memory_eta: torch.Tensor | None
+    memory_theta: torch.Tensor | None
+    router_state: dict[str, Any]
     memory_mode: str
     update_memory: bool
     input_is_invariant: bool
-    transfer_truth: Optional[Any] = None
+    transfer_truth: Any | None = None
 
     @property
     def routing_weights(self) -> torch.Tensor:
@@ -52,7 +54,7 @@ class TransferState:
     def invariant(self) -> torch.Tensor:
         return self.exported_invariant
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "g_source": self.g_source,
             "u_inv": self.u_inv,

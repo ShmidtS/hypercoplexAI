@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from src.core.domain_operators import DomainRotationOperator
-from src.core.hypercomplex import CliffordAlgebra
+from src.core.rotors import DomainRotationOperator
+from src.core.algebra import CliffordAlgebra
 from src.core.transfer_engine import TransferEngine
 
 

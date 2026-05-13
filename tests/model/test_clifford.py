@@ -16,8 +16,8 @@ def model(cfg):
 
 def test_identity_rotor_preserves_input():
     """Identity rotor (R[0]=1, rest=0) должен давать sandwich(R, x) ≈ x."""
-    from src.core.hypercomplex import CliffordAlgebra
-    from src.core.domain_operators import DomainRotationOperator
+    from src.core.algebra import CliffordAlgebra
+    from src.core.rotors import DomainRotationOperator
     alg = CliffordAlgebra(p=2, q=0, r=0)  # dim=4
     rotor = DomainRotationOperator(alg, init_identity=True)
     x = torch.randn(alg.dim)
@@ -29,8 +29,8 @@ def test_identity_rotor_preserves_input():
 def test_rotor_inverse_matches_explicit_reverse_formula():
     """apply_inverse(rotor(x)) должен совпадать с явной формулой через reverse(R)."""
     import math
-    from src.core.hypercomplex import CliffordAlgebra
-    from src.core.domain_operators import DomainRotationOperator
+    from src.core.algebra import CliffordAlgebra
+    from src.core.rotors import DomainRotationOperator
     alg = CliffordAlgebra(p=2, q=0, r=0)
     rotor = DomainRotationOperator(alg, init_identity=False)
     theta = math.pi / 6
@@ -72,7 +72,7 @@ def test_raw_invariant_differs_from_exported(model, cfg):
 
 def test_clifford_geometric_product_anticommutativity():
     """e1 * e2 = -e2 * e1 в Cl_{2,0,0}."""
-    from src.core.hypercomplex import CliffordAlgebra
+    from src.core.algebra import CliffordAlgebra
     alg = CliffordAlgebra(p=2, q=0, r=0)
     e1 = torch.zeros(alg.dim)
     e1[1] = 1.0

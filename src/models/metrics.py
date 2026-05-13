@@ -5,8 +5,6 @@ HDIM Quality Metrics:
 - DRS (Domain Routing Stability) — стабильность роутера при повторных вызовах
 - AFR (Analogy Feasibility Rate) — доля aligned pairs, проходящих margin-aware проверку
 """
-from typing import Dict, List, Optional
-
 import torch
 import torch.nn.functional as F
 
@@ -17,14 +15,14 @@ def _model_device(model) -> torch.device:
 
 
 def domain_routing_stability(
-    routing_weights_list: List[torch.Tensor],
+    routing_weights_list: list[torch.Tensor],
 ) -> torch.Tensor:
     """DRS: стабильность роутера — стандартное отклонение весов по нескольким прогонам."""
     stacked = torch.stack(routing_weights_list, dim=0)
     return stacked.std(dim=0).mean()
 
 
-def _compute_negative_pair_indices(batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+def _compute_negative_pair_indices(batch: dict[str, torch.Tensor]) -> torch.Tensor | None:
     pair_group_id = batch["pair_group_id"]
     pair_domain_id = batch["pair_domain_id"]
     source_domain_id = batch["domain_id"]
@@ -75,7 +73,7 @@ def _get_encodings(model, batch, device):
     return enc, pair_enc, domain_ids, pair_domain_ids
 
 
-def _paired_batch_metrics(model, batch) -> Dict[str, torch.Tensor]:
+def _paired_batch_metrics(model, batch) -> dict[str, torch.Tensor]:
     device = _model_device(model)
     enc, pair_enc, domain_ids, pair_domain_ids = _get_encodings(model, batch, device)
 
@@ -194,15 +192,15 @@ def compute_all_metrics(
     device = _model_device(model)
 
     # Собираем глобальные инварианты для pair_margin
-    all_src_inv: List[torch.Tensor] = []
-    all_tgt_inv: List[torch.Tensor] = []
-    all_group_ids: List[torch.Tensor] = []
-    all_domain_ids: List[torch.Tensor] = []
-    all_pair_domain_ids: List[torch.Tensor] = []
-    all_pair_labels: List[torch.Tensor] = []
-    sts_exported_scores: List[torch.Tensor] = []
-    sts_training_scores: List[torch.Tensor] = []
-    routing_runs: List[List[torch.Tensor]] = [[] for _ in range(num_routing_runs)]
+    all_src_inv: list[torch.Tensor] = []
+    all_tgt_inv: list[torch.Tensor] = []
+    all_group_ids: list[torch.Tensor] = []
+    all_domain_ids: list[torch.Tensor] = []
+    all_pair_domain_ids: list[torch.Tensor] = []
+    all_pair_labels: list[torch.Tensor] = []
+    sts_exported_scores: list[torch.Tensor] = []
+    sts_training_scores: list[torch.Tensor] = []
+    routing_runs: list[list[torch.Tensor]] = [[] for _ in range(num_routing_runs)]
 
     with torch.no_grad():
         for batch in dataloader:

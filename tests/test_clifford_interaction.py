@@ -281,7 +281,7 @@ class TestIntegration:
 
     def test_with_clifford_algebra(self):
         """Test that layer correctly uses CliffordAlgebra for operations."""
-        from src.core.hypercomplex import CliffordAlgebra
+        from src.core.algebra import CliffordAlgebra
         
         layer = CliffordInteractionLayer()
         clifford = CliffordAlgebra(p=3, q=1, r=0)

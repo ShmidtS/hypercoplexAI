@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import os
 import pickle
-from typing import Any, Union, cast
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import cast
 
 import torch
 
 from src.core.engine import HDIMCoreEngine
-from src.models.hdim_model import HDIMModel
 from src.training.invariant_losses import compute_pair_iso_loss
+
+if TYPE_CHECKING:
+    from src.models.hdim_model import HDIMModel
 
 
 class InvariantTrainer:
@@ -18,7 +22,7 @@ class InvariantTrainer:
 
     def __init__(
         self,
-        model: Union[HDIMModel, HDIMCoreEngine],
+        model: HDIMModel | HDIMCoreEngine,
         optimizer,
         device: str | torch.device = "cpu",
         **kwargs,
@@ -31,6 +35,7 @@ class InvariantTrainer:
         self._step = 0
         self._current_epoch = 0
         self._grad_norm_ema = 0.0
+        self._log_temp = None
 
     def training_step(self, batch: dict) -> dict:
         """Run one paired invariant optimization step and return loss metrics."""
@@ -143,7 +148,11 @@ class InvariantTrainer:
 
         source_state = source_result.aux_state
         target_state = target_result.aux_state
-        return source_state.training_invariant, target_state.training_invariant, self._build_extras(source_result, has_pairs)
+        return (
+            source_state.training_invariant,
+            target_state.training_invariant,
+            self._build_extras(source_result, has_pairs),
+        )
 
     def _extract_text_pair_invariants(
         self,
@@ -157,7 +166,7 @@ class InvariantTrainer:
         Args:
             batch: Training batch with text and optional pair_text fields.
         """
-        model = cast(Any, self.model)
+        model = cast("Any", self.model)
         source_texts = [str(text) for text in batch["text"]]
         if not self._has_pair_texts(batch):
             source_result = model.forward_texts(
@@ -199,7 +208,7 @@ class InvariantTrainer:
         Args:
             batch: Training batch with encoding and optional pair_encoding fields.
         """
-        model = cast(HDIMModel, self.model)
+        model = cast("HDIMModel", self.model)
         source_encoding = batch["encoding"].to(self.device)
         if not has_pairs:
             source_result = model(
@@ -262,9 +271,7 @@ class InvariantTrainer:
     def set_epoch(self, epoch: int) -> None:
         self._current_epoch = epoch
 
-    def compute_iso_loss(
-        self, u_inv_source: torch.Tensor, u_inv_target: torch.Tensor
-    ) -> torch.Tensor:
+    def compute_iso_loss(self, u_inv_source: torch.Tensor, u_inv_target: torch.Tensor) -> torch.Tensor:
         from src.training.invariant_losses import compute_iso_loss
 
         return compute_iso_loss(u_inv_source, u_inv_target)
@@ -344,7 +351,7 @@ class InvariantTrainer:
         for key, value in state_dict.items():
             new_key = key
             if key.startswith("pipeline.moe.kernel."):
-                new_key = "pipeline.moe." + key[len("pipeline.moe.kernel."):]
+                new_key = "pipeline.moe." + key[len("pipeline.moe.kernel.") :]
             new_state_dict[new_key] = value
         return new_state_dict
 

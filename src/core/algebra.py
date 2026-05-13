@@ -2,8 +2,6 @@
 HDIM — focused Clifford algebra primitives.
 """
 
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 
@@ -50,7 +48,7 @@ class CliffordAlgebra(nn.Module):
 
         self.signature_str = f"Cl({self.p},{self.q},{self.r})"
 
-    def _blade_sign(self, a_idx: int, b_idx: int) -> Tuple[float, int]:
+    def _blade_sign(self, a_idx: int, b_idx: int) -> tuple[float, int]:
         """
         Вычисляет знак и индекс результата перестановки базисных элементов.
         Возвращает (sign, result_index) для e_a * e_b.
@@ -165,7 +163,7 @@ class CliffordAlgebra(nn.Module):
         Формула: (a ⊗ b)_c = Σ_{i,j: e_i*e_j=±e_c} sign * a_i * b_j
 
         Note: arithmetic is always done in float32 to prevent fp16 overflow
-        from the dim×dim outer product (Cl(p,q,r) dim=16 for p+q+r=4).
+        from the dim x dim outer product (Cl(p,q,r) dim=16 for p+q+r=4).
         """
         self._validate_inputs(a, b, self.dim, self.signature_str)
         D = self.dim
@@ -180,8 +178,8 @@ class CliffordAlgebra(nn.Module):
             result = result * self.learnable_metric
 
         # Always return float32 for numerical stability.
-        # fp16 max (65504) is too small for dim×dim outer products
-        # in sandwich/geometric_product chains (Cl410: dim=32, max²×32 > fp16).
+        # fp16 max (65504) is too small for dim x dim outer products
+        # in sandwich/geometric_product chains (Cl410: dim=32, max^2 x 32 > fp16).
         return result
 
     def geometric_product_batch(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -231,26 +229,17 @@ class CliffordAlgebra(nn.Module):
         self.register_buffer('_reverse_signs', rev_signs)
 
     def involute(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Главная инволюция: меняет знак у нечётных k-векторов.
-        x̂ = Σ (-1)^k <x>_k
-        """
+        """Main involution: negates odd-grade components."""
         return x * self._involute_signs.to(device=x.device)
 
     def reverse(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Реверс (реверсия): меняет знак у k-векторов с k ≡ 2,3 (mod 4).
-        x̃ = Σ (-1)^{k(k-1)/2} <x>_k
-        """
+        """Reverse: negates k-vectors with k = 2 or 3 mod 4."""
         return x * self._reverse_signs.to(device=x.device)
 
     def norm(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Норма мультивектора: ||x||_Cl = sqrt(<x * x̃>_0)
-        Скалярная часть произведения x и его реверса.
-        Возвращает magnitude (всегда >= 0); abs() берётся от scalar_part,
-        знак теряется. Для inverse (где знак важен) см. sandwich() и
-        domain_operators.get_inverse() — они используют scalar_part напрямую.
+        Multivector norm: ||x||_Cl = sqrt(<x * x_rev>_0).
+        Returns magnitude only; inverse paths keep the scalar sign.
         """
         x_rev = self.reverse(x)
         product = self.geometric_product(x, x_rev)
@@ -262,11 +251,11 @@ class CliffordAlgebra(nn.Module):
         """
         Сэндвич-произведение: R x R^{-1}.
 
-        R^{-1} = ~R / <R * ~R>_0 всегда. Знак квадратичной формы
-        сохраняется для сигнатур Cl(p,q,0) с q>0 (timelike роторы).
+        R^{-1} = ~R / <R * ~R>_0 preserves the quadratic-form sign
+        for Cl(p,q,0) signatures with q>0.
 
-        unit=True: epsilon НЕ добавляется. Для единичных роторов
-          <R*~R>_0 = ±1, и R^{-1} = ~R/<R*~R>_0 корректно.
+        unit=True: epsilon is not added. For unit rotors
+          <R*~R>_0 = +/-1, and R^{-1} = ~R/<R*~R>_0 is correct.
           Удовлетворяет теоремам sandwich_norm_preservation,
           sandwich_identity, sandwich_composition.
 

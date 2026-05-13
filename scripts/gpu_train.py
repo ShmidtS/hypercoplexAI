@@ -49,8 +49,8 @@ from src.training.dataset import (
     create_paired_demo_dataset,
 )
 from src.training.experiment_config import ExperimentConfig
+from src.training.invariant_trainer import InvariantTrainer
 from src.training.results_logger import append_ledger_row
-from src.training.trainer import HDIMTrainer
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ GLOBAL_BEST_FILENAME = ".global_best_score.json"
 def update_global_best(runs_dir: str, current_score: float, run_dir: str) -> None:
     """Track the best score across all runs in a shared JSON file."""
     global_best_path = os.path.join(runs_dir, GLOBAL_BEST_FILENAME)
-    best = {"score": -float("inf"), "run_dir": ""}
+    best: dict[str, Any] = {"score": -float("inf"), "run_dir": ""}
     if os.path.exists(global_best_path):
         try:
             with open(global_best_path, encoding="utf-8") as f:
@@ -407,44 +407,13 @@ def run_gpu_training(
     if use_amp:
         print("Using Automatic Mixed Precision (AMP)")
 
-    trainer = HDIMTrainer(
-        model, optimizer,
+    trainer = InvariantTrainer(
+        model,
+        optimizer,
         device=device,
-        lambda_pair=args.lambda_pair,
-        lambda_routing=args.lambda_routing,
-        lambda_memory=args.lambda_memory,
-        ranking_margin=args.ranking_margin,
-        use_infonce=getattr(args, 'use_infonce', True),
+        negative_margin=args.ranking_margin,
         infonce_temperature=getattr(args, 'infonce_temperature', ExperimentConfig.infonce_temperature),
-        lambda_z=getattr(args, 'lambda_z', 0.0),
-        lambda_expert_ortho=getattr(args, 'lambda_expert_ortho', 0.0),
-        learnable_temperature=getattr(args, 'learnable_temperature', False),
-        lambda_dcl=getattr(args, 'lambda_dcl', ExperimentConfig.lambda_dcl),
-        lambda_uniformity=getattr(args, 'lambda_uniformity', ExperimentConfig.lambda_uniformity),
-        lambda_matryoshka=getattr(args, 'lambda_matryoshka', ExperimentConfig.lambda_matryoshka),
-        aug_noise_std=getattr(args, 'aug_noise_std', 0.0),
-        aug_mixup_alpha=getattr(args, 'aug_mixup_alpha', 0.0),
     )
-    # Focal-InfoNCE
-    _focal_gamma = getattr(args, 'focal_gamma', 1.0)
-    trainer._focal_gamma = _focal_gamma
-    if _focal_gamma < 1.0:
-        print(f"Focal-InfoNCE: gamma={_focal_gamma}")
-    # Temperature scheduling
-    _temp_schedule = getattr(args, 'temp_schedule', 'none')
-    if _temp_schedule != 'none':
-        trainer._temp_schedule = _temp_schedule
-        trainer._tau_max = getattr(args, 'tau_max', 0.1)
-        trainer._tau_min = getattr(args, 'tau_min', 0.01)
-        print(f"Temperature schedule: {_temp_schedule} (tau_max={trainer._tau_max}, tau_min={trainer._tau_min})")
-    # Attach hard negative mining flag
-    trainer.use_hard_negatives = getattr(args, 'use_hard_negatives', False)
-    if trainer.use_hard_negatives:
-        print("Hard Negative Mining: ENABLED")
-    # Phase 22: SC-InfoNCE cluster temperature
-    if getattr(args, 'sc_temperature', False):
-        trainer.use_sc_temperature = True
-        print("SC-InfoNCE cluster temperature: ENABLED")
     # Phase 22: Config-level features
     _p22_flags = []
     if getattr(cfg.memory, 'use_gradient_surprise', False):

@@ -7,7 +7,7 @@ from .hdim_model import HDIMModel
 from .results import HDIMAuxState
 
 __all__ = [
+    "HDIMAuxState",
     "HDIMConfig",
     "HDIMModel",
-    "HDIMAuxState",
 ]
