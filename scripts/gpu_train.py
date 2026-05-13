@@ -151,6 +151,15 @@ def _build_model(cfg: HDIMConfig, args: argparse.Namespace) -> nn.Module:
     return HDIMModel(cfg)
 
 
+def _maybe_compile_model(model: nn.Module, args: argparse.Namespace) -> nn.Module:
+    if not args.compile_model:
+        return model
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile requested but unavailable in this PyTorch build")
+    print(f"torch.compile enabled with mode={args.compile_mode}")
+    return torch.compile(model, mode=args.compile_mode)
+
+
 class GPUTrainingMonitor:
     """Мониторинг GPU памяти, throughput и NaN-статистики."""
 
@@ -348,7 +357,8 @@ def run_gpu_training(
 
     model = _build_model(cfg, args)
     model = model.to(device)
-    
+    model = _maybe_compile_model(model, args)
+
     # Freeze bottom 50% SBERT encoder if requested
     if getattr(args, 'freeze_sbert', False):
         freeze_sbert_bottom_half(model)
@@ -741,6 +751,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true", default=False)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
+    parser.add_argument("--compile_model", action="store_true", default=False)
+    parser.add_argument(
+        "--compile_mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="default",
+    )
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing to reduce activation memory")
     # Model arch
