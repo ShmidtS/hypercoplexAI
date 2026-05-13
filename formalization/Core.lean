@@ -132,12 +132,10 @@ def sameStructure {sig : CliffordSignature} [CliffordAlgebra sig]
 def analogyMatch {sig : CliffordSignature} (U V : Multivector sig) : Prop :=
   U = V
 
-axiom extract_transfer_roundtrip_axiom {sig : CliffordSignature} [CliffordAlgebra sig] :
-  ∀ (R : DomainRotor sig) (U : Multivector sig),
+class RotorTransferLaws (sig : CliffordSignature) [CliffordAlgebra sig] where
+  transfer_roundtrip_law : ∀ (R : DomainRotor sig) (U : Multivector sig),
     extractInvariant R (domainTransfer R U) = U
-
-axiom norm_extract_preservation_axiom {sig : CliffordSignature} [CliffordAlgebra sig] :
-  ∀ (R : DomainRotor sig) (G : Multivector sig),
+  norm_extract_preservation_law : ∀ (R : DomainRotor sig) (G : Multivector sig),
     norm (extractInvariant R G) = norm G
 
 -- ============================================================
@@ -154,11 +152,13 @@ theorem identity_extraction {sig : CliffordSignature} [CliffordAlgebra sig]
   exact geom_prod_one_right G
 
 theorem transfer_roundtrip {sig : CliffordSignature} [CliffordAlgebra sig]
+    [laws : RotorTransferLaws sig]
     (R : DomainRotor sig) (U : Multivector sig) :
     extractInvariant R (domainTransfer R U) = U := by
-  exact extract_transfer_roundtrip_axiom R U
+  exact laws.transfer_roundtrip_law R U
 
 theorem cross_domain_invariance {sig : CliffordSignature} [CliffordAlgebra sig]
+    [laws : RotorTransferLaws sig]
     (G1 : Multivector sig) (R1 : DomainRotor sig)
     (G2 : Multivector sig) (R2 : DomainRotor sig)
     (U : Multivector sig)
@@ -168,9 +168,10 @@ theorem cross_domain_invariance {sig : CliffordSignature} [CliffordAlgebra sig]
   rw [h1, h2, transfer_roundtrip R1 U, transfer_roundtrip R2 U]
 
 theorem norm_preservation_unit_rotor {sig : CliffordSignature} [CliffordAlgebra sig]
+    [laws : RotorTransferLaws sig]
     (R : DomainRotor sig) (G : Multivector sig) :
     norm (extractInvariant R G) = norm G := by
-  exact norm_extract_preservation_axiom R G
+  exact laws.norm_extract_preservation_law R G
 
 theorem analogy_equivalence_refl {sig : CliffordSignature}
     (U : Multivector sig) : analogyMatch U U := by
