@@ -518,14 +518,11 @@ python formalization/verify_numerical.py
 # pytest suite
 python -m pytest tests/ -v
 
-# Real-model verification (MoEKernel on SBERT + real_pairs_v10.json)
-python scripts/verify_moe_kernel_real.py  # 14/14 checks PASS
+# Current verification path: numerical theorem checks plus pytest suite.
+# MoEKernel coverage remains in extension/training tests and examples.
 
 # Import check
-python -c "from src.core.hypercomplex import CliffordAlgebra; \
-           from src.core.hbma_memory import HBMAMemory; \
-           from src.core.hdim_pipeline import HDIMPipeline; \
-           print('All imports OK')"
+python -c "from src.core import CliffordAlgebra, CoreEngineConfig, HDIMCoreEngine, InvariantExtractor, InvariantIndex, DomainRotationOperator, sandwich_transfer; print('All imports OK')"
 ```
 
 ### Lean4 Categories
