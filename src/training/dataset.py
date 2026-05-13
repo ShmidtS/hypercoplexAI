@@ -229,10 +229,10 @@ def create_demo_dataset(
 ) -> DomainProblemDataset:
     """Create a synthetic demo dataset for baseline HDIM training."""
     assert num_domains <= 4, "Demo dataset supports at most 4 domains."
-    random.seed(seed)
+    rng = random.Random(seed)
 
     samples, _ = _generate_demo_samples(n_samples, num_domains)
-    random.shuffle(samples)
+    rng.shuffle(samples)
     return DomainProblemDataset(samples, embed_dim=embed_dim)
 
 
@@ -246,7 +246,7 @@ def create_paired_demo_dataset(
     """Create a synthetic demo dataset with explicit positive and negative cross-domain pairs."""
     assert num_domains >= 2, "Paired demo dataset requires at least 2 domains."
     assert num_domains <= 4, "Demo dataset supports at most 4 domains."
-    random.seed(seed)
+    rng = random.Random(seed)
 
     samples, variant_ids = _generate_demo_samples(n_samples, num_domains)
 
@@ -269,7 +269,7 @@ def create_paired_demo_dataset(
         if not positive_candidates:
             raise ValueError("Could not construct cross-domain pair for sample")
 
-        should_use_negative = negative_ratio > 0.0 and random.random() < negative_ratio
+        should_use_negative = negative_ratio > 0.0 and rng.random() < negative_ratio
         if should_use_negative:
             negative_candidates = [
                 candidate_idx
@@ -279,7 +279,7 @@ def create_paired_demo_dataset(
                 and variant_ids[candidate_idx] != variant_ids[idx]
             ]
             if negative_candidates:
-                pair_idx = random.choice(negative_candidates)
+                pair_idx = rng.choice(negative_candidates)
                 pair_indices.append(pair_idx)
                 pair_relation_types.append("negative")
                 pair_group_ids.append(next_negative_group_id)
@@ -287,14 +287,14 @@ def create_paired_demo_dataset(
                 next_negative_group_id += 1
                 continue
 
-        pair_idx = random.choice(positive_candidates)
+        pair_idx = rng.choice(positive_candidates)
         pair_indices.append(pair_idx)
         pair_relation_types.append("positive")
         pair_group_ids.append(variant_ids[idx])
         pair_weights.append(1.0)
 
     order = list(range(len(samples)))
-    random.shuffle(order)
+    rng.shuffle(order)
     shuffled_samples = [samples[i] for i in order]
     inverse_order = {old_idx: new_idx for new_idx, old_idx in enumerate(order)}
     shuffled_pairs = [inverse_order[pair_indices[old_idx]] for old_idx in order]

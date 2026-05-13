@@ -29,22 +29,17 @@ def _compute_negative_pair_indices(batch: dict[str, torch.Tensor]) -> torch.Tens
     batch_size = pair_group_id.shape[0]
     if batch_size < 2:
         return None
-    batch_indices = torch.arange(batch_size, device=pair_group_id.device)
-    negative_indices = torch.empty(batch_size, device=pair_group_id.device, dtype=torch.long)
+    valid_mask = pair_group_id.unsqueeze(0) != pair_group_id.unsqueeze(1)
+    if not valid_mask.any(dim=1).all().item():
+        return None
 
-    for idx in range(batch_size):
-        valid_candidates = batch_indices[pair_group_id != pair_group_id[idx]]
-        cross_domain_candidates = valid_candidates[
-            pair_domain_id[valid_candidates] != source_domain_id[idx]
-        ]
-        if cross_domain_candidates.numel() > 0:
-            negative_indices[idx] = cross_domain_candidates[0]
-            continue
-        if valid_candidates.numel() == 0:
-            return None
-        negative_indices[idx] = valid_candidates[0]
-
-    return negative_indices
+    cross_domain_mask = valid_mask & (pair_domain_id.unsqueeze(0) != source_domain_id.unsqueeze(1))
+    selected_mask = torch.where(
+        cross_domain_mask.any(dim=1, keepdim=True),
+        cross_domain_mask,
+        valid_mask,
+    )
+    return selected_mask.to(torch.long).argmax(dim=1)
 
 
 def _get_encodings(model, batch, device):
